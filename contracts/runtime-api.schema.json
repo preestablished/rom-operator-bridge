@@ -1,0 +1,679 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rombridge.birb.homes/contracts/runtime-api.schema.json",
+  "title": "ROM Operator Bridge Runtime API",
+  "description": "Canonical schema_version 1 UI/service contract. Service and UI code must derive or validate public runtime payloads from this file.",
+  "oneOf": [
+    { "$ref": "#/$defs/errorEnvelope" },
+    { "$ref": "#/$defs/healthResponse" },
+    { "$ref": "#/$defs/sessionResponse" },
+    { "$ref": "#/$defs/startSessionRequest" },
+    { "$ref": "#/$defs/startSessionResponse" },
+    { "$ref": "#/$defs/stopSessionRequest" },
+    { "$ref": "#/$defs/stopSessionResponse" },
+    { "$ref": "#/$defs/runStatusResponse" },
+    { "$ref": "#/$defs/sessionOnlyRequest" },
+    { "$ref": "#/$defs/runStateResponse" },
+    { "$ref": "#/$defs/frameCurrentResponse" },
+    { "$ref": "#/$defs/captureTriggerRequest" },
+    { "$ref": "#/$defs/captureTriggerResponse" },
+    { "$ref": "#/$defs/captureJobResponse" },
+    { "$ref": "#/$defs/captureRecentResponse" },
+    { "$ref": "#/$defs/captureDetailResponse" },
+    { "$ref": "#/$defs/captureFeaturesResponse" },
+    { "$ref": "#/$defs/labelsRequest" },
+    { "$ref": "#/$defs/labelsResponse" },
+    { "$ref": "#/$defs/labelsSnapshotResponse" },
+    { "$ref": "#/$defs/wsEnvelope" }
+  ],
+  "$defs": {
+    "schemaName": {
+      "type": "string"
+    },
+    "schemaVersion": {
+      "type": "integer",
+      "const": 1
+    },
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._:-]+$"
+    },
+    "uuid": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "rfc3339": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "u64": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615
+    },
+    "hashRef": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "backendMode": {
+      "type": "string",
+      "enum": ["synthetic", "real"]
+    },
+    "sessionState": {
+      "type": "string",
+      "enum": [
+        "idle",
+        "starting",
+        "running",
+        "paused",
+        "capture_pending",
+        "stopping",
+        "stopped",
+        "faulted"
+      ]
+    },
+    "capabilityName": {
+      "type": "string",
+      "enum": [
+        "input",
+        "preview",
+        "capture",
+        "labels",
+        "privileged_features",
+        "validation_runner"
+      ]
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "input",
+        "preview",
+        "capture",
+        "labels",
+        "privileged_features",
+        "validation_runner"
+      ],
+      "properties": {
+        "input": { "type": "boolean" },
+        "preview": { "type": "boolean" },
+        "capture": { "type": "boolean" },
+        "labels": { "type": "boolean" },
+        "privileged_features": { "type": "boolean" },
+        "validation_runner": { "type": "boolean" }
+      }
+    },
+    "padLayout": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["layout_id", "layout_version"],
+      "properties": {
+        "layout_id": { "const": "console16-12btn-v1" },
+        "layout_version": { "const": 1 }
+      }
+    },
+    "errorCode": {
+      "type": "string",
+      "enum": [
+        "auth_rejected",
+        "origin_rejected",
+        "session_inactive",
+        "session_active_elsewhere",
+        "backend_unavailable",
+        "frame_stale",
+        "capture_in_progress",
+        "capture_failed",
+        "label_conflict",
+        "validation_failed",
+        "bad_request"
+      ]
+    },
+    "errorObject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message", "retryable", "details"],
+      "properties": {
+        "code": { "$ref": "#/$defs/errorCode" },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 240
+        },
+        "retryable": { "type": "boolean" },
+        "details": {
+          "type": "object",
+          "additionalProperties": {
+            "type": ["string", "number", "integer", "boolean", "null"]
+          }
+        }
+      }
+    },
+    "errorEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "error"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "error": { "$ref": "#/$defs/errorObject" }
+      }
+    },
+    "healthResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "ok", "service_version", "backend_mode", "runtime_api"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "ok": { "type": "boolean" },
+        "service_version": { "type": "string", "minLength": 1 },
+        "backend_mode": { "$ref": "#/$defs/backendMode" },
+        "runtime_api": { "const": 1 }
+      }
+    },
+    "sessionResponse": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schema_version",
+            "active",
+            "session_id",
+            "run_id",
+            "state",
+            "current_frame",
+            "backend_mode"
+          ],
+          "properties": {
+            "schema_version": { "$ref": "#/$defs/schemaVersion" },
+            "active": { "const": true },
+            "session_id": { "$ref": "#/$defs/id" },
+            "run_id": { "$ref": "#/$defs/id" },
+            "state": { "$ref": "#/$defs/sessionState" },
+            "current_frame": { "$ref": "#/$defs/u64" },
+            "backend_mode": { "$ref": "#/$defs/backendMode" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schema_version", "active", "state"],
+          "properties": {
+            "schema_version": { "$ref": "#/$defs/schemaVersion" },
+            "active": { "const": false },
+            "state": { "const": "idle" }
+          }
+        }
+      ]
+    },
+    "startSessionRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "operator_credential",
+        "backend_mode",
+        "requested_capabilities"
+      ],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "operator_credential": {
+          "type": "string",
+          "minLength": 1
+        },
+        "backend_mode": { "$ref": "#/$defs/backendMode" },
+        "requested_capabilities": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/capabilityName" }
+        }
+      }
+    },
+    "startSessionResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "session_id",
+        "run_id",
+        "state",
+        "current_frame",
+        "pad_layout",
+        "capabilities"
+      ],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "session_id": { "$ref": "#/$defs/id" },
+        "run_id": { "$ref": "#/$defs/id" },
+        "state": { "$ref": "#/$defs/sessionState" },
+        "current_frame": { "$ref": "#/$defs/u64" },
+        "pad_layout": { "$ref": "#/$defs/padLayout" },
+        "capabilities": { "$ref": "#/$defs/capabilities" }
+      }
+    },
+    "stopSessionRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "session_id", "reason"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "session_id": { "$ref": "#/$defs/id" },
+        "reason": {
+          "type": "string",
+          "enum": ["operator_stop", "fault_cleanup", "session_replaced"]
+        }
+      }
+    },
+    "stopSessionResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "session_id", "state", "final_frame"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "session_id": { "$ref": "#/$defs/id" },
+        "state": { "const": "stopped" },
+        "final_frame": { "$ref": "#/$defs/u64" }
+      }
+    },
+    "runStatusResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "session_id",
+        "run_id",
+        "state",
+        "backend_mode",
+        "current_frame",
+        "last_applied_input_frame",
+        "last_preview_frame",
+        "preview_stale",
+        "active_capture_job_id",
+        "capabilities"
+      ],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "session_id": { "$ref": "#/$defs/id" },
+        "run_id": { "$ref": "#/$defs/id" },
+        "state": { "$ref": "#/$defs/sessionState" },
+        "backend_mode": { "$ref": "#/$defs/backendMode" },
+        "current_frame": { "$ref": "#/$defs/u64" },
+        "last_applied_input_frame": { "$ref": "#/$defs/u64" },
+        "last_preview_frame": { "$ref": "#/$defs/u64" },
+        "preview_stale": { "type": "boolean" },
+        "active_capture_job_id": {
+          "oneOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }]
+        },
+        "capabilities": { "$ref": "#/$defs/capabilities" }
+      }
+    },
+    "sessionOnlyRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "session_id"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "session_id": { "$ref": "#/$defs/id" }
+      }
+    },
+    "runStateResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "state", "current_frame"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "state": { "$ref": "#/$defs/sessionState" },
+        "current_frame": { "$ref": "#/$defs/u64" }
+      }
+    },
+    "frameCurrentResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "frame",
+        "captured_at",
+        "stale",
+        "width",
+        "height",
+        "format",
+        "image_url",
+        "preview_hash"
+      ],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "frame": { "$ref": "#/$defs/u64" },
+        "captured_at": { "$ref": "#/$defs/rfc3339" },
+        "stale": { "type": "boolean" },
+        "width": { "const": 256 },
+        "height": { "const": 224 },
+        "format": { "const": "image/png" },
+        "image_url": { "type": "string", "pattern": "^/api/frame/current/image" },
+        "preview_hash": { "$ref": "#/$defs/hashRef" }
+      }
+    },
+    "captureStatus": {
+      "type": "string",
+      "enum": ["requested", "capturing", "completed", "failed", "not_labelable"]
+    },
+    "captureTriggerRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "session_id",
+        "idempotency_key",
+        "observed_preview_frame",
+        "reason"
+      ],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "session_id": { "$ref": "#/$defs/id" },
+        "idempotency_key": { "$ref": "#/$defs/uuid" },
+        "observed_preview_frame": { "$ref": "#/$defs/u64" },
+        "reason": { "enum": ["operator_mark"] }
+      }
+    },
+    "captureTriggerResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "job_id",
+        "status",
+        "requested_frame",
+        "scheduled_frame"
+      ],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "job_id": { "$ref": "#/$defs/id" },
+        "status": { "$ref": "#/$defs/captureStatus" },
+        "requested_frame": { "$ref": "#/$defs/u64" },
+        "scheduled_frame": { "$ref": "#/$defs/u64" }
+      }
+    },
+    "captureJobResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "job_id",
+        "status",
+        "requested_frame",
+        "scheduled_frame",
+        "captured_frame",
+        "capture_id",
+        "labelable",
+        "has_preview",
+        "error"
+      ],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "job_id": { "$ref": "#/$defs/id" },
+        "status": { "$ref": "#/$defs/captureStatus" },
+        "requested_frame": { "$ref": "#/$defs/u64" },
+        "scheduled_frame": { "$ref": "#/$defs/u64" },
+        "captured_frame": {
+          "oneOf": [{ "$ref": "#/$defs/u64" }, { "type": "null" }]
+        },
+        "capture_id": {
+          "oneOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }]
+        },
+        "labelable": { "type": "boolean" },
+        "has_preview": { "type": "boolean" },
+        "error": {
+          "oneOf": [{ "$ref": "#/$defs/errorObject" }, { "type": "null" }]
+        }
+      }
+    },
+    "labelRole": {
+      "type": "string",
+      "enum": [
+        "first_boss",
+        "goal_positive",
+        "goal_negative",
+        "needs_review",
+        "rejected",
+        "same_canonical",
+        "distinct_stable"
+      ]
+    },
+    "captureSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "capture_id",
+        "frame",
+        "status",
+        "labelable",
+        "has_preview",
+        "labels",
+        "created_at"
+      ],
+      "properties": {
+        "capture_id": { "$ref": "#/$defs/id" },
+        "frame": { "$ref": "#/$defs/u64" },
+        "status": { "$ref": "#/$defs/captureStatus" },
+        "labelable": { "type": "boolean" },
+        "has_preview": { "type": "boolean" },
+        "labels": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/labelRole" },
+          "uniqueItems": true
+        },
+        "created_at": { "$ref": "#/$defs/rfc3339" }
+      }
+    },
+    "captureRecentResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "captures", "next_cursor"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "captures": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/captureSummary" }
+        },
+        "next_cursor": {
+          "oneOf": [{ "type": "string" }, { "type": "null" }]
+        }
+      }
+    },
+    "captureDetailResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "capture_id",
+        "frame",
+        "status",
+        "labelable",
+        "preview_image_url",
+        "privileged_features_available",
+        "labels",
+        "sanitized_provenance"
+      ],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "capture_id": { "$ref": "#/$defs/id" },
+        "frame": { "$ref": "#/$defs/u64" },
+        "status": { "$ref": "#/$defs/captureStatus" },
+        "labelable": { "type": "boolean" },
+        "preview_image_url": { "type": "string", "pattern": "^/api/capture/" },
+        "privileged_features_available": { "type": "boolean" },
+        "labels": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/labelRole" }
+        },
+        "sanitized_provenance": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["capture_source", "layout_hash", "capture_spec_hash", "map_hash"],
+          "properties": {
+            "capture_source": { "enum": ["synthetic", "hypervisor"] },
+            "layout_hash": { "$ref": "#/$defs/hashRef" },
+            "capture_spec_hash": { "$ref": "#/$defs/hashRef" },
+            "map_hash": { "$ref": "#/$defs/hashRef" }
+          }
+        }
+      }
+    },
+    "decodedFeature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "value"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "value": {
+          "type": ["string", "number", "integer", "boolean", "null"]
+        }
+      }
+    },
+    "captureFeaturesResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "capture_id", "frame", "decoded_features"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "capture_id": { "$ref": "#/$defs/id" },
+        "frame": { "$ref": "#/$defs/u64" },
+        "decoded_features": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/decodedFeature" }
+        }
+      }
+    },
+    "labelUpdate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "capture_id", "role"],
+      "properties": {
+        "op": { "enum": ["upsert", "delete"] },
+        "capture_id": { "$ref": "#/$defs/id" },
+        "role": { "$ref": "#/$defs/labelRole" },
+        "confidence": { "enum": ["candidate", "confirmed"] },
+        "note": { "type": "string", "maxLength": 512 }
+      }
+    },
+    "labelsRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "session_id", "idempotency_key", "updates"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "session_id": { "$ref": "#/$defs/id" },
+        "idempotency_key": { "$ref": "#/$defs/uuid" },
+        "updates": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/labelUpdate" }
+        }
+      }
+    },
+    "labelsResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "applied", "label_revision", "conflicts"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "applied": { "type": "boolean" },
+        "label_revision": { "type": "integer", "minimum": 0 },
+        "conflicts": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/errorObject" }
+        }
+      }
+    },
+    "labelsSnapshotResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "label_revision", "labels", "dedup_groups"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "label_revision": { "type": "integer", "minimum": 0 },
+        "labels": { "type": "array", "items": { "$ref": "#/$defs/labelUpdate" } },
+        "dedup_groups": { "type": "array", "items": { "type": "object" } }
+      }
+    },
+    "wsMessageType": {
+      "type": "string",
+      "enum": [
+        "input_state",
+        "input_ack",
+        "input_reject",
+        "session_updated",
+        "run_updated",
+        "capture_updated",
+        "label_updated",
+        "validation_updated"
+      ]
+    },
+    "inputSource": {
+      "type": "string",
+      "enum": ["keyboard", "gamepad", "combined"]
+    },
+    "padButton": {
+      "type": "string",
+      "enum": ["A", "B", "X", "Y", "L", "R", "Up", "Down", "Left", "Right", "Start", "Select"]
+    },
+    "wsEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "type", "session_id", "client_seq", "source_id", "server_seq", "payload"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "type": { "$ref": "#/$defs/wsMessageType" },
+        "session_id": { "$ref": "#/$defs/id" },
+        "client_seq": { "oneOf": [{ "$ref": "#/$defs/u64" }, { "type": "null" }] },
+        "source_id": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "server_seq": { "oneOf": [{ "$ref": "#/$defs/u64" }, { "type": "null" }] },
+        "payload": { "type": "object" }
+      }
+    },
+    "inputStatePayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["client_event_id", "client_time_ms", "source", "buttons"],
+      "properties": {
+        "client_event_id": { "$ref": "#/$defs/uuid" },
+        "client_time_ms": { "type": "number", "minimum": 0 },
+        "source": { "$ref": "#/$defs/inputSource" },
+        "buttons": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/padButton" },
+          "uniqueItems": true
+        }
+      }
+    },
+    "inputAckPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["client_event_id", "assigned_frame", "pad_word", "status"],
+      "properties": {
+        "client_event_id": { "$ref": "#/$defs/uuid" },
+        "assigned_frame": { "$ref": "#/$defs/u64" },
+        "pad_word": { "type": "integer", "minimum": 0, "maximum": 4095 },
+        "status": { "enum": ["applied", "queued", "dropped"] }
+      }
+    },
+    "captureUpdatedPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["job_id", "status", "capture_id"],
+      "properties": {
+        "job_id": { "$ref": "#/$defs/id" },
+        "status": { "$ref": "#/$defs/captureStatus" },
+        "capture_id": {
+          "oneOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }]
+        }
+      }
+    }
+  }
+}
