@@ -24,3 +24,9 @@ target
 .dolt/
 *.db
 .beads-credential-key
+
+# Private operator bridge config and runtime roots.
+rom-operator-bridge.env
+*.rombridge.env
+private/
+service/private/
