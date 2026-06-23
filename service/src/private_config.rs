@@ -17,9 +17,11 @@ pub const ENV_STATIC_PUBLISH_ROOT: &str = "ROM_OPERATOR_BRIDGE_STATIC_PUBLISH_RO
 pub const ENV_OPERATOR_CREDENTIAL: &str = "ROM_OPERATOR_BRIDGE_OPERATOR_CREDENTIAL";
 pub const ENV_SESSION_SECRET: &str = "ROM_OPERATOR_BRIDGE_SESSION_SECRET";
 
+pub const PRIVATE_ROOT_MARKER: &str = ".rom-operator-bridge-private-root";
 pub const PRIVATE_DIR_MODE: u32 = 0o700;
 pub const PRIVATE_FILE_MODE: u32 = 0o600;
 pub const PRIVATE_RUN_DIRS: &[&str] = &["runs", "captures", "events", "validation", "tmp"];
+const MIN_PRIVATE_ROOT_COMPONENTS: usize = 3;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct BridgePrivateConfig {
@@ -120,10 +122,11 @@ impl BridgePrivateConfig {
         let Some(root) = &self.root else {
             return Ok(());
         };
+        let root = root.path();
 
-        ensure_private_dir(root.path())?;
+        ensure_private_root_dir(root)?;
         for dir in PRIVATE_RUN_DIRS {
-            ensure_private_dir(&root.path().join(dir))?;
+            ensure_private_descendant_dir(root, Path::new(dir))?;
         }
 
         Ok(())
@@ -141,12 +144,16 @@ impl BridgePrivateConfig {
                 env: ENV_PRIVATE_ROOT,
             })?
             .path();
+        ensure_private_root_dir(root)?;
         let relative_path = validate_relative_path(relative_path.as_ref())?;
-        let path = root.join(relative_path);
 
-        if let Some(parent) = path.parent() {
-            ensure_private_dir(parent)?;
+        if let Some(parent) = relative_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            ensure_private_descendant_dir(root, parent)?;
         }
+        let path = root.join(&relative_path);
         if path_metadata(&path)?.is_some() {
             validate_private_file(&path)?;
         }
@@ -367,46 +374,159 @@ fn validate_private_root(
     root: &Path,
     static_publish_root: Option<&Path>,
 ) -> Result<(), PrivateConfigError> {
-    if let Some(static_publish_root) = static_publish_root {
-        if root == static_publish_root || root.starts_with(static_publish_root) {
-            return Err(PrivateConfigError::PrivateRootInsideStaticPublishRoot {
-                private_root: root.to_path_buf(),
-                static_publish_root: static_publish_root.to_path_buf(),
-            });
-        }
+    if root_component_count(root) < MIN_PRIVATE_ROOT_COMPONENTS {
+        return Err(PrivateConfigError::BroadPrivateRoot {
+            path: root.to_path_buf(),
+        });
+    }
+    reject_symlink_components(root)?;
+
+    if let Some(static_publish_root) = static_publish_root
+        && (root == static_publish_root || root.starts_with(static_publish_root))
+    {
+        reject_symlink_components(static_publish_root)?;
+        return Err(PrivateConfigError::PrivateRootInsideStaticPublishRoot {
+            private_root: root.to_path_buf(),
+            static_publish_root: static_publish_root.to_path_buf(),
+        });
     }
 
-    if path_metadata(root)?.is_some() {
-        reject_symlink(root)?;
-        if path_mode(root)? & 0o002 != 0 {
+    if let Some(metadata) = path_metadata(root)? {
+        if !metadata.is_dir() {
+            return Err(PrivateConfigError::NotDirectory {
+                path: root.to_path_buf(),
+            });
+        }
+
+        let mode = path_mode(root)?;
+        if mode & 0o002 != 0 {
             return Err(PrivateConfigError::WorldWritableRoot {
                 path: root.to_path_buf(),
             });
         }
+        if mode != PRIVATE_DIR_MODE {
+            return Err(PrivateConfigError::InsecureDirectoryMode {
+                path: root.to_path_buf(),
+                mode,
+            });
+        }
+        validate_existing_private_root_contents(root)?;
     }
 
     Ok(())
 }
 
-fn ensure_private_dir(path: &Path) -> Result<(), PrivateConfigError> {
-    if path_metadata(path)?.is_some() {
-        reject_symlink(path)?;
-        let metadata =
-            fs::metadata(path).map_err(|error| io_error("stat directory", path, error))?;
-        if !metadata.is_dir() {
-            return Err(PrivateConfigError::NotDirectory {
-                path: path.to_path_buf(),
-            });
-        }
-        if path_mode(path)? & 0o002 != 0 {
-            return Err(PrivateConfigError::WorldWritableDirectory {
-                path: path.to_path_buf(),
-            });
-        }
-    } else {
-        fs::create_dir_all(path).map_err(|error| io_error("create directory", path, error))?;
+fn root_component_count(path: &Path) -> usize {
+    path.components()
+        .filter(|component| matches!(component, Component::Normal(_)))
+        .count()
+}
+
+fn validate_existing_private_root_contents(root: &Path) -> Result<(), PrivateConfigError> {
+    if private_root_marker_exists(root)? {
+        return Ok(());
     }
 
+    if fs::read_dir(root)
+        .map_err(|error| io_error("read private root", root, error))?
+        .next()
+        .transpose()
+        .map_err(|error| io_error("read private root", root, error))?
+        .is_some()
+    {
+        return Err(PrivateConfigError::UnmarkedNonEmptyRoot {
+            path: root.to_path_buf(),
+        });
+    }
+
+    Ok(())
+}
+
+fn ensure_private_root_dir(root: &Path) -> Result<(), PrivateConfigError> {
+    reject_symlink_components(root)?;
+    match path_metadata(root)? {
+        Some(metadata) => {
+            if !metadata.is_dir() {
+                return Err(PrivateConfigError::NotDirectory {
+                    path: root.to_path_buf(),
+                });
+            }
+            let mode = path_mode(root)?;
+            if mode & 0o002 != 0 {
+                return Err(PrivateConfigError::WorldWritableRoot {
+                    path: root.to_path_buf(),
+                });
+            }
+            if mode != PRIVATE_DIR_MODE {
+                return Err(PrivateConfigError::InsecureDirectoryMode {
+                    path: root.to_path_buf(),
+                    mode,
+                });
+            }
+            validate_existing_private_root_contents(root)?;
+        }
+        None => create_private_dir(root)?,
+    }
+
+    ensure_private_root_marker(root)
+}
+
+fn ensure_private_descendant_dir(
+    root: &Path,
+    relative_path: &Path,
+) -> Result<(), PrivateConfigError> {
+    let relative_path = validate_relative_path(relative_path)?;
+    let mut current = root.to_path_buf();
+    for component in relative_path.components() {
+        let Component::Normal(part) = component else {
+            return Err(PrivateConfigError::UnsafeRelativePath {
+                path: relative_path.to_path_buf(),
+            });
+        };
+        current.push(part);
+        ensure_existing_or_new_private_dir(&current)?;
+    }
+
+    Ok(())
+}
+
+fn ensure_existing_or_new_private_dir(path: &Path) -> Result<(), PrivateConfigError> {
+    match path_metadata(path)? {
+        Some(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(PrivateConfigError::SymlinkPath {
+                    path: path.to_path_buf(),
+                });
+            }
+            if !metadata.is_dir() {
+                return Err(PrivateConfigError::NotDirectory {
+                    path: path.to_path_buf(),
+                });
+            }
+            if path_mode(path)? & 0o002 != 0 {
+                return Err(PrivateConfigError::WorldWritableDirectory {
+                    path: path.to_path_buf(),
+                });
+            }
+            let mode = path_mode(path)?;
+            if mode != PRIVATE_DIR_MODE {
+                return Err(PrivateConfigError::InsecureDirectoryMode {
+                    path: path.to_path_buf(),
+                    mode,
+                });
+            }
+        }
+        None => create_private_dir(path)?,
+    }
+
+    Ok(())
+}
+
+fn create_private_dir(path: &Path) -> Result<(), PrivateConfigError> {
+    if let Some(parent) = path.parent() {
+        reject_symlink_components(parent)?;
+    }
+    fs::create_dir(path).map_err(|error| io_error("create directory", path, error))?;
     set_private_dir_mode(path)?;
     let mode = path_mode(path)?;
     if mode != PRIVATE_DIR_MODE {
@@ -415,7 +535,6 @@ fn ensure_private_dir(path: &Path) -> Result<(), PrivateConfigError> {
             mode,
         });
     }
-
     Ok(())
 }
 
@@ -439,12 +558,74 @@ fn validate_private_file(path: &Path) -> Result<(), PrivateConfigError> {
     Ok(())
 }
 
+fn private_root_marker_exists(root: &Path) -> Result<bool, PrivateConfigError> {
+    let marker = root.join(PRIVATE_ROOT_MARKER);
+    if path_metadata(&marker)?.is_none() {
+        return Ok(false);
+    }
+
+    validate_private_file(&marker)?;
+    Ok(true)
+}
+
+fn ensure_private_root_marker(root: &Path) -> Result<(), PrivateConfigError> {
+    let marker = root.join(PRIVATE_ROOT_MARKER);
+    if private_root_marker_exists(root)? {
+        return Ok(());
+    }
+
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(PRIVATE_FILE_MODE);
+
+    let mut file = options
+        .open(&marker)
+        .map_err(|error| io_error("create private root marker", &marker, error))?;
+    file.write_all(b"rom-operator-bridge private root\n")
+        .map_err(|error| io_error("write private root marker", &marker, error))?;
+    file.sync_all()
+        .map_err(|error| io_error("sync private root marker", &marker, error))?;
+    set_private_file_mode(&marker)?;
+    validate_private_file(&marker)
+}
+
 fn path_metadata(path: &Path) -> Result<Option<fs::Metadata>, PrivateConfigError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => Ok(Some(metadata)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(io_error("stat path", path, error)),
     }
+}
+
+fn reject_symlink_components(path: &Path) -> Result<(), PrivateConfigError> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => current.push(Path::new("/")),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(PrivateConfigError::UnsafeRelativePath {
+                    path: path.to_path_buf(),
+                });
+            }
+            Component::Normal(part) => {
+                current.push(part);
+                let Some(metadata) = path_metadata(&current)? else {
+                    break;
+                };
+                if metadata.file_type().is_symlink() {
+                    return Err(PrivateConfigError::SymlinkPath { path: current });
+                }
+                if !metadata.is_dir() && current != path {
+                    return Err(PrivateConfigError::NotDirectory { path: current });
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn reject_symlink(path: &Path) -> Result<(), PrivateConfigError> {
@@ -534,7 +715,7 @@ fn io_error(operation: &'static str, path: &Path, error: io::Error) -> PrivateCo
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[derive(Clone, PartialEq, Eq, Error)]
 pub enum PrivateConfigError {
     #[error("{env} is required for complete private bridge config")]
     MissingEnv { env: &'static str },
@@ -549,6 +730,10 @@ pub enum PrivateConfigError {
         private_root: PathBuf,
         static_publish_root: PathBuf,
     },
+    #[error("private root must be a dedicated non-broad directory")]
+    BroadPrivateRoot { path: PathBuf },
+    #[error("existing private root must be empty or marked as a bridge private root")]
+    UnmarkedNonEmptyRoot { path: PathBuf },
     #[error("private root must not be world-writable")]
     WorldWritableRoot { path: PathBuf },
     #[error("private directory must not be world-writable")]
@@ -575,4 +760,10 @@ pub enum PrivateConfigError {
     InvalidConfigLine { line: usize },
     #[error("private file modes require unix permissions")]
     UnsupportedPlatform,
+}
+
+impl fmt::Debug for PrivateConfigError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
 }

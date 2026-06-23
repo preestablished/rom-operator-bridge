@@ -1,5 +1,5 @@
 use crate::{backend::BackendMode, private_config};
-use std::{collections::BTreeMap, net::SocketAddr, str::FromStr};
+use std::{collections::BTreeMap, fmt, net::SocketAddr, str::FromStr};
 use thiserror::Error;
 
 pub const DEFAULT_BIND_ADDR: &str = "10.0.0.106:7410";
@@ -84,7 +84,7 @@ impl ServiceConfig {
     }
 }
 
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Error, PartialEq, Eq)]
 pub enum ConfigError {
     #[error("{env} must be a valid socket address")]
     InvalidBindAddr { env: &'static str },
@@ -92,4 +92,10 @@ pub enum ConfigError {
     InvalidBackendMode { env: &'static str },
     #[error(transparent)]
     PrivateConfig(#[from] private_config::PrivateConfigError),
+}
+
+impl fmt::Debug for ConfigError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
 }
