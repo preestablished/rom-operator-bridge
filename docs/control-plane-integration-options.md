@@ -119,6 +119,7 @@ checkout:
 
 ```text
 proto/determinism/controlplane/v1/scoring.proto: service ScoringService {}
+proto/determinism/controlplane/v1/audit.proto: service AuditService {}
 proto/determinism/controlplane/v1/featuremaps.proto: service FeatureMapService {}
 proto/determinism/controlplane/v1/artifacts.proto: service ArtifactService {}
 proto/determinism/controlplane/v1/runs.proto: service RunService {}
@@ -145,9 +146,10 @@ crates/determinism-proto/src/lib.rs handwritten SnapshotRef and PutSnapshotReque
 
 These are not enough to mark a real ROM capture job `completed`, write
 `captures/index.jsonl`, or expose recent capture metadata. Real capture must be
-resolved by the hypervisor and reference-workload discovery beads. If those
-beads find no real exporter, bridge capture work must remain synthetic or be
-deferred; do not represent a synthetic capture as Phase 4 real acceptance.
+resolved by `rom-operator-bridge-7a6` (Inspect hypervisor runtime contracts) and
+`rom-operator-bridge-z8z` (Inspect reference-workload contracts). If those beads
+find no real exporter, bridge capture work must remain synthetic or be deferred;
+do not represent a synthetic capture as Phase 4 real acceptance.
 
 ## Feature-Map And Verifier Decision
 
@@ -177,6 +179,10 @@ Acceptance:
 - config names scorer endpoint, TLS/auth policy, timeout, and disabled-by-default behavior;
 - synthetic test sends fake feature bytes/framebuffer metadata and receives sanitized status only;
 - UI never receives decoded feature values, feature bytes, raw framebuffer bytes, or private scorer errors;
+- UI never receives `fb_blob_ref`, snapshot refs, artifact refs, component
+  breakdowns, novelty details, decoded arrays, scorer warning strings, or raw
+  scorer error details unless a later privacy review explicitly approves a
+  sanitized subset;
 - bridge falls back to runbook-only validation when scorer endpoint is unset.
 ```
 
