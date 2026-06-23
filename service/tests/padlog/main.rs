@@ -105,8 +105,7 @@ fn writes_padlog_and_private_event_sidecar_without_rich_fields_in_padlog() {
     let (_workspace, config, private_root) = private_config();
     let store = PrivateArtifactStore::new(config.private_config());
     let padlog = PadLog::from_raw_frames([PadButton::A.mask(), PadButton::A.mask()])
-        .expect("padlog frames validate")
-        .write_canonical();
+        .expect("padlog frames validate");
 
     let padlog_ref = store
         .write_padlog("run-001", &padlog)

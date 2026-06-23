@@ -1,5 +1,6 @@
 use crate::{
     backend::BackendMode,
+    input::PadLog,
     private_config::{BridgePrivateConfig, PrivateConfigError},
 };
 use serde::{Deserialize, Serialize};
@@ -68,16 +69,14 @@ impl<'a> PrivateArtifactStore<'a> {
     pub fn write_padlog(
         &self,
         run_id: &str,
-        padlog_text: &str,
+        padlog: &PadLog,
     ) -> Result<PrivateArtifactRef, ArtifactError> {
         let run_id = path_segment("run_id", run_id)?;
-        self.config.write_private_file_atomic(
-            PathBuf::from("runs").join(run_id).join("input.padlog"),
-            padlog_text.as_bytes(),
-        )?;
-        Ok(PrivateArtifactRef::new(
-            PathBuf::from("runs").join(run_id).join("input.padlog"),
-        ))
+        let relative_path = PathBuf::from("runs").join(run_id).join("input.padlog");
+        let padlog_text = padlog.write_canonical();
+        self.config
+            .write_private_file_atomic(&relative_path, padlog_text.as_bytes())?;
+        Ok(PrivateArtifactRef::new(relative_path))
     }
 
     pub fn append_padlog_event(
