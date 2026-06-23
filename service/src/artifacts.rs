@@ -65,6 +65,37 @@ impl<'a> PrivateArtifactStore<'a> {
         )
     }
 
+    pub fn write_padlog(
+        &self,
+        run_id: &str,
+        padlog_text: &str,
+    ) -> Result<PrivateArtifactRef, ArtifactError> {
+        let run_id = path_segment("run_id", run_id)?;
+        self.config.write_private_file_atomic(
+            PathBuf::from("runs").join(run_id).join("input.padlog"),
+            padlog_text.as_bytes(),
+        )?;
+        Ok(PrivateArtifactRef::new(
+            PathBuf::from("runs").join(run_id).join("input.padlog"),
+        ))
+    }
+
+    pub fn append_padlog_event(
+        &self,
+        run_id: &str,
+        row: &PadLogEventRow,
+    ) -> Result<PrivateArtifactRef, ArtifactError> {
+        ensure_schema_version(row.schema_version)?;
+        let run_id = path_segment("run_id", run_id)?;
+        ensure_matching_identifier("run_id", run_id, &row.run_id)?;
+        self.append_jsonl(
+            PathBuf::from("runs")
+                .join(run_id)
+                .join("padlog-events.jsonl"),
+            row,
+        )
+    }
+
     pub fn write_recent_captures(
         &self,
         recent: &RecentCapturesFile,
@@ -238,6 +269,44 @@ impl InputRejectionRow {
             occurred_at: occurred_at.into(),
             reason_code: reason_code.into(),
             public_message: public_message.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadLogEventRow {
+    pub schema_version: u16,
+    pub run_id: String,
+    pub frame_index: u64,
+    pub assigned_frame: u64,
+    pub pad_word: u16,
+    pub client_seq: u64,
+    pub source_id: String,
+    pub status: String,
+    pub message: String,
+}
+
+impl PadLogEventRow {
+    pub fn new(
+        run_id: impl Into<String>,
+        frame_index: u64,
+        assigned_frame: u64,
+        pad_word: u16,
+        client_seq: u64,
+        source_id: impl Into<String>,
+        status: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            schema_version: ARTIFACT_SCHEMA_VERSION,
+            run_id: run_id.into(),
+            frame_index,
+            assigned_frame,
+            pad_word,
+            client_seq,
+            source_id: source_id.into(),
+            status: status.into(),
+            message: message.into(),
         }
     }
 }
