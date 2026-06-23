@@ -7,17 +7,22 @@ use crate::{
     input::PadWord,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::VecDeque, fmt};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    fmt,
+};
 use thiserror::Error;
 
 pub const DEFAULT_INPUT_LEAD_FRAMES: FrameCounter = 1;
+pub const PENDING_INPUT_LIMIT_PER_SESSION: usize = 120;
 pub const FRAME_STALE_REASON_CODE: &str = "frame_stale";
+pub const QUEUE_FULL_REASON_CODE: &str = "queue_full";
+pub const SESSION_REPLACED_REASON_CODE: &str = "session_replaced";
 pub const PUBLIC_INPUT_REJECTION_MESSAGE: &str = "Input rejected.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrowserInputState {
     pub session_id: SessionId,
-    pub run_id: String,
     pub client_seq: u64,
     pub occurred_at: String,
     pub pad_word: PadWord,
@@ -26,14 +31,12 @@ pub struct BrowserInputState {
 impl BrowserInputState {
     pub fn new(
         session_id: impl Into<SessionId>,
-        run_id: impl Into<String>,
         client_seq: u64,
         occurred_at: impl Into<String>,
         pad_word: PadWord,
     ) -> Self {
         Self {
             session_id: session_id.into(),
-            run_id: run_id.into(),
             client_seq,
             occurred_at: occurred_at.into(),
             pad_word,
@@ -70,6 +73,13 @@ pub struct InputScheduleOutcome {
     pub status: InputScheduleStatus,
     pub assigned_frame: Option<FrameCounter>,
     pub pad_word: u16,
+    pub rejection: Option<InputRejectionNotice>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputRejectionNotice {
+    pub reason_code: String,
+    pub public_message: String,
 }
 
 impl InputScheduleOutcome {
@@ -79,6 +89,7 @@ impl InputScheduleOutcome {
             status: InputScheduleStatus::Applied,
             assigned_frame: Some(receipt.assigned_frame),
             pad_word: receipt.pad_word.raw(),
+            rejection: None,
         }
     }
 
@@ -88,15 +99,17 @@ impl InputScheduleOutcome {
             status: InputScheduleStatus::Queued,
             assigned_frame: None,
             pad_word: input.pad_word.raw(),
+            rejection: None,
         }
     }
 
-    fn dropped(input: &BrowserInputState) -> Self {
+    fn dropped(input: &BrowserInputState, rejection: InputRejectionNotice) -> Self {
         Self {
             client_seq: input.client_seq,
             status: InputScheduleStatus::Dropped,
             assigned_frame: None,
             pad_word: input.pad_word.raw(),
+            rejection: Some(rejection),
         }
     }
 }
@@ -111,13 +124,20 @@ pub struct InputRejectionRecord {
 }
 
 impl InputRejectionRecord {
-    fn frame_stale(input: &BrowserInputState) -> Self {
+    fn new_for_input(input: &BrowserInputState, run_id: &str, reason_code: &str) -> Self {
         Self {
-            run_id: input.run_id.clone(),
+            run_id: run_id.to_string(),
             client_seq: input.client_seq,
             occurred_at: input.occurred_at.clone(),
-            reason_code: FRAME_STALE_REASON_CODE.to_string(),
+            reason_code: reason_code.to_string(),
             public_message: PUBLIC_INPUT_REJECTION_MESSAGE.to_string(),
+        }
+    }
+
+    fn notice(&self) -> InputRejectionNotice {
+        InputRejectionNotice {
+            reason_code: self.reason_code.clone(),
+            public_message: self.public_message.clone(),
         }
     }
 }
@@ -166,8 +186,17 @@ impl InputRejectionSink for PrivateArtifactStore<'_> {
 pub enum InputSchedulerError {
     #[error("backend input scheduling failed: {0}")]
     Backend(#[from] BackendError),
+    #[error("input lead frames must be at least 1")]
+    InvalidLeadFrames,
     #[error("frame counter overflow while scheduling from {current_frame}")]
     FrameCounterOverflow { current_frame: FrameCounter },
+    #[error(
+        "backend returned status for session {actual_session_id}, expected {expected_session_id}"
+    )]
+    BackendStatusSessionMismatch {
+        expected_session_id: SessionId,
+        actual_session_id: SessionId,
+    },
     #[error("session {session_id} is not accepting input in state {state}")]
     SessionNotAcceptingInput {
         session_id: SessionId,
@@ -179,6 +208,25 @@ pub enum InputSchedulerError {
     OutOfOrderAppliedFrame {
         frame: FrameCounter,
         previous_frame: FrameCounter,
+    },
+    #[error(
+        "backend input receipt session mismatch: expected {expected_session_id}, got {actual_session_id}"
+    )]
+    ReceiptSessionMismatch {
+        expected_session_id: SessionId,
+        actual_session_id: SessionId,
+    },
+    #[error(
+        "backend input receipt pad word mismatch: expected {expected_pad_word:#06x}, got {actual_pad_word:#06x}"
+    )]
+    ReceiptPadWordMismatch {
+        expected_pad_word: u16,
+        actual_pad_word: u16,
+    },
+    #[error("backend assigned input frame {assigned_frame} before requested target {target_frame}")]
+    ReceiptFrameBeforeTarget {
+        assigned_frame: FrameCounter,
+        target_frame: FrameCounter,
     },
     #[error("input rejection sink failed: {0}")]
     RejectionSink(String),
@@ -195,16 +243,62 @@ impl From<SessionState> for SessionStateLabel {
 
 impl fmt::Display for SessionStateLabel {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{:?}", self.0)
+        formatter.write_str(match self.0 {
+            SessionState::Idle => "idle",
+            SessionState::Starting => "starting",
+            SessionState::Running => "running",
+            SessionState::Paused => "paused",
+            SessionState::CapturePending => "capture_pending",
+            SessionState::Stopping => "stopping",
+            SessionState::Stopped => "stopped",
+            SessionState::Faulted => "faulted",
+        })
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct InputRunKey {
+    session_id: SessionId,
+    run_id: String,
+}
+
+impl InputRunKey {
+    fn from_status(
+        expected_session_id: &str,
+        status: &RunStatus,
+    ) -> Result<Self, InputSchedulerError> {
+        if status.session_id != expected_session_id {
+            return Err(InputSchedulerError::BackendStatusSessionMismatch {
+                expected_session_id: expected_session_id.to_string(),
+                actual_session_id: status.session_id.clone(),
+            });
+        }
+
+        Ok(Self {
+            session_id: status.session_id.clone(),
+            run_id: status.run_id.clone(),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct QueuedInputState {
+    key: InputRunKey,
+    input: BrowserInputState,
+}
+
+#[derive(Debug, Clone, Default)]
+struct InputRunState {
+    applied_frames: Vec<AppliedInputFrame>,
+    last_assigned_frame: Option<FrameCounter>,
 }
 
 #[derive(Debug, Clone)]
 pub struct InputScheduler {
     lead_frames: FrameCounter,
-    pending: VecDeque<BrowserInputState>,
+    pending: VecDeque<QueuedInputState>,
+    run_states: BTreeMap<InputRunKey, InputRunState>,
     applied_frames: Vec<AppliedInputFrame>,
-    last_assigned_frame: Option<FrameCounter>,
 }
 
 impl Default for InputScheduler {
@@ -219,16 +313,28 @@ impl InputScheduler {
     }
 
     pub fn with_lead_frames(lead_frames: FrameCounter) -> Self {
-        Self {
-            lead_frames: lead_frames.max(1),
-            pending: VecDeque::new(),
-            applied_frames: Vec::new(),
-            last_assigned_frame: None,
+        Self::try_with_lead_frames(lead_frames).expect("lead_frames must be at least 1")
+    }
+
+    pub fn try_with_lead_frames(lead_frames: FrameCounter) -> Result<Self, InputSchedulerError> {
+        if lead_frames == 0 {
+            return Err(InputSchedulerError::InvalidLeadFrames);
         }
+
+        Ok(Self {
+            lead_frames,
+            pending: VecDeque::new(),
+            run_states: BTreeMap::new(),
+            applied_frames: Vec::new(),
+        })
     }
 
     pub fn pending_len(&self) -> usize {
         self.pending.len()
+    }
+
+    pub fn pending_len_for_session(&self, session_id: &str) -> usize {
+        self.pending_for_session(session_id)
     }
 
     pub fn applied_frames(&self) -> &[AppliedInputFrame] {
@@ -242,14 +348,25 @@ impl InputScheduler {
         rejection_sink: &mut dyn InputRejectionSink,
     ) -> Result<InputScheduleOutcome, InputSchedulerError> {
         let status = backend.status(input.session_id.clone())?;
+        let key = InputRunKey::from_status(&input.session_id, &status)?;
 
         if status.state == SessionState::Paused {
+            if self.pending_for_session(&input.session_id) >= PENDING_INPUT_LIMIT_PER_SESSION {
+                let rejection = InputRejectionRecord::new_for_input(
+                    &input,
+                    &key.run_id,
+                    QUEUE_FULL_REASON_CODE,
+                );
+                rejection_sink.record_input_rejection(&rejection)?;
+                return Ok(InputScheduleOutcome::dropped(&input, rejection.notice()));
+            }
+
             let outcome = InputScheduleOutcome::queued(&input);
-            self.pending.push_back(input);
+            self.pending.push_back(QueuedInputState { key, input });
             return Ok(outcome);
         }
 
-        self.apply_with_status(backend, input, status, rejection_sink)
+        self.apply_with_status(backend, input, status, key, rejection_sink)
     }
 
     pub fn flush_pending(
@@ -259,32 +376,52 @@ impl InputScheduler {
         rejection_sink: &mut dyn InputRejectionSink,
     ) -> Result<Vec<InputScheduleOutcome>, InputSchedulerError> {
         let status = backend.status(session_id.to_string())?;
+        let key = InputRunKey::from_status(session_id, &status)?;
         if status.state == SessionState::Paused {
             return Ok(self
                 .pending
                 .iter()
-                .filter(|input| input.session_id == session_id)
-                .map(InputScheduleOutcome::queued)
+                .filter(|queued| queued.key.session_id == session_id)
+                .map(|queued| InputScheduleOutcome::queued(&queued.input))
                 .collect());
         }
 
         let mut outcomes = Vec::new();
         let mut remaining = VecDeque::new();
 
-        while let Some(input) = self.pending.pop_front() {
-            if input.session_id == session_id {
-                match self.apply_with_status(backend, input.clone(), status.clone(), rejection_sink)
-                {
+        while let Some(queued) = self.pending.pop_front() {
+            if queued.key.session_id == session_id {
+                if queued.key != key {
+                    let rejection = InputRejectionRecord::new_for_input(
+                        &queued.input,
+                        &queued.key.run_id,
+                        SESSION_REPLACED_REASON_CODE,
+                    );
+                    rejection_sink.record_input_rejection(&rejection)?;
+                    outcomes.push(InputScheduleOutcome::dropped(
+                        &queued.input,
+                        rejection.notice(),
+                    ));
+                    continue;
+                }
+
+                match self.apply_with_status(
+                    backend,
+                    queued.input.clone(),
+                    status.clone(),
+                    key.clone(),
+                    rejection_sink,
+                ) {
                     Ok(outcome) => outcomes.push(outcome),
                     Err(error) => {
-                        remaining.push_back(input);
+                        remaining.push_back(queued);
                         remaining.append(&mut self.pending);
                         self.pending = remaining;
                         return Err(error);
                     }
                 }
             } else {
-                remaining.push_back(input);
+                remaining.push_back(queued);
             }
         }
 
@@ -297,6 +434,7 @@ impl InputScheduler {
         backend: &dyn BridgeBackend,
         input: BrowserInputState,
         status: RunStatus,
+        key: InputRunKey,
         rejection_sink: &mut dyn InputRejectionSink,
     ) -> Result<InputScheduleOutcome, InputSchedulerError> {
         if status.state != SessionState::Running {
@@ -306,7 +444,7 @@ impl InputScheduler {
             });
         }
 
-        let target_frame = self.next_target_frame(status.current_frame)?;
+        let target_frame = self.next_target_frame(&key, status.current_frame)?;
         let request = InputScheduleRequest {
             session_id: input.session_id.clone(),
             target_frame,
@@ -314,9 +452,9 @@ impl InputScheduler {
         };
 
         match backend.inject_input(request) {
-            Ok(receipt) => self.record_applied(&input, receipt),
+            Ok(receipt) => self.record_applied(&key, &input, target_frame, receipt),
             Err(BackendError::FrameStale { .. }) => {
-                self.retry_after_stale_frame(backend, input, rejection_sink)
+                self.retry_after_stale_frame(backend, input, key, rejection_sink)
             }
             Err(error) => Err(InputSchedulerError::Backend(error)),
         }
@@ -326,9 +464,21 @@ impl InputScheduler {
         &mut self,
         backend: &dyn BridgeBackend,
         input: BrowserInputState,
+        original_key: InputRunKey,
         rejection_sink: &mut dyn InputRejectionSink,
     ) -> Result<InputScheduleOutcome, InputSchedulerError> {
         let refreshed = backend.status(input.session_id.clone())?;
+        let refreshed_key = InputRunKey::from_status(&input.session_id, &refreshed)?;
+        if refreshed_key != original_key {
+            let rejection = InputRejectionRecord::new_for_input(
+                &input,
+                &original_key.run_id,
+                SESSION_REPLACED_REASON_CODE,
+            );
+            rejection_sink.record_input_rejection(&rejection)?;
+            return Ok(InputScheduleOutcome::dropped(&input, rejection.notice()));
+        }
+
         if refreshed.state != SessionState::Running {
             return Err(InputSchedulerError::SessionNotAcceptingInput {
                 session_id: refreshed.session_id,
@@ -336,7 +486,7 @@ impl InputScheduler {
             });
         }
 
-        let retry_frame = self.next_target_frame(refreshed.current_frame)?;
+        let retry_frame = self.next_target_frame(&refreshed_key, refreshed.current_frame)?;
         let retry = InputScheduleRequest {
             session_id: input.session_id.clone(),
             target_frame: retry_frame,
@@ -344,11 +494,15 @@ impl InputScheduler {
         };
 
         match backend.inject_input(retry) {
-            Ok(receipt) => self.record_applied(&input, receipt),
+            Ok(receipt) => self.record_applied(&refreshed_key, &input, retry_frame, receipt),
             Err(BackendError::FrameStale { .. }) => {
-                rejection_sink
-                    .record_input_rejection(&InputRejectionRecord::frame_stale(&input))?;
-                Ok(InputScheduleOutcome::dropped(&input))
+                let rejection = InputRejectionRecord::new_for_input(
+                    &input,
+                    &refreshed_key.run_id,
+                    FRAME_STALE_REASON_CODE,
+                );
+                rejection_sink.record_input_rejection(&rejection)?;
+                Ok(InputScheduleOutcome::dropped(&input, rejection.notice()))
             }
             Err(error) => Err(InputSchedulerError::Backend(error)),
         }
@@ -356,13 +510,18 @@ impl InputScheduler {
 
     fn next_target_frame(
         &self,
+        key: &InputRunKey,
         current_frame: FrameCounter,
     ) -> Result<FrameCounter, InputSchedulerError> {
         let future_frame = current_frame
             .checked_add(self.lead_frames)
             .ok_or(InputSchedulerError::FrameCounterOverflow { current_frame })?;
 
-        match self.last_assigned_frame {
+        match self
+            .run_states
+            .get(key)
+            .and_then(|state| state.last_assigned_frame)
+        {
             Some(last_assigned) if last_assigned >= future_frame => last_assigned
                 .checked_add(1)
                 .ok_or(InputSchedulerError::FrameCounterOverflow {
@@ -374,10 +533,35 @@ impl InputScheduler {
 
     fn record_applied(
         &mut self,
+        key: &InputRunKey,
         input: &BrowserInputState,
+        target_frame: FrameCounter,
         receipt: InputScheduleReceipt,
     ) -> Result<InputScheduleOutcome, InputSchedulerError> {
-        if let Some(previous_frame) = self.last_assigned_frame
+        if receipt.session_id != input.session_id {
+            return Err(InputSchedulerError::ReceiptSessionMismatch {
+                expected_session_id: input.session_id.clone(),
+                actual_session_id: receipt.session_id,
+            });
+        }
+
+        if receipt.pad_word != input.pad_word {
+            return Err(InputSchedulerError::ReceiptPadWordMismatch {
+                expected_pad_word: input.pad_word.raw(),
+                actual_pad_word: receipt.pad_word.raw(),
+            });
+        }
+
+        if receipt.assigned_frame < target_frame {
+            return Err(InputSchedulerError::ReceiptFrameBeforeTarget {
+                assigned_frame: receipt.assigned_frame,
+                target_frame,
+            });
+        }
+
+        let run_state = self.run_states.entry(key.clone()).or_default();
+
+        if let Some(previous_frame) = run_state.last_assigned_frame
             && receipt.assigned_frame <= previous_frame
         {
             return if receipt.assigned_frame == previous_frame {
@@ -392,7 +576,7 @@ impl InputScheduler {
             };
         }
 
-        if self
+        if run_state
             .applied_frames
             .iter()
             .any(|applied| applied.frame == receipt.assigned_frame)
@@ -402,12 +586,18 @@ impl InputScheduler {
             });
         }
 
-        self.last_assigned_frame = Some(receipt.assigned_frame);
-        self.applied_frames.push(AppliedInputFrame::new(
-            receipt.assigned_frame,
-            receipt.pad_word,
-        ));
+        let applied = AppliedInputFrame::new(receipt.assigned_frame, receipt.pad_word);
+        run_state.last_assigned_frame = Some(receipt.assigned_frame);
+        run_state.applied_frames.push(applied.clone());
+        self.applied_frames.push(applied);
 
         Ok(InputScheduleOutcome::applied(input, &receipt))
+    }
+
+    fn pending_for_session(&self, session_id: &str) -> usize {
+        self.pending
+            .iter()
+            .filter(|queued| queued.key.session_id == session_id)
+            .count()
     }
 }

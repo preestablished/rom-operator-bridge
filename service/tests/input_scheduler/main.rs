@@ -8,7 +8,8 @@ use rom_operator_bridge_service::{
     input::{
         AppliedInputFrame, BrowserInputState, FRAME_STALE_REASON_CODE, InputRejectionRecord,
         InputRejectionSink, InputScheduleStatus, InputScheduler, InputSchedulerError,
-        PUBLIC_INPUT_REJECTION_MESSAGE, PadButton, PadWord,
+        PENDING_INPUT_LIMIT_PER_SESSION, PUBLIC_INPUT_REJECTION_MESSAGE, PadButton, PadWord,
+        QUEUE_FULL_REASON_CODE, SESSION_REPLACED_REASON_CODE,
     },
 };
 use std::{
@@ -42,6 +43,14 @@ fn assigns_current_frame_plus_one_from_fake_frame_counter() {
         }]
     );
     assert!(rejections.records.is_empty());
+}
+
+#[test]
+fn rejects_zero_lead_frame_configuration() {
+    assert!(matches!(
+        InputScheduler::try_with_lead_frames(0),
+        Err(InputSchedulerError::InvalidLeadFrames)
+    ));
 }
 
 #[test]
@@ -168,6 +177,13 @@ fn failed_late_retry_records_private_input_rejection() {
 
     assert_eq!(outcome.status, InputScheduleStatus::Dropped);
     assert_eq!(outcome.assigned_frame, None);
+    assert_eq!(
+        outcome
+            .rejection
+            .as_ref()
+            .map(|rejection| rejection.reason_code.as_str()),
+        Some(FRAME_STALE_REASON_CODE)
+    );
     assert_eq!(backend.request_frames(), [6, 9]);
     assert!(scheduler.applied_frames().is_empty());
     assert_eq!(
@@ -180,6 +196,150 @@ fn failed_late_retry_records_private_input_rejection() {
             public_message: PUBLIC_INPUT_REJECTION_MESSAGE.to_string(),
         }]
     );
+}
+
+#[test]
+fn failed_late_retry_during_flush_removes_pending_after_private_rejection() {
+    let backend = FakeBackend::new([
+        (SessionState::Paused, 10),
+        (SessionState::Running, 20),
+        (SessionState::Running, 25),
+    ]);
+    backend.push_injection(Err(stale_frame(21, 22)));
+    backend.push_injection(Err(stale_frame(26, 27)));
+    let mut scheduler = InputScheduler::new();
+    let mut rejections = RecordingRejectionSink::default();
+
+    scheduler
+        .submit(
+            &backend,
+            input(8, PadWord::from_buttons([PadButton::L])),
+            &mut rejections,
+        )
+        .expect("input queues");
+
+    let flushed = scheduler
+        .flush_pending(&backend, SESSION_ID, &mut rejections)
+        .expect("stale retry drop is a typed outcome");
+
+    assert_eq!(flushed.len(), 1);
+    assert_eq!(flushed[0].status, InputScheduleStatus::Dropped);
+    assert_eq!(
+        flushed[0]
+            .rejection
+            .as_ref()
+            .map(|rejection| rejection.reason_code.as_str()),
+        Some(FRAME_STALE_REASON_CODE)
+    );
+    assert_eq!(backend.request_frames(), [21, 26]);
+    assert_eq!(scheduler.pending_len(), 0);
+    assert!(scheduler.applied_frames().is_empty());
+    assert_eq!(rejections.records[0].reason_code, FRAME_STALE_REASON_CODE);
+}
+
+#[test]
+fn enforces_pending_input_limit_per_session_with_private_rejection() {
+    let backend = FakeBackend::new([(SessionState::Paused, 10)]);
+    let mut scheduler = InputScheduler::new();
+    let mut rejections = RecordingRejectionSink::default();
+
+    for client_seq in 0..PENDING_INPUT_LIMIT_PER_SESSION as u64 {
+        let outcome = scheduler
+            .submit(
+                &backend,
+                input(client_seq, PadWord::from_buttons([PadButton::A])),
+                &mut rejections,
+            )
+            .expect("input queues under limit");
+        assert_eq!(outcome.status, InputScheduleStatus::Queued);
+    }
+
+    let overflow = scheduler
+        .submit(
+            &backend,
+            input(999, PadWord::from_buttons([PadButton::B])),
+            &mut rejections,
+        )
+        .expect("queue overflow returns typed drop");
+
+    assert_eq!(overflow.status, InputScheduleStatus::Dropped);
+    assert_eq!(
+        overflow
+            .rejection
+            .as_ref()
+            .map(|rejection| rejection.reason_code.as_str()),
+        Some(QUEUE_FULL_REASON_CODE)
+    );
+    assert_eq!(scheduler.pending_len(), PENDING_INPUT_LIMIT_PER_SESSION);
+    assert_eq!(rejections.records.len(), 1);
+    assert_eq!(rejections.records[0].reason_code, QUEUE_FULL_REASON_CODE);
+}
+
+#[test]
+fn drops_queued_input_from_replaced_run_without_applying_it() {
+    let backend = FakeBackend::new_with_runs([
+        ("run-old", SessionState::Paused, 10),
+        ("run-new", SessionState::Running, 0),
+    ]);
+    let mut scheduler = InputScheduler::new();
+    let mut rejections = RecordingRejectionSink::default();
+
+    scheduler
+        .submit(
+            &backend,
+            input(1, PadWord::from_buttons([PadButton::A])),
+            &mut rejections,
+        )
+        .expect("old run input queues");
+
+    let flushed = scheduler
+        .flush_pending(&backend, SESSION_ID, &mut rejections)
+        .expect("old run input drops");
+
+    assert_eq!(flushed.len(), 1);
+    assert_eq!(flushed[0].status, InputScheduleStatus::Dropped);
+    assert_eq!(
+        flushed[0]
+            .rejection
+            .as_ref()
+            .map(|rejection| rejection.reason_code.as_str()),
+        Some(SESSION_REPLACED_REASON_CODE)
+    );
+    assert!(backend.request_frames().is_empty());
+    assert_eq!(scheduler.pending_len(), 0);
+    assert_eq!(rejections.records[0].run_id, "run-old");
+    assert_eq!(
+        rejections.records[0].reason_code,
+        SESSION_REPLACED_REASON_CODE
+    );
+}
+
+#[test]
+fn frame_assignment_state_is_scoped_to_backend_run() {
+    let backend = FakeBackend::new_with_runs([
+        ("run-one", SessionState::Running, 100),
+        ("run-two", SessionState::Running, 0),
+    ]);
+    let mut scheduler = InputScheduler::new();
+    let mut rejections = RecordingRejectionSink::default();
+
+    scheduler
+        .submit(
+            &backend,
+            input(1, PadWord::from_buttons([PadButton::A])),
+            &mut rejections,
+        )
+        .expect("first run input schedules");
+    scheduler
+        .submit(
+            &backend,
+            input(2, PadWord::from_buttons([PadButton::B])),
+            &mut rejections,
+        )
+        .expect("replacement run input schedules from its own frame base");
+
+    assert_eq!(backend.request_frames(), [101, 1]);
+    assert!(rejections.records.is_empty());
 }
 
 #[test]
@@ -229,8 +389,142 @@ fn applies_one_pad_word_per_replay_frame_preserving_order() {
 }
 
 #[test]
-fn serializes_assigned_frames_without_narrowing_to_u32() {
-    let current_frame = u32::MAX as FrameCounter;
+fn rejects_backend_receipt_with_mismatched_session_id() {
+    let backend = FakeBackend::new([(SessionState::Running, 10)]);
+    backend.push_injection(Ok(receipt(
+        "different-session",
+        11,
+        PadWord::from_buttons([PadButton::A]),
+    )));
+    let mut scheduler = InputScheduler::new();
+    let mut rejections = RecordingRejectionSink::default();
+
+    let error = scheduler
+        .submit(
+            &backend,
+            input(1, PadWord::from_buttons([PadButton::A])),
+            &mut rejections,
+        )
+        .expect_err("receipt session mismatch is rejected");
+
+    assert!(matches!(
+        error,
+        InputSchedulerError::ReceiptSessionMismatch { .. }
+    ));
+    assert!(scheduler.applied_frames().is_empty());
+}
+
+#[test]
+fn rejects_backend_receipt_with_mismatched_pad_word() {
+    let backend = FakeBackend::new([(SessionState::Running, 10)]);
+    backend.push_injection(Ok(receipt(
+        SESSION_ID,
+        11,
+        PadWord::from_buttons([PadButton::B]),
+    )));
+    let mut scheduler = InputScheduler::new();
+    let mut rejections = RecordingRejectionSink::default();
+
+    let error = scheduler
+        .submit(
+            &backend,
+            input(1, PadWord::from_buttons([PadButton::A])),
+            &mut rejections,
+        )
+        .expect_err("receipt pad mismatch is rejected");
+
+    assert!(matches!(
+        error,
+        InputSchedulerError::ReceiptPadWordMismatch { .. }
+    ));
+    assert!(scheduler.applied_frames().is_empty());
+}
+
+#[test]
+fn rejects_backend_receipt_before_requested_target_frame() {
+    let backend = FakeBackend::new([(SessionState::Running, 10)]);
+    backend.push_injection(Ok(receipt(
+        SESSION_ID,
+        10,
+        PadWord::from_buttons([PadButton::A]),
+    )));
+    let mut scheduler = InputScheduler::new();
+    let mut rejections = RecordingRejectionSink::default();
+
+    let error = scheduler
+        .submit(
+            &backend,
+            input(1, PadWord::from_buttons([PadButton::A])),
+            &mut rejections,
+        )
+        .expect_err("receipt before target is rejected");
+
+    assert!(matches!(
+        error,
+        InputSchedulerError::ReceiptFrameBeforeTarget { .. }
+    ));
+    assert!(scheduler.applied_frames().is_empty());
+}
+
+#[test]
+fn reports_frame_counter_overflow_from_current_frame() {
+    let backend = FakeBackend::new([(SessionState::Running, FrameCounter::MAX)]);
+    let mut scheduler = InputScheduler::new();
+    let mut rejections = RecordingRejectionSink::default();
+
+    let error = scheduler
+        .submit(
+            &backend,
+            input(1, PadWord::from_buttons([PadButton::A])),
+            &mut rejections,
+        )
+        .expect_err("current frame overflow is rejected");
+
+    assert!(matches!(
+        error,
+        InputSchedulerError::FrameCounterOverflow {
+            current_frame: FrameCounter::MAX
+        }
+    ));
+    assert!(backend.request_frames().is_empty());
+}
+
+#[test]
+fn reports_frame_counter_overflow_after_last_assigned_frame() {
+    let backend = FakeBackend::new([
+        (SessionState::Running, FrameCounter::MAX - 1),
+        (SessionState::Running, FrameCounter::MAX - 2),
+    ]);
+    let mut scheduler = InputScheduler::new();
+    let mut rejections = RecordingRejectionSink::default();
+
+    scheduler
+        .submit(
+            &backend,
+            input(1, PadWord::from_buttons([PadButton::A])),
+            &mut rejections,
+        )
+        .expect("first input schedules at u64 max");
+    let error = scheduler
+        .submit(
+            &backend,
+            input(2, PadWord::from_buttons([PadButton::B])),
+            &mut rejections,
+        )
+        .expect_err("last assigned overflow is rejected");
+
+    assert!(matches!(
+        error,
+        InputSchedulerError::FrameCounterOverflow {
+            current_frame: FrameCounter::MAX
+        }
+    ));
+    assert_eq!(backend.request_frames(), [FrameCounter::MAX]);
+}
+
+#[test]
+fn serializes_assigned_frames_at_browser_safe_integer_boundary() {
+    let current_frame = 9_007_199_254_740_990;
     let backend = FakeBackend::new([(SessionState::Running, current_frame)]);
     let mut scheduler = InputScheduler::new();
     let mut rejections = RecordingRejectionSink::default();
@@ -255,10 +549,23 @@ fn serializes_assigned_frames_without_narrowing_to_u32() {
         serde_json::from_value(json).expect("applied frame deserializes");
     assert_eq!(decoded.frame, assigned_frame);
     assert!(assigned_frame > u32::MAX as u64);
+    assert_eq!(assigned_frame, 9_007_199_254_740_991);
 }
 
 fn input(client_seq: u64, pad_word: PadWord) -> BrowserInputState {
-    BrowserInputState::new(SESSION_ID, RUN_ID, client_seq, OCCURRED_AT, pad_word)
+    BrowserInputState::new(SESSION_ID, client_seq, OCCURRED_AT, pad_word)
+}
+
+fn receipt(
+    session_id: impl Into<SessionId>,
+    assigned_frame: FrameCounter,
+    pad_word: PadWord,
+) -> InputScheduleReceipt {
+    InputScheduleReceipt {
+        session_id: session_id.into(),
+        assigned_frame,
+        pad_word,
+    }
 }
 
 fn stale_frame(requested_frame: FrameCounter, current_frame: FrameCounter) -> BackendError {
@@ -293,10 +600,25 @@ struct FakeBackend {
 
 impl FakeBackend {
     fn new(statuses: impl IntoIterator<Item = (SessionState, FrameCounter)>) -> Self {
-        let mut statuses = statuses
-            .into_iter()
-            .map(|(state, current_frame)| status(state, current_frame))
-            .collect::<VecDeque<_>>();
+        Self::from_statuses(
+            statuses
+                .into_iter()
+                .map(|(state, current_frame)| status(RUN_ID, state, current_frame)),
+        )
+    }
+
+    fn new_with_runs(
+        statuses: impl IntoIterator<Item = (&'static str, SessionState, FrameCounter)>,
+    ) -> Self {
+        Self::from_statuses(
+            statuses
+                .into_iter()
+                .map(|(run_id, state, current_frame)| status(run_id, state, current_frame)),
+        )
+    }
+
+    fn from_statuses(statuses: impl IntoIterator<Item = RunStatus>) -> Self {
+        let mut statuses = statuses.into_iter().collect::<VecDeque<_>>();
         let first_status = statuses
             .front()
             .cloned()
@@ -391,10 +713,10 @@ impl BridgeBackend for FakeBackend {
     }
 }
 
-fn status(state: SessionState, current_frame: FrameCounter) -> RunStatus {
+fn status(run_id: &str, state: SessionState, current_frame: FrameCounter) -> RunStatus {
     RunStatus {
         session_id: SESSION_ID.to_string(),
-        run_id: RUN_ID.to_string(),
+        run_id: run_id.to_string(),
         state,
         backend_mode: BackendMode::Synthetic,
         current_frame,

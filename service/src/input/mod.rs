@@ -7,6 +7,8 @@ pub use mapping::{
 };
 pub use scheduler::{
     AppliedInputFrame, BrowserInputState, DEFAULT_INPUT_LEAD_FRAMES, FRAME_STALE_REASON_CODE,
-    InputRejectionRecord, InputRejectionSink, InputScheduleOutcome, InputScheduleStatus,
-    InputScheduler, InputSchedulerError, NoopInputRejectionSink, PUBLIC_INPUT_REJECTION_MESSAGE,
+    InputRejectionNotice, InputRejectionRecord, InputRejectionSink, InputScheduleOutcome,
+    InputScheduleStatus, InputScheduler, InputSchedulerError, NoopInputRejectionSink,
+    PENDING_INPUT_LIMIT_PER_SESSION, PUBLIC_INPUT_REJECTION_MESSAGE, QUEUE_FULL_REASON_CODE,
+    SESSION_REPLACED_REASON_CODE,
 };
