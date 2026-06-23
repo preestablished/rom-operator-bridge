@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "rom_operator_bridge",
+  "project_id": "630e08a5-0879-46d7-93d8-e20f5428ba5b"
+}
