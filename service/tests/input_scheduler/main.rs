@@ -94,6 +94,35 @@ fn queues_paused_input_and_flushes_in_fifo_order_after_resume() {
 }
 
 #[test]
+fn preserves_pending_input_when_flush_hits_non_stale_backend_error() {
+    let backend = FakeBackend::new([(SessionState::Paused, 10), (SessionState::Running, 20)]);
+    backend.push_injection(Err(BackendError::BackendUnavailable));
+    let mut scheduler = InputScheduler::new();
+    let mut rejections = RecordingRejectionSink::default();
+
+    scheduler
+        .submit(
+            &backend,
+            input(1, PadWord::from_buttons([PadButton::A])),
+            &mut rejections,
+        )
+        .expect("input queues");
+
+    let error = scheduler
+        .flush_pending(&backend, SESSION_ID, &mut rejections)
+        .expect_err("backend error is surfaced");
+
+    assert!(matches!(
+        error,
+        InputSchedulerError::Backend(BackendError::BackendUnavailable)
+    ));
+    assert_eq!(scheduler.pending_len(), 1);
+    assert_eq!(backend.request_frames(), [21]);
+    assert!(scheduler.applied_frames().is_empty());
+    assert!(rejections.records.is_empty());
+}
+
+#[test]
 fn retries_once_when_backend_rejects_a_late_frame() {
     let backend = FakeBackend::new([(SessionState::Running, 5), (SessionState::Running, 8)]);
     backend.push_injection(Err(stale_frame(6, 7)));

@@ -273,12 +273,16 @@ impl InputScheduler {
 
         while let Some(input) = self.pending.pop_front() {
             if input.session_id == session_id {
-                outcomes.push(self.apply_with_status(
-                    backend,
-                    input,
-                    status.clone(),
-                    rejection_sink,
-                )?);
+                match self.apply_with_status(backend, input.clone(), status.clone(), rejection_sink)
+                {
+                    Ok(outcome) => outcomes.push(outcome),
+                    Err(error) => {
+                        remaining.push_back(input);
+                        remaining.append(&mut self.pending);
+                        self.pending = remaining;
+                        return Err(error);
+                    }
+                }
             } else {
                 remaining.push_back(input);
             }
