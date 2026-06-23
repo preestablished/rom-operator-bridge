@@ -1,5 +1,6 @@
 use crate::{
     backend::BackendMode,
+    input::{PAD_MASK, PadLog},
     private_config::{BridgePrivateConfig, PrivateConfigError},
 };
 use serde::{Deserialize, Serialize};
@@ -61,6 +62,36 @@ impl<'a> PrivateArtifactStore<'a> {
             PathBuf::from("runs")
                 .join(run_id)
                 .join("input-rejections.jsonl"),
+            row,
+        )
+    }
+
+    pub fn write_padlog(
+        &self,
+        run_id: &str,
+        padlog: &PadLog,
+    ) -> Result<PrivateArtifactRef, ArtifactError> {
+        let run_id = path_segment("run_id", run_id)?;
+        let relative_path = PathBuf::from("runs").join(run_id).join("input.padlog");
+        let padlog_text = padlog.write_canonical();
+        self.config
+            .write_private_file_atomic(&relative_path, padlog_text.as_bytes())?;
+        Ok(PrivateArtifactRef::new(relative_path))
+    }
+
+    pub fn append_padlog_event(
+        &self,
+        run_id: &str,
+        row: &PadLogEventRow,
+    ) -> Result<PrivateArtifactRef, ArtifactError> {
+        ensure_schema_version(row.schema_version)?;
+        ensure_pad_word(row.pad_word)?;
+        let run_id = path_segment("run_id", run_id)?;
+        ensure_matching_identifier("run_id", run_id, &row.run_id)?;
+        self.append_jsonl(
+            PathBuf::from("runs")
+                .join(run_id)
+                .join("padlog-events.jsonl"),
             row,
         )
     }
@@ -243,6 +274,44 @@ impl InputRejectionRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadLogEventRow {
+    pub schema_version: u16,
+    pub run_id: String,
+    pub frame_index: u64,
+    pub assigned_frame: u64,
+    pub pad_word: u16,
+    pub client_seq: u64,
+    pub source_id: String,
+    pub status: String,
+    pub message: String,
+}
+
+impl PadLogEventRow {
+    pub fn new(
+        run_id: impl Into<String>,
+        frame_index: u64,
+        assigned_frame: u64,
+        pad_word: u16,
+        client_seq: u64,
+        source_id: impl Into<String>,
+        status: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            schema_version: ARTIFACT_SCHEMA_VERSION,
+            run_id: run_id.into(),
+            frame_index,
+            assigned_frame,
+            pad_word,
+            client_seq,
+            source_id: source_id.into(),
+            status: status.into(),
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecentCapturesFile {
     pub schema_version: u16,
     pub captures: Vec<CaptureSummary>,
@@ -395,6 +464,15 @@ fn ensure_matching_identifier(
     }
 }
 
+fn ensure_pad_word(pad_word: u16) -> Result<(), ArtifactError> {
+    let reserved = pad_word & !PAD_MASK;
+    if reserved == 0 {
+        Ok(())
+    } else {
+        Err(ArtifactError::InvalidPadWord { pad_word, reserved })
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ArtifactError {
     #[error(transparent)]
@@ -411,4 +489,6 @@ pub enum ArtifactError {
         path_value: String,
         row_value: String,
     },
+    #[error("artifact pad word {pad_word:#06x} sets reserved bits {reserved:#06x}")]
+    InvalidPadWord { pad_word: u16, reserved: u16 },
 }
