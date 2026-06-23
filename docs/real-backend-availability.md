@@ -36,6 +36,7 @@ Unavailable prerequisite:
 Required undefer inputs:
 
 ```text
+BRIDGE_HYPERVISOR_ENDPOINT, default unix:///run/dh/grpc.sock
 BRIDGE_PRIVATE_ROOT
 BRIDGE_WORKLOAD_IMAGE_REF
 BRIDGE_CAPTURE_SPEC_REF
@@ -43,9 +44,19 @@ BRIDGE_REFERENCE_WORKLOAD_CHECKOUT
 BRIDGE_REAL_SNAPSHOT_REF or BRIDGE_CREATE_VM_CONFIG_REF
 ```
 
-The real backend attachment bead must stay deferred until those inputs are
-available or until an operator explicitly supplies the equivalent private config
-through the uncommitted service configuration.
+The real backend attachment bead must stay deferred until all of these proof
+steps are available:
+
+1. Operator records the private config source that supplies the `BRIDGE_*`
+   values above.
+2. `dh-workerd` is running at the configured endpoint, or at the default
+   `unix:///run/dh/grpc.sock`.
+3. The bridge service user can open the worker socket.
+4. The configured snapshot ref or `CreateVm` startup ref resolves through the
+   private config validator.
+5. A sanitized probe records that missing config returns `backend_unavailable`
+   without private details, and complete config can distinguish an attachable
+   real session from an unavailable backend.
 
 ## Real Capture Export Status
 
@@ -70,7 +81,7 @@ Unavailable prerequisite:
 Required undefer inputs:
 
 ```text
-bridge-owned durable capture writer
+rom-operator-bridge-2sn closed with bridge-owned durable capture writer support
 private capture root
 feature-map.yaml
 scoring-program.yaml
@@ -79,9 +90,11 @@ real backend session inputs
 operator-approved private artifact policy
 ```
 
-The real capture export bead must stay deferred until the writer exists and the
-private operator inputs are available. Synthetic capture work must not be
-represented as Phase 4 real acceptance.
+The real capture export bead must stay deferred until `rom-operator-bridge-2sn`
+or its successor provides the durable private payload and `captures/index.jsonl`
+writer. `rom-operator-bridge-q63` owns the remaining real hypervisor capture
+adapter after that writer exists and the private operator inputs are available.
+Synthetic capture work must not be represented as Phase 4 real acceptance.
 
 ## Downstream Bead Status
 
@@ -92,8 +105,14 @@ Defer now:
 
 Already deferred and still correct:
 
+- `rom-operator-bridge-0wo` (`Document and run real backend smoke`)
 - `rom-operator-bridge-r77` (`Run real one-capture label smoke`)
 - `rom-operator-bridge-opw` (`Validate bridge-produced private bundle`)
+
+Blocked by deferred real backend attachment:
+
+- `rom-operator-bridge-0i9` (`Wire real framebuffer preview source`)
+- `rom-operator-bridge-3dr` (`Wire real frame-boundary input injection`)
 
 Still unblocked:
 
@@ -111,3 +130,6 @@ Still unblocked:
 - Synthetic captures must stay visibly synthetic in API and UI state.
 - Public notes must not contain private paths, screenshots, raw reports, capture
   ids, decoded values, or artifact refs.
+- Private operator evidence for real-backend undefer or real-capture acceptance
+  must stay under the private root. Public summaries may state only sanitized
+  status, command shape, and non-sensitive failure class.
