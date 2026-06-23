@@ -183,6 +183,11 @@ pub struct CaptureJob {
 pub enum BackendError {
     #[error("backend unavailable")]
     BackendUnavailable,
+    #[error("input target frame is stale")]
+    FrameStale {
+        requested_frame: FrameCounter,
+        current_frame: FrameCounter,
+    },
     #[error("{operation} is not implemented in the service scaffold")]
     NotImplemented { operation: &'static str },
 }
