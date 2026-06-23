@@ -1,4 +1,5 @@
 pub mod api;
+pub mod artifacts;
 pub mod backend;
 pub mod config;
 pub mod input;

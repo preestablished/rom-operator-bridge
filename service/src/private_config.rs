@@ -137,6 +137,30 @@ impl BridgePrivateConfig {
         relative_path: impl AsRef<Path>,
         contents: &[u8],
     ) -> Result<PathBuf, PrivateConfigError> {
+        self.write_private_file_with_mode(
+            relative_path.as_ref(),
+            contents,
+            PrivateWriteMode::Truncate,
+        )
+    }
+
+    pub fn append_private_file(
+        &self,
+        relative_path: impl AsRef<Path>,
+        contents: &[u8],
+    ) -> Result<PathBuf, PrivateConfigError> {
+        self.write_private_file_with_mode(
+            relative_path.as_ref(),
+            contents,
+            PrivateWriteMode::Append,
+        )
+    }
+
+    pub fn write_private_file_atomic(
+        &self,
+        relative_path: impl AsRef<Path>,
+        contents: &[u8],
+    ) -> Result<PathBuf, PrivateConfigError> {
         let root = self
             .root
             .as_ref()
@@ -158,8 +182,84 @@ impl BridgePrivateConfig {
             validate_private_file(&path)?;
         }
 
+        let file_name = relative_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| PrivateConfigError::UnsafeRelativePath {
+                path: relative_path.clone(),
+            })?;
+        let parent = relative_path.parent().unwrap_or_else(|| Path::new(""));
+        let temp_name = format!(
+            ".tmp-{file_name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default()
+        );
+        let temp_relative_path = parent.join(temp_name);
+        let temp_path = root.join(&temp_relative_path);
+
         let mut options = OpenOptions::new();
-        options.create(true).truncate(true).write(true);
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        options.mode(PRIVATE_FILE_MODE);
+
+        let mut file = options
+            .open(&temp_path)
+            .map_err(|error| io_error("create temporary private file", &temp_path, error))?;
+        file.write_all(contents)
+            .map_err(|error| io_error("write temporary private file", &temp_path, error))?;
+        file.sync_all()
+            .map_err(|error| io_error("sync temporary private file", &temp_path, error))?;
+        drop(file);
+        set_private_file_mode(&temp_path)?;
+        fs::rename(&temp_path, &path)
+            .map_err(|error| io_error("rename private file", &path, error))?;
+        sync_parent_dir(&path)?;
+        validate_private_file(&path)?;
+
+        Ok(path)
+    }
+
+    fn write_private_file_with_mode(
+        &self,
+        relative_path: &Path,
+        contents: &[u8],
+        mode: PrivateWriteMode,
+    ) -> Result<PathBuf, PrivateConfigError> {
+        let root = self
+            .root
+            .as_ref()
+            .ok_or(PrivateConfigError::MissingEnv {
+                env: ENV_PRIVATE_ROOT,
+            })?
+            .path();
+        ensure_private_root_dir(root)?;
+        let relative_path = validate_relative_path(relative_path)?;
+
+        if let Some(parent) = relative_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            ensure_private_descendant_dir(root, parent)?;
+        }
+        let path = root.join(&relative_path);
+        let file_exists = path_metadata(&path)?.is_some();
+        if file_exists {
+            validate_private_file(&path)?;
+        }
+
+        let mut options = OpenOptions::new();
+        options.create(true).write(true);
+        match mode {
+            PrivateWriteMode::Truncate => {
+                options.truncate(true);
+            }
+            PrivateWriteMode::Append => {
+                options.append(true);
+            }
+        }
         #[cfg(unix)]
         options.mode(PRIVATE_FILE_MODE);
 
@@ -171,9 +271,18 @@ impl BridgePrivateConfig {
         file.sync_all()
             .map_err(|error| io_error("sync private file", &path, error))?;
         set_private_file_mode(&path)?;
+        if matches!(mode, PrivateWriteMode::Append) && !file_exists {
+            sync_parent_dir(&path)?;
+        }
 
         Ok(path)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrivateWriteMode {
+    Truncate,
+    Append,
 }
 
 impl fmt::Debug for BridgePrivateConfig {
@@ -705,6 +814,18 @@ fn set_private_file_mode(path: &Path) -> Result<(), PrivateConfigError> {
 #[cfg(not(unix))]
 fn set_private_file_mode(_path: &Path) -> Result<(), PrivateConfigError> {
     Err(PrivateConfigError::UnsupportedPlatform)
+}
+
+fn sync_parent_dir(path: &Path) -> Result<(), PrivateConfigError> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+
+    let directory =
+        fs::File::open(parent).map_err(|error| io_error("open parent directory", parent, error))?;
+    directory
+        .sync_all()
+        .map_err(|error| io_error("sync parent directory", parent, error))
 }
 
 fn io_error(operation: &'static str, path: &Path, error: io::Error) -> PrivateConfigError {
