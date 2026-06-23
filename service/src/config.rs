@@ -1,0 +1,83 @@
+use crate::backend::BackendMode;
+use std::{collections::BTreeMap, net::SocketAddr, str::FromStr};
+use thiserror::Error;
+
+pub const DEFAULT_BIND_ADDR: &str = "10.0.0.106:7410";
+pub const DEFAULT_BACKEND_MODE: BackendMode = BackendMode::Synthetic;
+pub const ENV_BIND_ADDR: &str = "ROM_OPERATOR_BRIDGE_BIND_ADDR";
+pub const ENV_BACKEND_MODE: &str = "ROM_OPERATOR_BRIDGE_BACKEND";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceConfig {
+    bind_addr: SocketAddr,
+    backend_mode: BackendMode,
+    service_version: String,
+}
+
+impl ServiceConfig {
+    pub fn from_env() -> Result<Self, ConfigError> {
+        Self::from_pairs(std::env::vars())
+    }
+
+    pub fn from_pairs<I, K, V>(pairs: I) -> Result<Self, ConfigError>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        let values: BTreeMap<String, String> = pairs
+            .into_iter()
+            .map(|(key, value)| (key.into(), value.into()))
+            .collect();
+
+        let bind_addr = values
+            .get(ENV_BIND_ADDR)
+            .map(String::as_str)
+            .unwrap_or(DEFAULT_BIND_ADDR)
+            .parse()
+            .map_err(|_| ConfigError::InvalidBindAddr { env: ENV_BIND_ADDR })?;
+
+        let backend_mode = values
+            .get(ENV_BACKEND_MODE)
+            .map(String::as_str)
+            .unwrap_or(DEFAULT_BACKEND_MODE.as_str());
+        let backend_mode =
+            BackendMode::from_str(backend_mode).map_err(|_| ConfigError::InvalidBackendMode {
+                env: ENV_BACKEND_MODE,
+            })?;
+
+        Ok(Self {
+            bind_addr,
+            backend_mode,
+            service_version: env!("CARGO_PKG_VERSION").to_string(),
+        })
+    }
+
+    pub fn synthetic_for_addr(bind_addr: SocketAddr) -> Self {
+        Self {
+            bind_addr,
+            backend_mode: BackendMode::Synthetic,
+            service_version: env!("CARGO_PKG_VERSION").to_string(),
+        }
+    }
+
+    pub const fn bind_addr(&self) -> SocketAddr {
+        self.bind_addr
+    }
+
+    pub const fn backend_mode(&self) -> BackendMode {
+        self.backend_mode
+    }
+
+    pub fn service_version(&self) -> &str {
+        &self.service_version
+    }
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ConfigError {
+    #[error("{env} must be a valid socket address")]
+    InvalidBindAddr { env: &'static str },
+    #[error("{env} must be synthetic or real")]
+    InvalidBackendMode { env: &'static str },
+}
