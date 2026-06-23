@@ -44,6 +44,27 @@ All service/UI JSON payloads are validated against
 event whose `schema_version` is not `1` is rejected client-side before state is
 mutated.
 
+## Service-Owned Collaborators
+
+`BridgeBackend` is the runtime boundary, not the owner of every side effect.
+The service scaffold must keep these collaborators outside backend
+implementations so synthetic and real modes cannot drift:
+
+| Collaborator | Owner | Contract |
+| --- | --- | --- |
+| Auth, origin checks, and session cookie store | Service layer | Reject before backend calls; only sanitized session ids cross the backend boundary. |
+| WebSocket sequencing and idempotency cache | Service layer | Deduplicate `source_id`/`client_seq` and HTTP idempotency keys before repeating side effects. |
+| Padlog writer | Service artifact layer | Persist accepted input frames from both backends through the same append/fsync path. |
+| Event log | Service event layer | Assign `server_seq`, sanitize payloads, and write browser-visible event summaries. |
+| Private capture writer and `captures/index.jsonl` | Service artifact layer | Persist raw payload refs server-side and expose only browser-safe capture ids/status. |
+| Label store | Service label layer | Enforce target label cardinality, status labels, dedup conflicts, and label revisions. |
+| Validation runner | Service validation layer | Execute scoring/quality checks and expose only sanitized pass/fail summaries. |
+
+Backends may return runtime observations, frame previews, scheduling receipts,
+and capture boundary data. They must not write public API state, expose private
+paths, bypass the shared writers, or mark capture completion without the service
+artifact layer's durability proof.
+
 ## Backend Trait
 
 ```rust

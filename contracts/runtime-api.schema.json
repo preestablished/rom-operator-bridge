@@ -20,7 +20,6 @@
     { "$ref": "#/$defs/captureJobResponse" },
     { "$ref": "#/$defs/captureRecentResponse" },
     { "$ref": "#/$defs/captureDetailResponse" },
-    { "$ref": "#/$defs/captureFeaturesResponse" },
     { "$ref": "#/$defs/labelsRequest" },
     { "$ref": "#/$defs/labelsResponse" },
     { "$ref": "#/$defs/labelsSnapshotResponse" },
@@ -51,7 +50,8 @@
     "u64": {
       "type": "integer",
       "minimum": 0,
-      "maximum": 18446744073709551615
+      "maximum": 9007199254740991,
+      "description": "Schema v1 transports frame counters and sequence numbers as JSON safe integers. The service may keep wider u64 values internally."
     },
     "hashRef": {
       "type": "string",
@@ -436,10 +436,20 @@
         "goal_positive",
         "goal_negative",
         "needs_review",
-        "rejected",
-        "same_canonical",
-        "distinct_stable"
+        "rejected"
       ]
+    },
+    "targetLabelRole": {
+      "type": "string",
+      "enum": ["first_boss", "goal_positive", "goal_negative"]
+    },
+    "statusLabelRole": {
+      "type": "string",
+      "enum": ["needs_review", "rejected"]
+    },
+    "dedupRelation": {
+      "type": "string",
+      "enum": ["same_canonical_state", "distinct_stable_state"]
     },
     "captureSummary": {
       "type": "object",
@@ -502,7 +512,10 @@
         "frame": { "$ref": "#/$defs/u64" },
         "status": { "$ref": "#/$defs/captureStatus" },
         "labelable": { "type": "boolean" },
-        "preview_image_url": { "type": "string", "pattern": "^/api/capture/" },
+        "preview_image_url": {
+          "type": "string",
+          "pattern": "^/api/capture/[A-Za-z0-9._:-]+/preview(\\?frame=[0-9]+)?$"
+        },
         "privileged_features_available": { "type": "boolean" },
         "labels": {
           "type": "array",
@@ -521,32 +534,74 @@
         }
       }
     },
-    "decodedFeature": {
+    "labelTargetSnapshot": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "value"],
+      "required": ["first_boss", "goal_positive", "goal_negative"],
       "properties": {
-        "name": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 128
+        "first_boss": {
+          "oneOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }]
         },
-        "value": {
-          "type": ["string", "number", "integer", "boolean", "null"]
+        "goal_positive": {
+          "oneOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }]
+        },
+        "goal_negative": {
+          "oneOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }]
         }
       }
     },
-    "captureFeaturesResponse": {
+    "statusLabelSnapshot": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["schema_version", "capture_id", "frame", "decoded_features"],
+      "required": ["capture_id", "status"],
       "properties": {
-        "schema_version": { "$ref": "#/$defs/schemaVersion" },
         "capture_id": { "$ref": "#/$defs/id" },
-        "frame": { "$ref": "#/$defs/u64" },
-        "decoded_features": {
+        "status": { "$ref": "#/$defs/statusLabelRole" }
+      }
+    },
+    "changedOffsetRange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start", "len"],
+      "properties": {
+        "start": { "$ref": "#/$defs/u64" },
+        "len": { "$ref": "#/$defs/u64" }
+      }
+    },
+    "dedupGroup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["group_id", "expected_relation", "capture_ids"],
+      "anyOf": [
+        { "required": ["changed_features"] },
+        { "required": ["changed_offset_ranges"] }
+      ],
+      "properties": {
+        "group_id": { "$ref": "#/$defs/id" },
+        "expected_relation": { "$ref": "#/$defs/dedupRelation" },
+        "capture_ids": {
           "type": "array",
-          "items": { "$ref": "#/$defs/decodedFeature" }
+          "minItems": 2,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/id" }
+        },
+        "changed_features": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          }
+        },
+        "changed_offset_ranges": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/changedOffsetRange" }
+        },
+        "status": {
+          "type": "string",
+          "enum": ["candidate", "confirmed", "conflict"]
         }
       }
     },
@@ -594,12 +649,19 @@
     "labelsSnapshotResponse": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["schema_version", "label_revision", "labels", "dedup_groups"],
+      "required": ["schema_version", "label_revision", "target_labels", "status_labels", "dedup_groups"],
       "properties": {
         "schema_version": { "$ref": "#/$defs/schemaVersion" },
         "label_revision": { "type": "integer", "minimum": 0 },
-        "labels": { "type": "array", "items": { "$ref": "#/$defs/labelUpdate" } },
-        "dedup_groups": { "type": "array", "items": { "type": "object" } }
+        "target_labels": { "$ref": "#/$defs/labelTargetSnapshot" },
+        "status_labels": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/statusLabelSnapshot" }
+        },
+        "dedup_groups": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/dedupGroup" }
+        }
       }
     },
     "wsMessageType": {
@@ -624,17 +686,127 @@
       "enum": ["A", "B", "X", "Y", "L", "R", "Up", "Down", "Left", "Right", "Start", "Select"]
     },
     "wsEnvelope": {
+      "oneOf": [
+        { "$ref": "#/$defs/wsInputStateMessage" },
+        { "$ref": "#/$defs/wsInputAckMessage" },
+        { "$ref": "#/$defs/wsInputRejectMessage" },
+        { "$ref": "#/$defs/wsSessionUpdatedMessage" },
+        { "$ref": "#/$defs/wsRunUpdatedMessage" },
+        { "$ref": "#/$defs/wsCaptureUpdatedMessage" },
+        { "$ref": "#/$defs/wsLabelUpdatedMessage" },
+        { "$ref": "#/$defs/wsValidationUpdatedMessage" }
+      ]
+    },
+    "wsInputStateMessage": {
       "type": "object",
       "additionalProperties": false,
       "required": ["schema_version", "type", "session_id", "client_seq", "source_id", "server_seq", "payload"],
       "properties": {
         "schema_version": { "$ref": "#/$defs/schemaVersion" },
-        "type": { "$ref": "#/$defs/wsMessageType" },
+        "type": { "const": "input_state" },
         "session_id": { "$ref": "#/$defs/id" },
-        "client_seq": { "oneOf": [{ "$ref": "#/$defs/u64" }, { "type": "null" }] },
+        "client_seq": { "$ref": "#/$defs/u64" },
+        "source_id": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "server_seq": { "type": "null" },
+        "payload": { "$ref": "#/$defs/inputStatePayload" }
+      }
+    },
+    "wsInputAckMessage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "type", "session_id", "client_seq", "source_id", "server_seq", "payload"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "type": { "const": "input_ack" },
+        "session_id": { "$ref": "#/$defs/id" },
+        "client_seq": { "$ref": "#/$defs/u64" },
         "source_id": { "type": "string", "minLength": 1, "maxLength": 64 },
         "server_seq": { "oneOf": [{ "$ref": "#/$defs/u64" }, { "type": "null" }] },
-        "payload": { "type": "object" }
+        "payload": { "$ref": "#/$defs/inputAckPayload" }
+      }
+    },
+    "wsInputRejectMessage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "type", "session_id", "client_seq", "source_id", "server_seq", "payload"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "type": { "const": "input_reject" },
+        "session_id": { "$ref": "#/$defs/id" },
+        "client_seq": { "$ref": "#/$defs/u64" },
+        "source_id": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "server_seq": { "oneOf": [{ "$ref": "#/$defs/u64" }, { "type": "null" }] },
+        "payload": { "$ref": "#/$defs/errorEnvelope" }
+      }
+    },
+    "wsSessionUpdatedMessage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "type", "session_id", "client_seq", "source_id", "server_seq", "payload"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "type": { "const": "session_updated" },
+        "session_id": { "$ref": "#/$defs/id" },
+        "client_seq": { "type": "null" },
+        "source_id": { "const": "server" },
+        "server_seq": { "$ref": "#/$defs/u64" },
+        "payload": { "$ref": "#/$defs/sessionUpdatedPayload" }
+      }
+    },
+    "wsRunUpdatedMessage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "type", "session_id", "client_seq", "source_id", "server_seq", "payload"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "type": { "const": "run_updated" },
+        "session_id": { "$ref": "#/$defs/id" },
+        "client_seq": { "type": "null" },
+        "source_id": { "const": "server" },
+        "server_seq": { "$ref": "#/$defs/u64" },
+        "payload": { "$ref": "#/$defs/runUpdatedPayload" }
+      }
+    },
+    "wsCaptureUpdatedMessage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "type", "session_id", "client_seq", "source_id", "server_seq", "payload"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "type": { "const": "capture_updated" },
+        "session_id": { "$ref": "#/$defs/id" },
+        "client_seq": { "type": "null" },
+        "source_id": { "const": "server" },
+        "server_seq": { "$ref": "#/$defs/u64" },
+        "payload": { "$ref": "#/$defs/captureUpdatedPayload" }
+      }
+    },
+    "wsLabelUpdatedMessage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "type", "session_id", "client_seq", "source_id", "server_seq", "payload"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "type": { "const": "label_updated" },
+        "session_id": { "$ref": "#/$defs/id" },
+        "client_seq": { "type": "null" },
+        "source_id": { "const": "server" },
+        "server_seq": { "$ref": "#/$defs/u64" },
+        "payload": { "$ref": "#/$defs/labelUpdatedPayload" }
+      }
+    },
+    "wsValidationUpdatedMessage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "type", "session_id", "client_seq", "source_id", "server_seq", "payload"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "type": { "const": "validation_updated" },
+        "session_id": { "$ref": "#/$defs/id" },
+        "client_seq": { "type": "null" },
+        "source_id": { "const": "server" },
+        "server_seq": { "$ref": "#/$defs/u64" },
+        "payload": { "$ref": "#/$defs/validationUpdatedPayload" }
       }
     },
     "inputStatePayload": {
@@ -672,6 +844,54 @@
         "status": { "$ref": "#/$defs/captureStatus" },
         "capture_id": {
           "oneOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }]
+        }
+      }
+    },
+    "sessionUpdatedPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "backend_mode", "current_frame", "capabilities"],
+      "properties": {
+        "state": { "$ref": "#/$defs/sessionState" },
+        "backend_mode": { "$ref": "#/$defs/backendMode" },
+        "current_frame": { "$ref": "#/$defs/u64" },
+        "capabilities": { "$ref": "#/$defs/capabilities" }
+      }
+    },
+    "runUpdatedPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "current_frame", "preview_stale", "active_capture_job_id"],
+      "properties": {
+        "state": { "$ref": "#/$defs/sessionState" },
+        "current_frame": { "$ref": "#/$defs/u64" },
+        "preview_stale": { "type": "boolean" },
+        "active_capture_job_id": {
+          "oneOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }]
+        }
+      }
+    },
+    "labelUpdatedPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["label_revision", "applied"],
+      "properties": {
+        "label_revision": { "type": "integer", "minimum": 0 },
+        "applied": { "type": "boolean" }
+      }
+    },
+    "validationUpdatedPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "summary"],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": ["not_run", "running", "passed", "failed"]
+        },
+        "summary": {
+          "type": "string",
+          "maxLength": 240
         }
       }
     }

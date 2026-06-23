@@ -72,10 +72,33 @@ POST /api/capture/trigger
 GET  /api/capture/jobs/<job_id>
 GET  /api/capture/recent
 GET  /api/capture/<capture_id>
-GET  /api/capture/<capture_id>/features
+GET  /api/capture/<capture_id>/preview
 POST /api/labels
 GET  /api/labels
 ```
+
+Route-to-schema map:
+
+| Route | Request | Success response | Notes |
+| --- | --- | --- | --- |
+| `GET /health` | none | `healthResponse` | Public liveness; no private paths. |
+| `GET /api/session` | none | `sessionResponse` | Requires authenticated session cookie when active. |
+| `POST /api/session/start` | `startSessionRequest` | `startSessionResponse` | Only route that accepts `operator_credential`. |
+| `POST /api/session/stop` | `stopSessionRequest` | `stopSessionResponse` | Releases backend lease/slot when present. |
+| `GET /api/run/status` | none | `runStatusResponse` | Runtime no-store headers required. |
+| `POST /api/run/pause` | `sessionOnlyRequest` | `runStateResponse` | Real backend maps to `Pause`; synthetic mirrors state. |
+| `POST /api/run/resume` | `sessionOnlyRequest` | `runStateResponse` | Real backend resumes on next bounded `Run`. |
+| `GET /api/frame/current` | none | `frameCurrentResponse` | Metadata only. |
+| `GET /api/frame/current/image` | none | PNG body | `Content-Type: image/png`; no-store; query `frame` is only a cache-busting hint. |
+| `POST /api/capture/trigger` | `captureTriggerRequest` | `captureTriggerResponse` | Idempotent per session/idempotency key. |
+| `GET /api/capture/jobs/<job_id>` | none | `captureJobResponse` | Job ids are service-local runtime ids, not private artifact refs. |
+| `GET /api/capture/recent` | query `limit`, `cursor` | `captureRecentResponse` | `limit` defaults to 50 and maxes at 200. |
+| `GET /api/capture/<capture_id>` | none | `captureDetailResponse` | Browser-safe detail only. |
+| `GET /api/capture/<capture_id>/preview` | none | PNG body | `Content-Type: image/png`; no-store; never an artifact ref. |
+| `POST /api/labels` | `labelsRequest` | `labelsResponse` | Private notes may be submitted but are stored server-side. |
+| `GET /api/labels` | none | `labelsSnapshotResponse` | Typed target labels, status labels, and dedup groups. |
+
+All non-2xx JSON responses use `errorEnvelope`.
 
 WebSocket channels:
 
@@ -100,6 +123,23 @@ Phase 0 freezes these deviations from the initial
   `docs/real-backend-availability.md` are available.
 - `HttpOnly; Secure; SameSite=Strict` cookie auth is the selected MVP transport;
   credentials are never accepted in URLs.
+- The planning-time privileged decoded-feature route is not part of schema
+  version 1. Browser runtime APIs must not expose decoded feature arrays.
+
+## Auth And Session
+
+- `POST /api/session/start` is the only route that accepts
+  `operator_credential`.
+- Successful session start sets an `HttpOnly; Secure; SameSite=Strict` cookie
+  scoped to `/`.
+- WebSocket handshakes authenticate with the same cookie.
+- Runtime routes reject missing, expired, or mismatched sessions.
+- Default session TTL is 4 hours.
+- MVP allows one active operator session.
+- Browser `Origin` is checked before cookie/session acceptance for runtime HTTP
+  and WebSocket requests; absent, `null`, and wrong origins are rejected unless a
+  future non-browser admin path explicitly says otherwise.
+- Credentials are never accepted in query strings or URLs.
 
 ## Common Error Envelope
 
@@ -123,7 +163,8 @@ stderr, or stack traces.
 
 ## WebSocket Rules
 
-All WebSocket messages use `wsEnvelope` from the schema.
+All WebSocket messages use the discriminated `wsEnvelope` union from the schema.
+The `type` field selects the only legal `payload` schema.
 
 Input channel rules:
 
@@ -141,6 +182,19 @@ Event channel rules:
 - `server_seq` is monotonically increasing per session;
 - the UI ignores events older than the last processed `server_seq`;
 - event payloads must be browser-safe summaries.
+
+Schema version 1 event payloads are limited to:
+
+```text
+input_state -> inputStatePayload
+input_ack -> inputAckPayload
+input_reject -> errorEnvelope
+session_updated -> sessionUpdatedPayload
+run_updated -> runUpdatedPayload
+capture_updated -> captureUpdatedPayload
+label_updated -> labelUpdatedPayload
+validation_updated -> validationUpdatedPayload
+```
 
 ## Backend Traits
 
@@ -180,9 +234,21 @@ The runtime API must not expose:
 - private artifact refs;
 - real private capture ids in public handoff material.
 
+## Number Representation
+
+Schema version 1 transports frame counters and WebSocket sequence numbers as
+JSON integers that fit inside JavaScript's safe integer range. The Rust service
+may keep wider `u64` values internally, but browser-visible values must be
+validated before serialization. A future schema version may switch these fields
+to decimal strings if full `u64` range is required in the UI.
+
 ## Future Generation
 
 When `service/Cargo.toml` and `ui/package.json` exist, the quality gate must
 validate that service and UI generated types are synchronized with
 `contracts/runtime-api.schema.json`. The frozen command contract is recorded in
 `docs/phase0-contract-freeze.md`.
+
+Future schema fixtures must cover missing `schema_version`, `schema_version: 2`,
+malformed WebSocket payloads for each `type`, private-field rejection, unknown
+capability rejection, stale-frame errors, and image URL pattern rejection.
