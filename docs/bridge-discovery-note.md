@@ -177,10 +177,35 @@ function: check_phase4_bundle()
 method: Checker::check_captures()
 ```
 
-Required bundle file:
+Required Phase 4 bundle files and directories validated by
+`phase4-bundle-check`:
 
 ```text
+manifest.json
+workload-image.yaml or workload-image-ref.txt
+feature-map.yaml
+scoring-program.yaml
+layout.json
 captures/index.jsonl
+dedup-groups.jsonl
+score-plan.json
+validation/
+trajectory/
+```
+
+Required files included by `phase4-checksum-manifest`:
+
+```text
+manifest.json
+workload-image.yaml or workload-image-ref.txt
+feature-map.yaml
+scoring-program.yaml
+layout.json
+captures/index.jsonl
+dedup-groups.jsonl
+score-plan.json
+trajectory/*
+validation/*
 ```
 
 Each non-empty JSONL row must include or satisfy:
@@ -290,7 +315,8 @@ K = 32
 ```
 
 `write_phase4_score_plan()` reads `captures/index.jsonl`, validates label ids
-against known capture ids, emits K=32 batches, defaults
+against known capture ids, fails unless the capture index contains at least 32
+captures, emits K=32 batches, defaults
 `client_batch_prefix = "phase4-k32"`, and defaults `restore_control_batch_ids`
 to `checkpoint_after_batch`.
 
@@ -307,6 +333,12 @@ labels:
     first_boss_coverage: <bool>
     active_stages: [<stage>, ...]   # optional
 ```
+
+`emit_phase4_trace()` requires one label entry for every capture row it reads
+from `captures/index.jsonl`. Missing labels fail validation. Present labels must
+match the state computed from decoded capture values and the scoring program:
+`expected_highest_stage`, `prune`, `goal`, and `first_boss_coverage` are
+required; `active_stages` is optional, but when present it must match exactly.
 
 Authoritative trace emitter:
 
@@ -348,11 +380,24 @@ optional file:
 The context manifest expects:
 
 ```text
+schema_version
 kind: phase4-context-smoke
 evidence_type: live | synthetic
+reference_workload_commit: 40-hex git commit
+workload_image.manifest_hash or workload_image.artifact_id
 pad_layout.layout_id: console16-12btn-v1
 pad_layout.layout_version: 1
+pad_layout.table_hash
+feature_map_hash
+scoring_program_hash
+layout_hash or capture_spec_hash
+capture_count
 recent_input_available: bool
+recent_input_unavailable_reason when recent_input_available is false
+private_storage.artifact_id or private_storage.storage_artifact_id
+private_storage.access_requirement or private_storage.role
+private_storage.retention or retention
+clean_room_provenance
 ```
 
 `recent-input.padlog`, when present, is parsed with `refwork_script::parse()` and
@@ -363,6 +408,13 @@ Inline `recent_input.words[]` must be integers no greater than `0x0fff`.
 ## Verifier Commands
 
 Current exact `refwork-verify` command shapes:
+
+Authoritative layout writer:
+
+```text
+crates/refwork-verify/src/phase4_layout.rs
+function: write_phase4_layout()
+```
 
 ```sh
 cargo run --locked -p refwork-verify -- phase4-layout \
@@ -389,6 +441,13 @@ Optional `phase4-score-plan` flags:
 --restore-control-batch <client-batch-id>   # repeatable
 ```
 
+Authoritative trace emitter:
+
+```text
+crates/refwork-verify/src/phase4_trace.rs
+function: emit_phase4_trace()
+```
+
 ```sh
 cargo run --locked -p refwork-verify -- trace \
   --captures <captures/index.jsonl> \
@@ -399,10 +458,24 @@ cargo run --locked -p refwork-verify -- trace \
   --report <trace-report.json>
 ```
 
+Authoritative bundle checker:
+
+```text
+crates/refwork-verify/src/phase4_bundle_check.rs
+function: check_phase4_bundle()
+```
+
 ```sh
 cargo run --locked -p refwork-verify -- phase4-bundle-check \
   --bundle <private-bundle-dir> \
   --report <validation/phase4-bundle-check.json>
+```
+
+Authoritative checksum writer:
+
+```text
+crates/refwork-verify/src/phase4_checksum_manifest.rs
+function: write_phase4_checksum_manifest()
 ```
 
 ```sh
@@ -411,10 +484,24 @@ cargo run --locked -p refwork-verify -- phase4-checksum-manifest \
   --out <validation/checksums.json>
 ```
 
+Authoritative context checker:
+
+```text
+crates/refwork-verify/src/phase4_context_check.rs
+function: check_phase4_context_bundle()
+```
+
 ```sh
 cargo run --locked -p refwork-verify -- phase4-context-check \
   --bundle <private-context-dir> \
   --report <validation/phase4-context-check.json>
+```
+
+Authoritative private-intake preparer:
+
+```text
+crates/refwork-verify/src/phase4_private_intake.rs
+function: prepare_phase4_private_intake()
 ```
 
 ```sh
@@ -429,6 +516,13 @@ Optional `phase4-private-intake` flags:
 ```text
 --operator-metadata-policy <text>
 --operator-label <text>
+```
+
+Authoritative redaction scanner:
+
+```text
+crates/refwork-verify/src/redaction_scan.rs
+function: scan_redactions()
 ```
 
 ```sh
@@ -541,6 +635,27 @@ private artifact payload files referenced by feature_bytes.ref and framebuffer.r
 `reference-workload` validates these artifacts but does not currently provide a
 bridge-owned capture exporter that consumes hypervisor `Run`/`TakeSnapshot`
 capture bytes and writes the durable bridge capture index.
+
+The final Phase 4 bundle also requires artifacts that are not necessarily
+bridge-owned:
+
+```text
+manifest.json
+workload-image.yaml or workload-image-ref.txt
+feature-map.yaml
+scoring-program.yaml
+layout.json
+score-plan.json
+validation/
+trajectory/
+```
+
+The final aggregation note should decide whether the bridge writes these itself,
+calls `refwork-verify`/`refwork-featuremap` commands to generate them, or records
+them as operator-supplied inputs. A capture-only bridge UI can complete one
+operator capture before the full bundle exists, but `phase4-score-plan` still
+requires at least 32 capture rows and `phase4-bundle-check` requires at least
+1,000 rows plus the full bundle shape.
 
 The final aggregation note should decide the bridge output root and atomic write
 policy. The durable condition should be: payload files are written and fsynced,
