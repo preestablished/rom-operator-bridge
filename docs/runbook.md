@@ -4,10 +4,11 @@ Date: 2026-06-23
 
 ## Service Commands
 
-Format and test the Rust service:
+Format, build, and test the Rust service:
 
 ```sh
 cargo fmt --manifest-path service/Cargo.toml -- --check
+cargo build --manifest-path service/Cargo.toml
 cargo test --manifest-path service/Cargo.toml --all-targets
 ```
 
@@ -23,6 +24,7 @@ For local development on loopback, override only the bind address:
 ```sh
 ROM_OPERATOR_BRIDGE_BIND_ADDR=127.0.0.1:7410 \
 ROM_OPERATOR_BRIDGE_BACKEND=synthetic \
+RUST_LOG=rom_operator_bridge_service=info \
 cargo run --manifest-path service/Cargo.toml
 ```
 

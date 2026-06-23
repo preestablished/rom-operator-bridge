@@ -18,4 +18,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
+jsonschema = { version = "0.33", default-features = false }
 tower = { version = "0.5", features = ["util"] }

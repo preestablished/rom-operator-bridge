@@ -4,7 +4,10 @@ use crate::{
 };
 use axum::{
     Json, Router,
-    http::StatusCode,
+    http::{
+        HeaderName, HeaderValue, StatusCode,
+        header::{CACHE_CONTROL, PRAGMA},
+    },
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -40,7 +43,7 @@ impl AppState {
 
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .route("/health", get(health))
+        .route("/health", get(health).fallback(method_not_allowed))
         .fallback(not_found)
         .with_state(state)
 }
@@ -62,6 +65,15 @@ async fn not_found() -> AppError {
         StatusCode::NOT_FOUND,
         ErrorCode::BadRequest,
         "Route not found.",
+        false,
+    )
+}
+
+async fn method_not_allowed() -> AppError {
+    AppError::new(
+        StatusCode::METHOD_NOT_ALLOWED,
+        ErrorCode::BadRequest,
+        "Method not allowed.",
         false,
     )
 }
@@ -135,6 +147,17 @@ impl AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        (self.status, Json(self.envelope)).into_response()
+        let mut response = (self.status, Json(self.envelope)).into_response();
+        apply_no_store_headers(response.headers_mut());
+        response
     }
+}
+
+fn apply_no_store_headers(headers: &mut axum::http::HeaderMap) {
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(PRAGMA, HeaderValue::from_static("no-cache"));
+    headers.insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
 }

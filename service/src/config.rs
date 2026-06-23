@@ -40,7 +40,7 @@ impl ServiceConfig {
         let backend_mode = values
             .get(ENV_BACKEND_MODE)
             .map(String::as_str)
-            .unwrap_or("synthetic");
+            .unwrap_or(DEFAULT_BACKEND_MODE.as_str());
         let backend_mode =
             BackendMode::from_str(backend_mode).map_err(|_| ConfigError::InvalidBackendMode {
                 env: ENV_BACKEND_MODE,
