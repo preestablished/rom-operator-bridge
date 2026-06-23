@@ -56,9 +56,12 @@ Decision:
 
 Implement both the bridge service and operator UI in this repository,
 `/home/infra-admin/git/preestablished/rom-operator-bridge`, as a standalone
-project. Phase 1 should add the concrete service/UI stack here, with a
-bridge-owned backend interface that supports the synthetic backend first and the
-real hypervisor backend later.
+project. Phase 1 should scaffold a Rust host-control service and a TypeScript
+single-page/static web UI here, with a bridge-owned backend interface that
+supports the synthetic backend first and the real hypervisor backend later. The
+exact Rust HTTP framework and TypeScript build tooling are implementation choices
+for the service/UI scaffold bead, but changing the repo location or Rust
+service/TypeScript UI split requires updating this contract.
 
 Rationale:
 
