@@ -31,10 +31,21 @@ The bridge should attach to the worker over the Unix domain socket by default:
 
 Use TCP only as an explicit operator deployment choice. The worker binary's
 defaults include TCP `0.0.0.0:7400`, HTTP `0.0.0.0:7401`, and UDS
-`/run/dh/grpc.sock`, while the operator smoke starts local-only endpoints such
-as `127.0.0.1:7400` plus `/tmp/dh-grpc.sock`. For this private bridge, the
-safer attachment shape is same-host UDS with filesystem permissions around the
-socket.
+`/run/dh/grpc.sock`, and the service serves TCP even when UDS is enabled. For
+this private bridge, start `dh-workerd` with TCP and HTTP rebound to loopback,
+or firewall those ports from every network except the trusted host path:
+
+```sh
+dh-workerd serve \
+  --tcp 127.0.0.1:7400 \
+  --http 127.0.0.1:7401 \
+  --uds /run/dh/grpc.sock
+```
+
+The bridge should use the UDS path and socket filesystem permissions for its
+same-host worker client. Do not expose `dh-workerd` directly to the LAN; the
+browser-facing surface is the authenticated bridge service, not the worker gRPC
+or worker HTTP endpoint.
 
 ## Worker Surface
 
@@ -121,14 +132,22 @@ The hypervisor input event carries a wider `uint32 buttons`, but the bridge
 should reject any browser pad word with reserved high bits before it reaches the
 worker.
 
+`InjectInputs` is not a live mid-run control path. `Run` clones the pending
+inputs at the start of the call, and worker lifecycle calls serialize through
+the slot runtime. An input sent while a long `Run` is already active will not
+land inside that `Run` and may be stale by the next boundary. The bridge should
+therefore run in short bounded steps: refresh or track the frame boundary, queue
+pad input for a future absolute frame, then start the next `Run`.
+
 Exact path for one browser pad word:
 
 1. The browser reports the current 16-bit pad word.
 2. The bridge validates reserved bits 12..15 are zero and maps player 1 to
    `PadSet.port = 0`.
-3. The bridge reads or tracks the current absolute `FRAME_COUNTER` for the
-   session.
-4. The bridge sends `InjectInputs` with the active lease and one event:
+3. Before the next run step, the bridge reads or tracks the current absolute
+   `FRAME_COUNTER` for the session.
+4. Before starting that run step, the bridge sends `InjectInputs` with the
+   active lease and one event:
 
    ```text
    ScheduledEvent.at_frame = current_frame_counter + lead_frames
@@ -142,8 +161,8 @@ Exact path for one browser pad word:
 5. `dh-worker` validates the lease, validates pv-pad exists in the machine
    config, rejects the reserved frame hint, rejects stale `at_frame` values, and
    queues the input.
-6. `Run` converts pending frame inputs into run-control scheduled frame inputs
-   using the session's current absolute frame counter.
+6. The next `Run` converts pending frame inputs into run-control scheduled frame
+   inputs using the session's current absolute frame counter.
 7. At the matching frame boundary, run control applies a canonical `PAD_SET`
    record through `PvPad::apply_pad_set(port, buttons)`.
 8. The guest ROM reads `PAD0` from the pv-pad MMIO latch at `0xD000_1000 + 0x08`.
@@ -165,7 +184,6 @@ RestoreSnapshotResponse.frame_counter
 TakeSnapshotResponse.frame_counter
 GetFramebufferResponse.frame_counter
 RunResponse.fb_info.frame_counter when boundary framebuffer capture is requested
-bridge-derived frame counter after a frame_budget run using frames_elapsed
 ```
 
 `CreateVm` starts with `icount = 0`; the pv-pad frame counter starts at 0 unless
@@ -194,12 +212,18 @@ retry once with a future frame. If it is still stale, surface a private operator
 status such as `input dropped: stale frame` and do not pretend the input landed.
 
 `RunRequest.frame_budget = N` stops after N frame-boundary exits, and
-`RunResponse.frames_elapsed` reports how many frame exits elapsed. A later bridge
-implementation can use short frame-budget runs to advance the ROM in controlled
-steps, with input injected for future absolute frames before each run. If the
-bridge runs by icount/vns instead of frame budget and does not request boundary
-framebuffer capture, it should refresh the frame counter with `TakeSnapshot` or
-`GetFramebuffer` before scheduling additional frame-based input.
+`RunResponse.frames_elapsed` reports only how many frame marks elapsed. It is not
+the final absolute `FRAME_COUNTER`. Current run control requires frame counter
+writes to be monotonic, but it does not freeze a contiguous `+1` counter
+contract. Do not derive the next absolute frame counter from `frames_elapsed`
+unless a later ROM/runtime contract explicitly freezes contiguous frame numbers.
+
+A later bridge implementation can still use short frame-budget runs to advance
+the ROM in controlled steps, with input injected for future absolute frames
+before each run. After a run, the bridge should treat the frame base as unknown
+unless `Run` capture returned `fb_info.frame_counter`; otherwise refresh the
+frame counter with `TakeSnapshot` or `GetFramebuffer` before scheduling
+additional frame-based input.
 
 ## Preview And Staleness
 
@@ -224,11 +248,14 @@ streaming framebuffer API for the bridge MVP. The bridge should treat previews
 as boundary samples:
 
 - update `session.current_frame_counter` after every successful restore,
-  snapshot, run, or framebuffer read that reports a boundary;
+  snapshot, framebuffer read, or run capture that reports an authoritative frame
+  counter;
 - update `session.preview_frame_counter` only when `GetFramebuffer`, `Run`
   capture, or `TakeSnapshot` capture returns image data;
 - mark preview stale whenever
   `preview_frame_counter < session.current_frame_counter`;
+- mark preview frame unknown and stale after any `Run` that may advance frames
+  but does not return `fb_info.frame_counter`;
 - also mark preview stale while a run is in progress unless the displayed image
   came from the same boundary that is currently reported to the browser;
 - mark preview unavailable, not fresh, if `GetFramebuffer` returns
