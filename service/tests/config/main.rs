@@ -350,6 +350,32 @@ fn private_root_inside_static_publish_root_is_rejected() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn symlinked_static_publish_root_alias_is_rejected() {
+    let workspace = tempfile::tempdir().expect("tempdir creates");
+    let actual_static_root = workspace.path().join("static-real");
+    fs::create_dir(&actual_static_root).expect("static root creates");
+    let static_root_alias = workspace.path().join("static-link");
+    symlink(&actual_static_root, &static_root_alias).expect("static symlink creates");
+    let private_root = actual_static_root.join("bridge-private");
+
+    let mut pairs = complete_private_pairs(&private_root);
+    pairs.push((
+        ENV_STATIC_PUBLISH_ROOT.to_string(),
+        static_root_alias.display().to_string(),
+    ));
+
+    assert_eq!(
+        ServiceConfig::from_pairs(pairs),
+        Err(ConfigError::PrivateConfig(
+            PrivateConfigError::SymlinkPath {
+                path: static_root_alias,
+            }
+        ))
+    );
+}
+
 #[test]
 fn config_error_debug_does_not_expose_private_paths() {
     let workspace = tempfile::tempdir().expect("tempdir creates");

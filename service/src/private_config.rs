@@ -381,14 +381,14 @@ fn validate_private_root(
     }
     reject_symlink_components(root)?;
 
-    if let Some(static_publish_root) = static_publish_root
-        && (root == static_publish_root || root.starts_with(static_publish_root))
-    {
+    if let Some(static_publish_root) = static_publish_root {
         reject_symlink_components(static_publish_root)?;
-        return Err(PrivateConfigError::PrivateRootInsideStaticPublishRoot {
-            private_root: root.to_path_buf(),
-            static_publish_root: static_publish_root.to_path_buf(),
-        });
+        if root == static_publish_root || root.starts_with(static_publish_root) {
+            return Err(PrivateConfigError::PrivateRootInsideStaticPublishRoot {
+                private_root: root.to_path_buf(),
+                static_publish_root: static_publish_root.to_path_buf(),
+            });
+        }
     }
 
     if let Some(metadata) = path_metadata(root)? {
