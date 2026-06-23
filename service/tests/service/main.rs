@@ -68,7 +68,7 @@ async fn unimplemented_api_route_uses_common_error_envelope() {
     let response = app
         .oneshot(
             Request::builder()
-                .uri("/api/session")
+                .uri("/api/missing")
                 .body(Body::empty())
                 .expect("request builds"),
         )

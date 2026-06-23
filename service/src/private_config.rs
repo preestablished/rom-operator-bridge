@@ -1,4 +1,6 @@
 use crate::{backend::BackendMode, sanitization::PublicSanitizer};
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use std::{
     collections::BTreeMap,
     fmt,
@@ -7,6 +9,8 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 use thiserror::Error;
+
+type HmacSha256 = Hmac<Sha256>;
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -116,6 +120,32 @@ impl BridgePrivateConfig {
             sanitizer = sanitizer.with_forbidden_literal(secret.as_str());
         }
         sanitizer
+    }
+
+    pub fn verify_operator_credential(&self, candidate: &str) -> bool {
+        self.operator_credential
+            .as_ref()
+            .is_some_and(|credential| constant_time_eq(candidate.as_bytes(), credential.as_bytes()))
+    }
+
+    pub fn sign_session_token(
+        &self,
+        issued_at_unix_seconds: u64,
+        nonce: u64,
+    ) -> Result<String, PrivateConfigError> {
+        let secret = self
+            .session_secret
+            .as_ref()
+            .ok_or(PrivateConfigError::MissingEnv {
+                env: ENV_SESSION_SECRET,
+            })?;
+        let payload = format!("{issued_at_unix_seconds:x}.{nonce:x}");
+        let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+            .map_err(|_| PrivateConfigError::InvalidSessionSecret)?;
+        mac.update(payload.as_bytes());
+        let digest = mac.finalize().into_bytes();
+
+        Ok(format!("v1.{payload}.{}", hex_lower(&digest)))
     }
 
     pub fn prepare_runtime_dirs(&self) -> Result<(), PrivateConfigError> {
@@ -342,6 +372,10 @@ impl SecretValue {
 
     fn as_str(&self) -> &str {
         &self.0
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
     }
 }
 
@@ -842,6 +876,8 @@ pub enum PrivateConfigError {
     MissingEnv { env: &'static str },
     #[error("{env} must not use a placeholder value")]
     PlaceholderSecret { env: &'static str },
+    #[error("session secret could not be used")]
+    InvalidSessionSecret,
     #[error("{env} must be an absolute path")]
     PathNotAbsolute { env: &'static str, path: PathBuf },
     #[error("{env} must not contain parent directory segments")]
@@ -887,4 +923,27 @@ impl fmt::Debug for PrivateConfigError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(self, formatter)
     }
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut diff = left.len() ^ right.len();
+    let max_len = left.len().max(right.len());
+    for index in 0..max_len {
+        let left_byte = left.get(index).copied().unwrap_or_default();
+        let right_byte = right.get(index).copied().unwrap_or_default();
+        diff |= (left_byte ^ right_byte) as usize;
+    }
+
+    diff == 0
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+
+    out
 }
