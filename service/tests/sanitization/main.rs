@@ -13,6 +13,18 @@ fn rejects_absolute_private_paths() {
         sanitizer.inspect_text("failed while opening C:\\Users\\operator\\rom.sfc"),
         Err(SanitizationError::PrivatePath)
     );
+    assert_eq!(
+        sanitizer.inspect_text("failed while opening /root/.ssh/id_rsa"),
+        Err(SanitizationError::PrivatePath)
+    );
+    assert_eq!(
+        sanitizer.inspect_text("failed while opening /run/secrets/operator-token"),
+        Err(SanitizationError::PrivatePath)
+    );
+    assert_eq!(
+        sanitizer.inspect_text("failed while opening /dev/shm/private-capture.bin"),
+        Err(SanitizationError::PrivatePath)
+    );
 }
 
 #[test]
@@ -41,14 +53,13 @@ fn rejects_command_output_and_stack_traces() {
 fn rejects_feature_bytes_and_raw_payload_snippets() {
     let sanitizer = PublicSanitizer::new();
 
-    assert_eq!(
-        sanitizer.inspect_json(&json!({
+    assert!(
+        sanitizer
+            .inspect_json(&json!({
             "schema_version": 1,
             "feature_bytes": "00 ff 9a 12",
-        })),
-        Err(SanitizationError::ForbiddenField {
-            field: "feature_bytes".to_string()
-        })
+            }))
+            .is_err()
     );
     assert_eq!(
         sanitizer.inspect_text("raw_payload: 7b226672616d65223a3132337d"),
@@ -56,6 +67,60 @@ fn rejects_feature_bytes_and_raw_payload_snippets() {
             pattern: "raw payload"
         })
     );
+}
+
+#[test]
+fn rejects_private_paths_and_literals_in_json_keys() {
+    let sanitizer = PublicSanitizer::new()
+        .with_private_root("/corpus/operator-a/private-rom-root")
+        .with_forbidden_literal("SECRET_ROM_NAME");
+
+    assert_eq!(
+        sanitizer.inspect_json(&json!({
+            "/home/operator/private/run.dat": "failed"
+        })),
+        Err(SanitizationError::PrivatePath)
+    );
+    assert_eq!(
+        sanitizer.inspect_json(&json!({
+            "/corpus/operator-a/private-rom-root/capture": "failed"
+        })),
+        Err(SanitizationError::ConfiguredPrivateRoot)
+    );
+    assert_eq!(
+        sanitizer.inspect_json(&json!({
+            "SECRET_ROM_NAME": "failed"
+        })),
+        Err(SanitizationError::ForbiddenLiteral)
+    );
+}
+
+#[test]
+fn rejects_sensitive_field_name_variants() {
+    let sanitizer = PublicSanitizer::new();
+    let cases = [
+        "featureBytes",
+        "rawPayload",
+        "validationReport",
+        "operatorCredential",
+        "workerLeaseToken",
+        "privatePath",
+        "artifactRef",
+        "stderr_lines",
+        "stdout_text",
+        "command_output",
+        "private_root_path",
+        "private_root_ref",
+    ];
+
+    for field in cases {
+        assert_eq!(
+            sanitizer.inspect_json(&json!({ field: "redacted" })),
+            Err(SanitizationError::ForbiddenField {
+                field: field.to_string()
+            })
+        );
+    }
 }
 
 #[test]

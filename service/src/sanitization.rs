@@ -138,6 +138,7 @@ impl PublicSanitizer {
             }
             Value::Object(map) => {
                 for (key, value) in map {
+                    self.inspect_text(key)?;
                     inspect_public_key(key)?;
                     self.inspect_json_value(value)?;
                 }
@@ -176,11 +177,11 @@ fn normalize_root(path: &Path) -> Option<String> {
 }
 
 fn inspect_public_key(key: &str) -> Result<(), SanitizationError> {
-    let lowered = key.to_ascii_lowercase();
-    if FORBIDDEN_FIELD_NAMES.contains(&lowered.as_str())
+    let canonical = canonical_field_name(key);
+    if FORBIDDEN_FIELD_NAMES.contains(&canonical.as_str())
         || FORBIDDEN_FIELD_FRAGMENTS
             .iter()
-            .any(|fragment| lowered.contains(fragment))
+            .any(|fragment| canonical.contains(fragment))
     {
         Err(SanitizationError::ForbiddenField {
             field: key.to_string(),
@@ -188,6 +189,13 @@ fn inspect_public_key(key: &str) -> Result<(), SanitizationError> {
     } else {
         Ok(())
     }
+}
+
+fn canonical_field_name(key: &str) -> String {
+    key.chars()
+        .filter(|ch| !matches!(ch, '_' | '-' | ' ' | '\t' | '\n' | '\r'))
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 fn contains_private_path(text: &str) -> bool {
@@ -208,15 +216,18 @@ fn contains_any(text: &str, patterns: &[&str]) -> bool {
 const PRIVATE_PATH_PATTERNS: &[&str] = &[
     "/home/",
     "/users/",
+    "/root/",
     "/private/",
     "/run/dh/",
     "/run/rom",
+    "/run/secret",
     "/etc/",
     "/opt/",
     "/var/",
     "/tmp/",
     "/mnt/",
     "/srv/",
+    "/dev/shm/",
 ];
 
 const COMMAND_OUTPUT_PATTERNS: &[&str] = &[
@@ -253,33 +264,38 @@ const VALIDATION_REPORT_PATTERNS: &[&str] = &[
 ];
 
 const FORBIDDEN_FIELD_NAMES: &[&str] = &[
-    "operator_credential",
-    "worker_lease_token",
-    "private_path",
-    "private_root",
-    "artifact_ref",
-    "feature_bytes",
-    "decoded_values",
-    "decoded_features",
-    "raw_payload",
-    "payload_snippet",
-    "validation_report",
+    "operatorcredential",
+    "workerleasetoken",
+    "privatepath",
+    "privateroot",
+    "artifactref",
+    "featurebytes",
+    "decodedvalues",
+    "decodedfeatures",
+    "rawpayload",
+    "payloadsnippet",
+    "validationreport",
     "stderr",
     "stdout",
-    "stack_trace",
-    "rom_bytes",
-    "save_ram",
+    "commandoutput",
+    "stacktrace",
+    "rombytes",
+    "saveram",
     "screenshot",
 ];
 
 const FORBIDDEN_FIELD_FRAGMENTS: &[&str] = &[
-    "private_path",
-    "worker_lease",
-    "artifact_ref",
-    "feature_bytes",
-    "decoded_value",
-    "raw_payload",
-    "payload_snippet",
-    "validation_report",
-    "stack_trace",
+    "privatepath",
+    "privateroot",
+    "workerlease",
+    "artifactref",
+    "featurebytes",
+    "decodedvalue",
+    "rawpayload",
+    "payloadsnippet",
+    "validationreport",
+    "stacktrace",
+    "stderr",
+    "stdout",
+    "commandoutput",
 ];
