@@ -1,5 +1,5 @@
-use crate::backend::BackendMode;
-use std::{collections::BTreeMap, net::SocketAddr, str::FromStr};
+use crate::{backend::BackendMode, private_config};
+use std::{collections::BTreeMap, fmt, net::SocketAddr, str::FromStr};
 use thiserror::Error;
 
 pub const DEFAULT_BIND_ADDR: &str = "10.0.0.106:7410";
@@ -12,6 +12,7 @@ pub struct ServiceConfig {
     bind_addr: SocketAddr,
     backend_mode: BackendMode,
     service_version: String,
+    private_config: private_config::BridgePrivateConfig,
 }
 
 impl ServiceConfig {
@@ -29,6 +30,7 @@ impl ServiceConfig {
             .into_iter()
             .map(|(key, value)| (key.into(), value.into()))
             .collect();
+        let values = private_config::merge_file_values(values)?;
 
         let bind_addr = values
             .get(ENV_BIND_ADDR)
@@ -45,11 +47,14 @@ impl ServiceConfig {
             BackendMode::from_str(backend_mode).map_err(|_| ConfigError::InvalidBackendMode {
                 env: ENV_BACKEND_MODE,
             })?;
+        let private_config =
+            private_config::BridgePrivateConfig::from_values(&values, backend_mode)?;
 
         Ok(Self {
             bind_addr,
             backend_mode,
             service_version: env!("CARGO_PKG_VERSION").to_string(),
+            private_config,
         })
     }
 
@@ -58,6 +63,7 @@ impl ServiceConfig {
             bind_addr,
             backend_mode: BackendMode::Synthetic,
             service_version: env!("CARGO_PKG_VERSION").to_string(),
+            private_config: private_config::BridgePrivateConfig::placeholder(),
         }
     }
 
@@ -72,12 +78,24 @@ impl ServiceConfig {
     pub fn service_version(&self) -> &str {
         &self.service_version
     }
+
+    pub fn private_config(&self) -> &private_config::BridgePrivateConfig {
+        &self.private_config
+    }
 }
 
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Error, PartialEq, Eq)]
 pub enum ConfigError {
     #[error("{env} must be a valid socket address")]
     InvalidBindAddr { env: &'static str },
     #[error("{env} must be synthetic or real")]
     InvalidBackendMode { env: &'static str },
+    #[error(transparent)]
+    PrivateConfig(#[from] private_config::PrivateConfigError),
+}
+
+impl fmt::Debug for ConfigError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
 }
