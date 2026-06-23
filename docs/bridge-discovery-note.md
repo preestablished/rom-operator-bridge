@@ -59,9 +59,12 @@ Implement both the bridge service and operator UI in this repository,
 project. Phase 1 should scaffold a Rust host-control service and a TypeScript
 single-page/static web UI here, with a bridge-owned backend interface that
 supports the synthetic backend first and the real hypervisor backend later. The
-exact Rust HTTP framework and TypeScript build tooling are implementation choices
-for the service/UI scaffold bead, but changing the repo location or Rust
-service/TypeScript UI split requires updating this contract.
+service package path is `service/Cargo.toml`; the UI package path is
+`ui/package.json`; the UI package manager is `npm`; and the UI test/build stack
+is TypeScript plus Vite/Vitest. The exact Rust HTTP framework is an
+implementation choice for the service scaffold bead, but changing the repo
+location, service/UI package paths, Rust service/TypeScript UI split, or command
+contract below requires updating this contract.
 
 Rationale:
 
@@ -80,6 +83,28 @@ service-side scoring through `determinism.scorer.v1.StateScorer` may be added by
 separate work after the bridge service scaffold exists, and should be disabled by
 default until its endpoint, auth, timeout, privacy, and fallback behavior are
 explicitly configured.
+
+Bridge stack runbook commands:
+
+The scaffold beads must create packages that make these commands runnable:
+
+```sh
+cargo fmt --manifest-path service/Cargo.toml -- --check
+cargo test --manifest-path service/Cargo.toml --all-targets
+npm --prefix ui ci
+npm --prefix ui run typecheck
+npm --prefix ui test -- --run
+npm --prefix ui run build
+```
+
+The root Ralph quality gate command reserved for the later quality-gate bead is:
+
+```sh
+scripts/quality-gate.sh
+```
+
+That script must run the service/UI commands above and may degrade with explicit
+skip messages only before `service/Cargo.toml` or `ui/package.json` exists.
 
 ## Host-Control API
 
@@ -346,6 +371,12 @@ Additional stale states:
   reported boundary;
 - when `GetFramebuffer` returns `FAILED_PRECONDITION` because the slot is not
   paused or no framebuffer region is published.
+
+Runtime API deviation:
+
+This supersedes the planning-time `11-runtime-api-contract.md` stale threshold of
+120 frames or 2 seconds. Because the real backend only has boundary samples in
+MVP, any preview older than `session.current_frame_counter` is stale.
 
 ## Capture Contract
 
@@ -713,7 +744,7 @@ target. The dedicated same-network HTTPS origin above is the chosen target.
 Service bind address:
 
 ```text
-10.0.0.106:<bridge-port>
+10.0.0.106:7410
 ```
 
 The operator has added DNS for `rombridge.birb.homes` pointing to `10.0.0.106`,
@@ -724,13 +755,25 @@ and local resolution has confirmed:
 ```
 
 Only DNS exists today. No bridge service, TLS route, proxy route, service unit,
-or exact `<bridge-port>` exists yet.
+or deployment files exist yet.
 
 Do not bind the bridge service to `0.0.0.0`. Do not use a
-`127.0.0.1:<bridge-port>` bind for the dedicated-hostname deployment unless the
+`127.0.0.1:7410` bind for the dedicated-hostname deployment unless the
 deployment bead adds a host-local reverse proxy that can reach loopback. The edge
 route must enforce Host/SNI for `rombridge.birb.homes` only, so the bridge is not
 served under another host that resolves to `10.0.0.106`.
+
+Frozen deployment paths:
+
+```text
+repo ingress manifest: deploy/k8s/rombridge-ingress.yaml
+repo systemd unit: deploy/systemd/rom-operator-bridge.service
+installed systemd unit: /etc/systemd/system/rom-operator-bridge.service
+private env file: /etc/rom-operator-bridge/rom-operator-bridge.env
+current release symlink: /opt/rom-operator-bridge/current
+previous release symlink: /opt/rom-operator-bridge/previous
+service binary: /opt/rom-operator-bridge/current/rom-operator-bridge
+```
 
 Origin allowlist:
 
@@ -782,13 +825,16 @@ Auth shape:
 - Return sanitized auth errors without credentials, private paths, stack traces,
   host-control details, or artifact identifiers.
 
-Restart and rollback command shapes:
+Frozen restart and rollback commands:
 
 ```sh
+sudo systemctl daemon-reload
 sudo systemctl restart rom-operator-bridge.service
 sudo systemctl stop rom-operator-bridge.service
-KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl apply -f <rombridge-ingress.yaml>
-KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl delete -f <rombridge-ingress.yaml>
+KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl apply -f deploy/k8s/rombridge-ingress.yaml
+KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl delete -f deploy/k8s/rombridge-ingress.yaml
+sudo ln -sfn /opt/rom-operator-bridge/previous /opt/rom-operator-bridge/current
+sudo systemctl restart rom-operator-bridge.service
 ```
 
 Future deployment checks once a service and route exist:
@@ -813,15 +859,18 @@ Expected deployment check results:
 
 Blockers:
 
-- The bridge service and UI do not exist yet, so there is no exact
-  bridge-package test command beyond docs checks in this repo. Phase 1 service
-  scaffold must define the stack-specific commands before implementation beads
-  can claim runtime tests.
-- The exact bridge service port, systemd unit contents, artifact path, private
-  env file path, K3s Service/Ingress manifest, and rollback artifact path do not
-  exist yet.
-- Real session start needs an operator-provided private snapshot or a later
-  exact `CreateVm` ROM startup config.
+- The bridge service and UI packages do not exist yet. The scaffold beads must
+  create `service/Cargo.toml` and `ui/package.json` and make the frozen
+  service/UI commands runnable.
+- The deployment files do not exist yet. The deployment bead must create
+  `deploy/k8s/rombridge-ingress.yaml`,
+  `deploy/systemd/rom-operator-bridge.service`, and private install material
+  matching the frozen paths before running deployment commands.
+- Real backend availability is not approved by this freeze. Real mode must fail
+  closed unless uncommitted service configuration supplies an operator-approved
+  private snapshot or exact `CreateVm` startup inputs, plus
+  `BRIDGE_PRIVATE_ROOT`, `BRIDGE_WORKLOAD_IMAGE_REF`,
+  `BRIDGE_CAPTURE_SPEC_REF`, and `BRIDGE_REFERENCE_WORKLOAD_CHECKOUT`.
 - No existing exporter writes private payload files plus `captures/index.jsonl`
   from hypervisor capture bytes. The bridge must implement that writer before
   real capture can be marked `completed`.
