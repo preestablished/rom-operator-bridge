@@ -245,7 +245,8 @@ impl BridgePrivateConfig {
             ensure_private_descendant_dir(root, parent)?;
         }
         let path = root.join(&relative_path);
-        if path_metadata(&path)?.is_some() {
+        let file_exists = path_metadata(&path)?.is_some();
+        if file_exists {
             validate_private_file(&path)?;
         }
 
@@ -270,6 +271,9 @@ impl BridgePrivateConfig {
         file.sync_all()
             .map_err(|error| io_error("sync private file", &path, error))?;
         set_private_file_mode(&path)?;
+        if matches!(mode, PrivateWriteMode::Append) && !file_exists {
+            sync_parent_dir(&path)?;
+        }
 
         Ok(path)
     }

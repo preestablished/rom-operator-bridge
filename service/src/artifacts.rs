@@ -70,6 +70,9 @@ impl<'a> PrivateArtifactStore<'a> {
         recent: &RecentCapturesFile,
     ) -> Result<PrivateArtifactRef, ArtifactError> {
         ensure_schema_version(recent.schema_version)?;
+        for capture in &recent.captures {
+            path_segment("capture_id", &capture.capture_id)?;
+        }
         self.write_json_atomic(
             PathBuf::from("captures").join("recent-captures.json"),
             recent,
@@ -95,6 +98,7 @@ impl<'a> PrivateArtifactStore<'a> {
         row: &ValidationRunRow,
     ) -> Result<PrivateArtifactRef, ArtifactError> {
         ensure_schema_version(row.schema_version)?;
+        path_segment("validation_id", &row.validation_id)?;
         self.append_jsonl(
             PathBuf::from("validation").join("validation-runs.jsonl"),
             row,
@@ -143,7 +147,7 @@ impl fmt::Debug for PrivateArtifactRef {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PrivateArtifactRef")
-            .field("relative_path", &self.relative_path)
+            .field("relative_path", &"[redacted]")
             .finish()
     }
 }

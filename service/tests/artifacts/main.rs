@@ -40,6 +40,8 @@ fn writes_schema_versioned_run_manifest_with_private_modes() {
     );
     assert_eq!(artifact.to_string(), "[private artifact]");
     assert!(!format!("{artifact:?}").contains(&private_root.display().to_string()));
+    assert!(!format!("{artifact:?}").contains("run-001"));
+    assert!(!format!("{artifact:?}").contains("run-manifest.json"));
 
     let private_path = private_root.join(artifact.relative_path());
     assert_eq!(mode(&private_path), PRIVATE_FILE_MODE);
@@ -113,6 +115,14 @@ fn appends_bridge_events_and_input_rejections_as_jsonl() {
         serde_json::from_str(&rejection_lines[0]).expect("rejection parses");
     assert_eq!(rejection.client_seq, 7);
     assert_eq!(rejection.reason_code, "frame_stale");
+    assert_eq!(
+        mode(&artifact_path(&private_root, &event_ref)),
+        PRIVATE_FILE_MODE
+    );
+    assert_eq!(
+        mode(&artifact_path(&private_root, &rejection_ref)),
+        PRIVATE_FILE_MODE
+    );
 }
 
 #[cfg(unix)]
@@ -220,6 +230,33 @@ fn artifact_writers_reject_bad_schema_versions_and_path_ids() {
         )),
         Err(ArtifactError::InvalidIdentifier {
             field: "capture_id",
+            ..
+        })
+    ));
+
+    assert!(matches!(
+        store.write_recent_captures(&RecentCapturesFile::new(vec![CaptureSummary::new(
+            "../capture-001",
+            "2026-06-23T00:00:04Z",
+            "completed",
+            true,
+        )])),
+        Err(ArtifactError::InvalidIdentifier {
+            field: "capture_id",
+            ..
+        })
+    ));
+
+    assert!(matches!(
+        store.append_validation_run(&ValidationRunRow::new(
+            "validation/001",
+            "2026-06-23T00:00:06Z",
+            "bundle_check",
+            "failed",
+            "validation failed",
+        )),
+        Err(ArtifactError::InvalidIdentifier {
+            field: "validation_id",
             ..
         })
     ));
