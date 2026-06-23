@@ -283,7 +283,7 @@ PadLog::from_frames(frames) -> write(&padlog) -> parse(&text)
 Agent-runnable command covering the parser/writer contract:
 
 ```sh
-cargo test --locked -p refwork-script
+(cd /home/infra-admin/git/preestablished/reference-workload && cargo test --locked -p refwork-script)
 ```
 
 ## Framebuffer Contract
@@ -393,7 +393,7 @@ capture_id: non-empty unique string
 node_ref or source_id: string
 capture_source: string
 frame_index or frame_counter
-layout_hash: matches layout.json blake3 when known
+layout_hash: required blake3 hash; equals layout.json blake3 when layout.json is present
 feature_bytes.ref: private artifact ref
 feature_bytes.len: equals layout.json total_len when known
 feature_bytes.blake3: blake3 hash/ref
@@ -507,6 +507,16 @@ goal
 first_boss_coverage
 ```
 
+Privacy boundary:
+
+`captures/index.jsonl`, `trajectory/*.jsonl`, `score-plan.json`,
+`dedup-groups.jsonl`, validation reports, checksum manifests, label drafts,
+capture ids, `decoded_values`, private artifact refs, and raw verifier or scorer
+error details are operator-private server-side artifacts. Browser APIs may return
+only sanitized aggregate status, counts, pass/fail booleans, and
+operator-approved labels. Public handoff text must run `redaction-scan` with the
+operator forbidden-literal file before publication.
+
 Dedup artifact:
 
 The required artifact is:
@@ -549,101 +559,106 @@ Validation commands:
 Padlog parser/writer:
 
 ```sh
-cargo test --locked -p refwork-script
+(cd /home/infra-admin/git/preestablished/reference-workload && cargo test --locked -p refwork-script)
 ```
 
 Feature-map validation:
 
 ```sh
-cargo run --locked -p refwork-featuremap -- validate \
+(cd /home/infra-admin/git/preestablished/reference-workload && cargo run --locked -p refwork-featuremap -- validate \
   <feature-map.yaml> \
-  --scoring <scoring-program.yaml>
+  --scoring <scoring-program.yaml>)
 ```
 
 Layout writer:
 
 ```sh
-cargo run --locked -p refwork-verify -- phase4-layout \
+(cd /home/infra-admin/git/preestablished/reference-workload && cargo run --locked -p refwork-verify -- phase4-layout \
   --map <feature-map.yaml> \
   --out <layout.json> \
   --capture-spec-hash <blake3-or-ref> \
-  --compiler-or-exporter-commit <commit>
+  --compiler-or-exporter-commit <commit>)
 ```
 
 Score plan:
 
 ```sh
-cargo run --locked -p refwork-verify -- phase4-score-plan \
+(cd /home/infra-admin/git/preestablished/reference-workload && cargo run --locked -p refwork-verify -- phase4-score-plan \
   --captures <captures/index.jsonl> \
   --out <score-plan.json> \
   --first-boss <capture-id> \
   --goal-positive <capture-id> \
-  --goal-negative <capture-id>
+  --goal-negative <capture-id>)
 ```
 
 Trace:
 
 ```sh
-cargo run --locked -p refwork-verify -- trace \
+(cd /home/infra-admin/git/preestablished/reference-workload && cargo run --locked -p refwork-verify -- trace \
   --captures <captures/index.jsonl> \
   --map <feature-map.yaml> \
   --scoring <scoring-program.yaml> \
   --labels <private-bundle-dir>/labels/phase4-trace-labels.yaml \
   --out <trajectory.jsonl> \
-  --report <trace-report.json>
+  --report <trace-report.json>)
 ```
 
 Bundle check:
 
 ```sh
-cargo run --locked -p refwork-verify -- phase4-bundle-check \
+(cd /home/infra-admin/git/preestablished/reference-workload && cargo run --locked -p refwork-verify -- phase4-bundle-check \
   --bundle <private-bundle-dir> \
-  --report <validation/phase4-bundle-check.json>
+  --report <validation/phase4-bundle-check.json>)
 ```
 
 Checksum manifest:
 
 ```sh
-cargo run --locked -p refwork-verify -- phase4-checksum-manifest \
+(cd /home/infra-admin/git/preestablished/reference-workload && cargo run --locked -p refwork-verify -- phase4-checksum-manifest \
   --bundle <private-bundle-dir> \
-  --out <validation/checksums.json>
+  --out <validation/checksums.json>)
 ```
 
 Context smoke:
 
 ```sh
-cargo run --locked -p refwork-verify -- phase4-context-check \
+(cd /home/infra-admin/git/preestablished/reference-workload && cargo run --locked -p refwork-verify -- phase4-context-check \
   --bundle <private-context-dir> \
-  --report <validation/phase4-context-check.json>
+  --report <validation/phase4-context-check.json>)
 ```
 
 Private intake:
 
 ```sh
-cargo run --locked -p refwork-verify -- phase4-private-intake \
+(cd /home/infra-admin/git/preestablished/reference-workload && cargo run --locked -p refwork-verify -- phase4-private-intake \
   --private-root <private-root> \
   --operator-approved \
-  --rom-dir <private-rom-dir>
+  --rom-dir <private-rom-dir>)
 ```
 
 Redaction scan:
 
 ```sh
-cargo run --locked -p refwork-verify -- redaction-scan \
+(cd /home/infra-admin/git/preestablished/reference-workload && cargo run --locked -p refwork-verify -- redaction-scan \
   --input <public-note.md> \
   --report <validation/redaction-scan.json> \
-  --forbid-file <private-forbid-literals.txt>
+  --forbid-file <private-forbid-literals.txt>)
 ```
+
+The redaction scanner reports finding kind, line, and column only; it must not
+echo matched private literals or source excerpts. Add operator-specific
+forbidden literals with repeatable `--forbid` and `--forbid-file` arguments
+before producing any public handoff.
 
 Agent-runnable synthetic checks already run during Phase 0:
 
 ```sh
-cargo test --locked -p refwork-script
-cargo test --locked -p refwork-verify phase4 -- --nocapture
-cargo test --locked -p xtask pad_layout
-cargo test -p dh-worker inject_mapper
-cargo test -p dh-devices frame_counter_write_logs_frame_mark
-cargo test -p determinism-proto --features scorer,inputsynth
+(cd /home/infra-admin/git/preestablished/reference-workload && cargo test --locked -p refwork-script)
+(cd /home/infra-admin/git/preestablished/reference-workload && cargo test --locked -p refwork-verify phase4 -- --nocapture)
+(cd /home/infra-admin/git/preestablished/reference-workload && cargo test --locked -p xtask pad_layout)
+(cd /home/infra-admin/git/preestablished/determinism-hypervisor && cargo test -p dh-worker inject_mapper)
+(cd /home/infra-admin/git/preestablished/determinism-hypervisor && cargo test -p dh-devices frame_counter_write_logs_frame_mark)
+(cd /home/infra-admin/git/preestablished/control-plane && cargo test -p determinism-proto --features scorer,inputsynth)
 ```
 
 Observed results:
@@ -660,9 +675,9 @@ determinism-proto scorer,inputsynth: 19 passed
 Operator/private-data commands:
 
 ```sh
-cargo run --locked -p refwork-verify -- phase4-private-intake ...
-cargo run --locked -p refwork-verify -- phase4-bundle-check ...
-cargo run --locked -p refwork-verify -- phase4-context-check ...
+(cd /home/infra-admin/git/preestablished/reference-workload && cargo run --locked -p refwork-verify -- phase4-private-intake ...)
+(cd /home/infra-admin/git/preestablished/reference-workload && cargo run --locked -p refwork-verify -- phase4-bundle-check ...)
+(cd /home/infra-admin/git/preestablished/reference-workload && cargo run --locked -p refwork-verify -- phase4-context-check ...)
 ```
 
 Those can be tested synthetically through existing tests, but real acceptance
@@ -707,6 +722,12 @@ and local resolution has confirmed:
 
 Only DNS exists today. No bridge service, TLS route, proxy route, service unit,
 or exact `<bridge-port>` exists yet.
+
+Do not bind the bridge service to `0.0.0.0`. Do not use a
+`127.0.0.1:<bridge-port>` bind for the dedicated-hostname deployment unless the
+deployment bead adds a host-local reverse proxy that can reach loopback. The edge
+route must enforce Host/SNI for `rombridge.birb.homes` only, so the bridge is not
+served under another host that resolves to `10.0.0.106`.
 
 Origin allowlist:
 
@@ -753,6 +774,10 @@ Auth shape:
 - Default session TTL is 4 hours.
 - MVP concurrency is one active operator session.
 - Do not put credentials in URLs.
+- Rate-limit failed auth attempts.
+- Log auth failures only to private service logs.
+- Return sanitized auth errors without credentials, private paths, stack traces,
+  host-control details, or artifact identifiers.
 
 Restart and rollback command shapes:
 
@@ -814,8 +839,9 @@ Deferred work:
 - Public handoff publishing is deferred until redaction scanning is wired for
   operator-specific forbidden literals.
 
-Current repo quality gate for this docs-only Phase 0 note:
+Current repo quality gate for this committed docs-only Phase 0 note:
 
 ```sh
-git diff --check
+git diff --check main...HEAD
+git show --check --stat HEAD
 ```
