@@ -1,5 +1,5 @@
 use rom_operator_bridge_service::{
-    artifacts::{ARTIFACT_SCHEMA_VERSION, PadLogEventRow, PrivateArtifactStore},
+    artifacts::{ARTIFACT_SCHEMA_VERSION, ArtifactError, PadLogEventRow, PrivateArtifactStore},
     config::ServiceConfig,
     input::{AppliedInputFrame, PadButton, PadLog, PadLogError, PadWord},
     private_config::{
@@ -87,16 +87,54 @@ fn applied_frame_rows_keep_only_pad_words_in_padlog_text() {
     let text = log.write_canonical();
 
     assert_eq!(text, "padlog v1\n2x0001\n0400\n");
-    for forbidden in [
-        "41",
-        "42",
-        "99",
-        "client_seq",
-        "source_id",
-        "assigned_frame",
-    ] {
+    for forbidden in ["client_seq", "source_id", "assigned_frame"] {
         assert!(!text.contains(forbidden), "padlog leaked {forbidden}");
     }
+}
+
+#[test]
+fn parser_matches_refwork_edge_cases() {
+    let parsed = PadLog::parse("# top\npadlog v1 # trailing\n# mid\n2X0001 # run\n\n0002\n")
+        .expect("comments blanks and uppercase run separator parse");
+    assert_eq!(
+        parsed.frames(),
+        [
+            PadWord::from_buttons([PadButton::A]),
+            PadWord::from_buttons([PadButton::A]),
+            PadWord::from_buttons([PadButton::B]),
+        ]
+    );
+    assert_eq!(
+        PadLog::parse("padlog v2\n"),
+        Err(PadLogError::UnsupportedVersion {
+            line: 1,
+            version: "v2".to_string(),
+        })
+    );
+    assert_eq!(
+        PadLog::parse("padlog v1 rom=zz\n"),
+        Err(PadLogError::BadRomHash { line: 1 })
+    );
+    assert_eq!(
+        PadLog::parse("padlog v1\n0x0000\n"),
+        Err(PadLogError::ZeroRun { line: 2 })
+    );
+    assert_eq!(
+        PadLog::parse(&format!(
+            "padlog v1\n{}x0000\n{}x0000\n",
+            rom_operator_bridge_service::input::MAX_PADLOG_FRAMES,
+            1
+        )),
+        Err(PadLogError::TooManyFrames { line: 3 })
+    );
+}
+
+#[test]
+fn parser_rejects_run_length_overflow_before_allocation() {
+    assert_eq!(
+        PadLog::parse("padlog v1\n0000\n18446744073709551615x0000\n"),
+        Err(PadLogError::TooManyFrames { line: 3 })
+    );
 }
 
 #[cfg(unix)]
@@ -161,6 +199,26 @@ fn writes_padlog_and_private_event_sidecar_without_rich_fields_in_padlog() {
     assert_eq!(event["client_seq"], 7);
     assert_eq!(event["source_id"], "keyboard-primary");
     assert_eq!(event["assigned_frame"], 42);
+
+    assert!(matches!(
+        store.append_padlog_event(
+            "run-001",
+            &PadLogEventRow::new(
+                "run-001",
+                1,
+                43,
+                0xf000,
+                8,
+                "keyboard-primary",
+                "rejected",
+                "reserved bits",
+            ),
+        ),
+        Err(ArtifactError::InvalidPadWord {
+            pad_word: 0xf000,
+            reserved: 0xf000,
+        })
+    ));
 }
 
 #[test]
@@ -177,6 +235,7 @@ fn reference_parser_accepts_canonical_output_when_accessible() {
     let frames = vec![0x0000, 0x0000, PadButton::A.mask(), PadButton::Start.mask()];
     let text = PadLog::from_raw_frames(frames.clone())
         .expect("frames validate")
+        .with_rom_blake3([0xabu8; 32])
         .write_canonical();
     let workspace = tempfile::tempdir().expect("tempdir creates");
     let src_dir = workspace.path().join("src");

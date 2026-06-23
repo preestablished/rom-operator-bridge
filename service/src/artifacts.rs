@@ -1,6 +1,6 @@
 use crate::{
     backend::BackendMode,
-    input::PadLog,
+    input::{PAD_MASK, PadLog},
     private_config::{BridgePrivateConfig, PrivateConfigError},
 };
 use serde::{Deserialize, Serialize};
@@ -85,6 +85,7 @@ impl<'a> PrivateArtifactStore<'a> {
         row: &PadLogEventRow,
     ) -> Result<PrivateArtifactRef, ArtifactError> {
         ensure_schema_version(row.schema_version)?;
+        ensure_pad_word(row.pad_word)?;
         let run_id = path_segment("run_id", run_id)?;
         ensure_matching_identifier("run_id", run_id, &row.run_id)?;
         self.append_jsonl(
@@ -463,6 +464,15 @@ fn ensure_matching_identifier(
     }
 }
 
+fn ensure_pad_word(pad_word: u16) -> Result<(), ArtifactError> {
+    let reserved = pad_word & !PAD_MASK;
+    if reserved == 0 {
+        Ok(())
+    } else {
+        Err(ArtifactError::InvalidPadWord { pad_word, reserved })
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ArtifactError {
     #[error(transparent)]
@@ -479,4 +489,6 @@ pub enum ArtifactError {
         path_value: String,
         row_value: String,
     },
+    #[error("artifact pad word {pad_word:#06x} sets reserved bits {reserved:#06x}")]
+    InvalidPadWord { pad_word: u16, reserved: u16 },
 }

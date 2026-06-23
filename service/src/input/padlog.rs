@@ -37,6 +37,8 @@ impl PadLog {
     pub fn from_applied_frames(
         frames: impl IntoIterator<Item = AppliedInputFrame>,
     ) -> Result<Self, PadLogError> {
+        // Padlogs are dense frame scripts. This preserves iterator order and
+        // intentionally does not expand gaps between absolute assigned frames.
         Self::from_raw_frames(frames.into_iter().map(|frame| frame.pad_word))
     }
 
@@ -63,7 +65,10 @@ impl PadLog {
             }
 
             let (count, word) = parse_frame_line(line, line_no)?;
-            if log.frames.len() as u64 + count > MAX_PADLOG_FRAMES {
+            let total_frames = (log.frames.len() as u64)
+                .checked_add(count)
+                .ok_or(PadLogError::TooManyFrames { line: line_no })?;
+            if total_frames > MAX_PADLOG_FRAMES {
                 return Err(PadLogError::TooManyFrames { line: line_no });
             }
 
