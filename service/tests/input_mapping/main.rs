@@ -104,6 +104,17 @@ fn merges_keyboard_and_gamepad_with_union_then_neutralization() {
 }
 
 #[test]
+fn merges_raw_pad_words_with_opposite_direction_neutralization() {
+    let up = PadWord::new(PadButton::Up.mask()).expect("reserved bits are clear");
+    let down = PadWord::new(PadButton::Down.mask()).expect("reserved bits are clear");
+    let left = PadWord::new(PadButton::Left.mask()).expect("reserved bits are clear");
+    let right = PadWord::new(PadButton::Right.mask()).expect("reserved bits are clear");
+
+    assert!(PadWord::merge(up, down).is_zero());
+    assert!(PadWord::merge(left, right).is_zero());
+}
+
+#[test]
 fn returns_sorted_button_names_by_layout_bit_order() {
     let word = PadWord::new(
         PadButton::Select.mask()
@@ -114,6 +125,18 @@ fn returns_sorted_button_names_by_layout_bit_order() {
     .expect("reserved bits are clear");
 
     assert_eq!(word.button_names(), ["A", "L", "Right", "Select"]);
+}
+
+#[test]
+fn returns_all_button_names_in_layout_bit_order() {
+    let word = PadWord::new(PAD_MASK).expect("reserved bits are clear");
+
+    assert_eq!(
+        word.button_names(),
+        [
+            "A", "B", "X", "Y", "L", "R", "Up", "Down", "Left", "Right", "Start", "Select"
+        ]
+    );
 }
 
 #[test]

@@ -110,6 +110,11 @@ impl PadWord {
         self.0 as u32
     }
 
+    /// Validates a raw pad word from persisted/replay surfaces.
+    ///
+    /// This preserves all valid low bits, including opposing D-pad pairs.
+    /// Browser input paths should use `from_buttons`, `merge`, or
+    /// `merge_buttons` so opposite directions are neutralized before scheduling.
     pub fn new(raw: u16) -> Result<Self, PadWordError> {
         let reserved = raw & RESERVED_MASK;
         if reserved != 0 {
