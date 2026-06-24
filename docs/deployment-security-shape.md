@@ -211,7 +211,7 @@ deployment, run `sudo systemctl daemon-reload` before restart.
 ## Future Deployment Checks
 
 These command shapes are for the later deployment bead. They were not run during
-Phase 0 discovery because no bridge service or proxy route exists yet.
+Phase 0 discovery because no deployed service instance or proxy route exists yet.
 
 DNS and TLS route:
 

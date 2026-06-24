@@ -16,9 +16,10 @@ https://rombridge.birb.homes/
 ```
 
 DNS for `rombridge.birb.homes` is already configured to resolve to
-`<bridge-private-ip>`. The bridge service, TLS route, reverse-proxy manifest,
-systemd unit, release artifact, and private env file are deployment outputs and
-are not present in this repository yet.
+`<bridge-private-ip>`. The bridge service source exists in this repository. The
+deployed service instance, TLS route, reverse-proxy manifest, systemd unit,
+release artifact, and private env file are deployment outputs that are not
+present or applied yet.
 
 The older static-only publishing shape under `https://birb.homes/rom-bridge/`
 is not the Phase 0 runtime target. It remains only a fallback static path shape;
@@ -30,6 +31,7 @@ Origin/CORS and proxy plan.
 | Surface | Public route |
 | --- | --- |
 | Static UI | `https://rombridge.birb.homes/` |
+| Static-only fallback publish path | `https://birb.homes/rom-bridge/` (no runtime API) |
 | Runtime API | `https://rombridge.birb.homes/api/...` |
 | WebSockets | `wss://rombridge.birb.homes/ws/...` |
 
@@ -86,20 +88,27 @@ must not be copied into shared logs or public handoff text.
 - Allowed browser origin: `https://rombridge.birb.homes`.
 - Reject absent, `null`, and unrelated browser `Origin` values.
 - Do not use wildcard CORS with credentials.
+- If responses vary by request `Origin`, include `Vary: Origin`.
 - Authenticate HTTP runtime routes and WebSocket handshakes.
 - Credentials are accepted only in the session-start request body; never in URLs.
 - Auth uses `HttpOnly; Secure; SameSite=Strict` cookies scoped to `/`.
 - Default session TTL is 4 hours.
 - MVP concurrency is one active operator session.
+- Rate-limit failed auth attempts.
+- Log auth failures only to private service logs.
+- Return sanitized public auth errors without credentials, private paths, stack
+  traces, host-control details, or artifact identifiers.
 
 Credential rotation procedure:
 
 1. Generate a new operator credential outside source control.
-2. Update `/etc/rom-operator-bridge/rom-operator-bridge.env`.
+2. Update `/etc/rom-operator-bridge/rom-operator-bridge.env` with the new
+   operator credential and session secret.
 3. Rotate session-signing or cookie secrets if applicable.
 4. Clear or expire active session state.
 5. Restart `rom-operator-bridge.service`.
-6. Confirm the old credential fails and the new credential works.
+6. Confirm the old credential and old sessions fail, and the new credential
+   works.
 
 ## Headers And Cache Policy
 
@@ -135,6 +144,18 @@ sudo systemctl daemon-reload
 sudo systemctl restart rom-operator-bridge.service
 ```
 
+Post-restart verification, inspected privately:
+
+```sh
+sudo systemctl status --no-pager rom-operator-bridge.service
+sudo journalctl -u rom-operator-bridge.service -n 50 --no-pager
+curl -fsS http://<bridge-private-ip>:7410/health
+```
+
+Do not paste service status or journal output into shared handoff text unless it
+has been sanitized for credentials, private paths, host-control details, and
+artifact refs.
+
 Emergency shutdown:
 
 ```sh
@@ -153,15 +174,28 @@ Rollback proxy route:
 KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl delete -f deploy/k8s/rombridge-ingress.yaml
 ```
 
-Rollback service artifact:
+Before changing the private env file during a deployment, save a private backup:
+
+```sh
+sudo install -m 0600 -o root -g root \
+  /etc/rom-operator-bridge/rom-operator-bridge.env \
+  /etc/rom-operator-bridge/rom-operator-bridge.env.previous
+```
+
+Rollback service artifact and private env file:
 
 ```sh
 sudo ln -sfn /opt/rom-operator-bridge/previous /opt/rom-operator-bridge/current
+sudo install -m 0600 -o root -g root \
+  /etc/rom-operator-bridge/rom-operator-bridge.env.previous \
+  /etc/rom-operator-bridge/rom-operator-bridge.env
+sudo systemctl daemon-reload
 sudo systemctl restart rom-operator-bridge.service
 ```
 
-If the systemd unit changes during a deployment, run `sudo systemctl
-daemon-reload` before restart.
+If the private env file did not change during the failed deployment, the env
+restore step can be skipped. Do not copy env file contents into shared logs or
+handoff text.
 
 ## Deployment Checks
 
@@ -171,15 +205,24 @@ proxy manifest exist:
 ```sh
 getent hosts rombridge.birb.homes
 curl -I --resolve rombridge.birb.homes:443:<bridge-private-ip> https://rombridge.birb.homes/
-curl -i -H 'Origin: https://example.invalid' https://rombridge.birb.homes/api/session
 curl -i https://rombridge.birb.homes/api/session
 curl -I https://rombridge.birb.homes/api/session
+curl -i \
+  -H 'Origin: https://example.invalid' \
+  -H 'Cookie: <redacted-valid-session-cookie>' \
+  https://rombridge.birb.homes/api/session
+websocat \
+  -H 'Origin: https://rombridge.birb.homes' \
+  -H 'Cookie: <redacted-valid-session-cookie>' \
+  wss://rombridge.birb.homes/ws/events
 ```
 
 Expected sanitized results:
 
 - Hostname resolves to `<bridge-private-ip>`.
 - TLS is served for `rombridge.birb.homes`.
-- Unrelated origins are rejected.
 - Unauthenticated API requests are rejected without private details.
 - Runtime responses include `Cache-Control: no-store`.
+- Wrong-origin authenticated requests are rejected before serving session state.
+- WebSocket upgrade succeeds only with an authenticated session and allowed
+  Origin.
