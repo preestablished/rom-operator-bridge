@@ -1,6 +1,7 @@
 import {
   initialAuthSessionState,
   logoutSession,
+  refreshSession,
   submitCredential,
   type AuthSessionState,
   type RuntimeSessionClient
@@ -114,9 +115,18 @@ export function mountOperatorApp(
   client: RuntimeSessionClient = new RuntimeApiClient(config)
 ): void {
   let auth = initialAuthSessionState();
+  let authRequestSeq = 0;
 
   const render = () => {
     root.innerHTML = renderOperatorApp(config, auth);
+  };
+
+  const applyAuthResult = (requestSeq: number, next: AuthSessionState) => {
+    if (requestSeq !== authRequestSeq) {
+      return;
+    }
+    auth = next;
+    render();
   };
 
   root.addEventListener("submit", (event) => {
@@ -125,40 +135,49 @@ export function mountOperatorApp(
       return;
     }
     event.preventDefault();
+    if (auth.status === "starting" || auth.status === "stopping") {
+      return;
+    }
 
     const formData = new FormData(form);
     const credential = String(formData.get("operator_credential") ?? "");
     form.reset();
+    const requestSeq = ++authRequestSeq;
     auth = { ...auth, status: "starting", error: null };
     render();
     submitCredential(auth, client, credential).then((next) => {
-      auth = next;
-      render();
+      applyAuthResult(requestSeq, next);
     });
   });
 
   root.addEventListener("click", (event) => {
     const target = event.target instanceof Element ? event.target : null;
     const button = target?.closest<HTMLButtonElement>("[data-session-action='logout']");
-    if (!button) {
+    if (!button || button.disabled || auth.status !== "active") {
       return;
     }
 
+    const stateToStop = auth;
+    const requestSeq = ++authRequestSeq;
     auth = { ...auth, status: "stopping", error: null };
     render();
-    logoutSession(auth, client).then((next) => {
-      auth = next;
-      render();
+    logoutSession(stateToStop, client).then((next) => {
+      applyAuthResult(requestSeq, next);
     });
   });
 
   render();
+  const refreshSeq = ++authRequestSeq;
+  refreshSession(auth, client).then((next) => {
+    applyAuthResult(refreshSeq, next);
+  });
 }
 
 function renderSessionPanel(auth: AuthSessionState, backendMode: BackendMode): string {
-  const active = auth.status === "active";
+  const showSession = auth.status === "active" || auth.status === "stopping";
+  const busy = auth.status === "starting" || auth.status === "stopping";
   return `
-    <article class="panel session-panel">
+    <article class="panel session-panel" aria-busy="${busy}">
       <div class="panel-header">
         <div>
           <p class="eyebrow">Session</p>
@@ -166,9 +185,10 @@ function renderSessionPanel(auth: AuthSessionState, backendMode: BackendMode): s
         </div>
         <span class="status-pill">${escapeHtml(backendMode)}</span>
       </div>
+      <p class="session-live" aria-live="polite">${sessionStatusLabel(auth)}</p>
       ${auth.error ? `<p class="session-alert" role="alert">${escapeHtml(auth.error.message)}</p>` : ""}
       ${
-        active
+        showSession
           ? `<dl class="session-meta" aria-label="Active session">
               <div><dt>Session</dt><dd>${escapeHtml(auth.session.session_id ?? "")}</dd></div>
               <div><dt>Run</dt><dd>${escapeHtml(auth.session.run_id ?? "")}</dd></div>
@@ -180,7 +200,7 @@ function renderSessionPanel(auth: AuthSessionState, backendMode: BackendMode): s
                 <input
                   type="password"
                   name="operator_credential"
-                  autocomplete="off"
+                  autocomplete="one-time-code"
                   autocapitalize="none"
                   spellcheck="false"
                   required
@@ -195,11 +215,13 @@ function renderSessionPanel(auth: AuthSessionState, backendMode: BackendMode): s
             </form>`
       }
       ${
-        active
+        showSession
           ? `<div class="button-row single-action">
               <button type="button" disabled>Pause</button>
               <button type="button" disabled>Resume</button>
-              <button type="button" class="danger" data-session-action="logout">Logout</button>
+              <button type="button" class="danger" data-session-action="logout" ${
+                auth.status === "stopping" ? "disabled" : ""
+              }>Logout</button>
             </div>`
           : ""
       }
@@ -219,6 +241,8 @@ function sessionStatusLabel(auth: AuthSessionState): string {
       return "active elsewhere";
     case "expired":
       return "expired";
+    case "origin_rejected":
+      return "origin rejected";
     case "starting":
       return "starting";
     case "stopping":

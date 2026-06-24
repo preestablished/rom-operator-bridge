@@ -14,6 +14,7 @@ export type AuthSessionStatus =
   | "active"
   | "expired"
   | "auth_rejected"
+  | "origin_rejected"
   | "session_active_elsewhere"
   | "stopping"
   | "faulted";
@@ -132,9 +133,17 @@ function stateFromRuntimeError(state: AuthSessionState, error: unknown): AuthSes
     };
   }
 
+  const status = statusFromErrorCode(error.display.code);
+  const clearSession =
+    status === "auth_rejected" ||
+    status === "expired" ||
+    status === "origin_rejected" ||
+    status === "session_active_elsewhere";
+
   return {
     ...state,
-    status: statusFromErrorCode(error.display.code),
+    status,
+    session: clearSession ? initialRuntimeSessionModel() : state.session,
     error: error.display
   };
 }
@@ -147,6 +156,8 @@ function statusFromErrorCode(code: RuntimeErrorDisplay["code"]): AuthSessionStat
       return "session_active_elsewhere";
     case "session_inactive":
       return "expired";
+    case "origin_rejected":
+      return "origin_rejected";
     default:
       return "faulted";
   }
