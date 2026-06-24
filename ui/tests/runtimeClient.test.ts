@@ -305,6 +305,7 @@ describe("runtime WebSocket clients", () => {
 
   it("sends typed input envelopes, parses acks, and reconnects without URL credentials", () => {
     const messages: RuntimeWsMessage[] = [];
+    const closes: number[] = [];
     const reconnects: number[] = [];
     const timers: Array<() => void> = [];
     const client = new RuntimeWebSocketClient(config, {
@@ -323,6 +324,7 @@ describe("runtime WebSocket clients", () => {
 
     const input = client.inputSocket("session-001", "keyboard", {
       onMessage: (message) => messages.push(message),
+      onClose: () => closes.push(closes.length + 1),
       onReconnect: (attempt) => reconnects.push(attempt)
     });
     const firstSocket = FakeWebSocket.instances[0]!;
@@ -370,6 +372,7 @@ describe("runtime WebSocket clients", () => {
     expect(messages[0]?.type).toBe("input_ack");
 
     firstSocket.emitClose();
+    expect(closes).toEqual([1]);
     expect(reconnects).toEqual([1]);
     expect(
       input.sendInput({

@@ -327,7 +327,11 @@ export function mountOperatorApp(
     if (!appRegion || !liveRegion) {
       return;
     }
+    syncInputCaptureLifecycle();
     const shouldRestoreInputFocus = !focusTarget && inputSurfaceFocused();
+    const focusedPadButton = shouldRestoreInputFocus
+      ? padButtonFromElement(globalThis.document?.activeElement)
+      : null;
     appRegion.innerHTML = renderOperatorApp(config, auth, {
       validationState,
       preview,
@@ -344,7 +348,7 @@ export function mountOperatorApp(
     if (focusTarget) {
       focusSessionTarget(appRegion, focusTarget);
     } else if (shouldRestoreInputFocus) {
-      focusInputSurface(appRegion);
+      focusInputSurface(appRegion, focusedPadButton);
     }
   };
 
@@ -438,10 +442,8 @@ export function mountOperatorApp(
     inputSocket = eventClient.inputSocket(nextSessionId, "combined", {
       onMessage: handleRuntimeEvent,
       onError: () => undefined,
-      onReconnect: () => {
-        clearInputSources(false);
-        render();
-      }
+      onClose: clearDisconnectedInputState,
+      onReconnect: clearDisconnectedInputState
     });
     startGamepadPolling();
   }
@@ -465,6 +467,10 @@ export function mountOperatorApp(
 
     if (!isRuntimeEvent(message)) {
       return;
+    }
+
+    if (runtimeEventStopsSession(message)) {
+      closeInputStream(true);
     }
 
     if (message.type === "validation_updated") {
@@ -791,7 +797,7 @@ export function mountOperatorApp(
       !button ||
       !inputSurfaceFocused() ||
       isTextInputTarget(event.target) ||
-      isVisiblePadButtonTarget(event.target)
+      isVisiblePadActivation(event)
     ) {
       return;
     }
@@ -806,7 +812,7 @@ export function mountOperatorApp(
 
   const releaseMappedKeyboardButton = (event: KeyboardEvent) => {
     const button = keyboardButtonForCode(event.code);
-    if (!button || isTextInputTarget(event.target) || isVisiblePadButtonTarget(event.target)) {
+    if (!button || isTextInputTarget(event.target) || isVisiblePadActivation(event)) {
       return;
     }
 
@@ -996,6 +1002,23 @@ export function mountOperatorApp(
     neutralizedDirections = merged.neutralizedDirections;
     sendInputState(pressedButtons);
     render();
+  }
+
+  function syncInputCaptureLifecycle() {
+    if (inputControlsDisabled()) {
+      clearInputSources();
+      stopGamepadPolling();
+      return;
+    }
+    startGamepadPolling();
+  }
+
+  function clearDisconnectedInputState() {
+    const hadInput = clearInputSources(false);
+    stopGamepadPolling();
+    if (hadInput) {
+      render();
+    }
   }
 
   function clearInputSources(sendRelease = true): boolean {
@@ -1211,6 +1234,13 @@ function isRuntimeEvent(message: RuntimeWsMessage): message is RuntimeEventMessa
     message.type === "capture_updated" ||
     message.type === "label_updated" ||
     message.type === "validation_updated"
+  );
+}
+
+function runtimeEventStopsSession(message: RuntimeEventMessage): boolean {
+  return (
+    (message.type === "session_updated" || message.type === "run_updated") &&
+    message.payload.state === "stopped"
   );
 }
 
@@ -1529,7 +1559,16 @@ function focusSessionTarget(root: HTMLElement, target: "alert" | "credential" | 
   root.querySelector<HTMLElement>(selector)?.focus();
 }
 
-function focusInputSurface(root: HTMLElement): void {
+function focusInputSurface(root: HTMLElement, padButton: PadButton | null = null): void {
+  if (padButton) {
+    const button = Array.from(root.querySelectorAll<HTMLButtonElement>("[data-pad-button]")).find(
+      (candidate) => candidate.dataset.padButton === padButton
+    );
+    if (button) {
+      button.focus({ preventScroll: true });
+      return;
+    }
+  }
   root.querySelector<HTMLElement>("[data-input-focus-surface]")?.focus({ preventScroll: true });
 }
 
@@ -1545,6 +1584,15 @@ function isVisiblePadButtonTarget(target: EventTarget | null): boolean {
     return false;
   }
   return Boolean(target.closest("[data-pad-button]"));
+}
+
+function padButtonFromElement(element: Element | null | undefined): PadButton | null {
+  const padButton = element?.closest<HTMLElement>("[data-pad-button]")?.dataset.padButton;
+  return isPadButton(padButton) ? padButton : null;
+}
+
+function isVisiblePadActivation(event: KeyboardEvent): boolean {
+  return isPadActivationKey(event.key) && isVisiblePadButtonTarget(event.target);
 }
 
 function runtimeStat(label: string, value: string): string {

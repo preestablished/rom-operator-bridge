@@ -606,6 +606,7 @@ export class RuntimeSocket {
     private readonly handlers: {
       onMessage?: (message: RuntimeWsMessage) => void;
       onError?: (error: RuntimeApiError) => void;
+      onClose?: () => void;
       onReconnect?: (attempt: number) => void;
     } = {},
     private readonly reconnect: {
@@ -694,7 +695,11 @@ export class RuntimeSocket {
   }
 
   private handleClose(): void {
-    if (this.closed || this.reconnectAttempts >= this.reconnect.maxAttempts) {
+    if (this.closed) {
+      return;
+    }
+    this.handlers.onClose?.();
+    if (this.reconnectAttempts >= this.reconnect.maxAttempts) {
       return;
     }
     this.reconnectAttempts += 1;
