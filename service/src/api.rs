@@ -3,6 +3,7 @@ use crate::{
     backend::{BackendMode, BridgeBackend, RealBackendUnavailable, SyntheticBackend},
     config::ServiceConfig,
     input::{PAD_LAYOUT_ID, PAD_LAYOUT_VERSION},
+    ws_input::{WsInputState, serve_input_socket},
 };
 use axum::{
     Json, Router,
@@ -26,6 +27,7 @@ pub struct AppState {
     backend: Arc<dyn BridgeBackend>,
     auth: AuthState,
     runtime_session: Arc<Mutex<Option<String>>>,
+    ws_input: WsInputState,
 }
 
 impl AppState {
@@ -40,6 +42,7 @@ impl AppState {
             backend,
             auth: AuthState::new(),
             runtime_session: Arc::new(Mutex::new(None)),
+            ws_input: WsInputState::new(),
         }
     }
 
@@ -53,6 +56,21 @@ impl AppState {
             backend: Arc::new(SyntheticBackend),
             auth,
             runtime_session: Arc::new(Mutex::new(None)),
+            ws_input: WsInputState::new(),
+        }
+    }
+
+    pub fn for_tests_with_backend(
+        config: ServiceConfig,
+        auth: AuthState,
+        backend: Arc<dyn BridgeBackend>,
+    ) -> Self {
+        Self {
+            config,
+            backend,
+            auth,
+            runtime_session: Arc::new(Mutex::new(None)),
+            ws_input: WsInputState::new(),
         }
     }
 }
@@ -147,6 +165,7 @@ async fn start_session(
         .runtime_session
         .lock()
         .expect("runtime session mutex poisoned") = Some(session_id);
+    state.ws_input.reset_session(&backend_session.session_id);
 
     let mut response = Json(StartSessionResponse {
         schema_version: RUNTIME_API_SCHEMA_VERSION,
@@ -225,7 +244,20 @@ async fn input_ws_handshake(
         return auth_error(error).into_response();
     }
 
-    let mut response = ws.on_upgrade(|_socket| async {}).into_response();
+    let Some(session_id) = state
+        .runtime_session
+        .lock()
+        .expect("runtime session mutex poisoned")
+        .clone()
+    else {
+        return auth_error(AuthError::MissingSession).into_response();
+    };
+
+    let backend = state.backend.clone();
+    let ws_input = state.ws_input.clone();
+    let mut response = ws
+        .on_upgrade(move |socket| serve_input_socket(socket, backend, ws_input, session_id))
+        .into_response();
     apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
     response
 }

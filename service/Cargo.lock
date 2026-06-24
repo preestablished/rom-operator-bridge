@@ -928,6 +928,7 @@ name = "rom-operator-bridge-service"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "futures-util",
  "hmac",
  "jsonschema",
  "serde",
@@ -936,6 +937,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-tungstenite",
  "tower",
  "tracing",
  "tracing-subscriber",

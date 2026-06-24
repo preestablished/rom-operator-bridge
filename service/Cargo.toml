@@ -20,6 +20,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 jsonschema = { version = "0.33", default-features = false }
 tempfile = "3"
+tokio-tungstenite = "0.29"
 tower = { version = "0.5", features = ["util"] }
