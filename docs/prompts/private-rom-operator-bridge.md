@@ -11,17 +11,17 @@ Create a thorough, production-ready task graph. Include all necessary setup, imp
 ## Project Information
 
 ### Links to Relevant Documentation
-/home/infra-admin/.agents/projects/phase4-rom-operator-bridge/plans/initial/
-/home/infra-admin/.agents/projects/determinism/
+<initial-plan-dir>/
+<determinism-plan-dir>/
 
 ### Project Description
 Build a private ROM operator bridge that supports the determinism project by letting a user on a macOS machine operate a ROM running on a Linux hypervisor host. The Mac should only need trusted-network access, a browser, keyboard input, and optionally a gamepad. The Linux host remains the source of truth for the ROM, hypervisor worker, deterministic frame-boundary input, framebuffer/capture path, private corpus root, labels, validation reports, and verifier commands.
 
 The bridge should provide a browser-based operator UI and a host-side control service. The UI must let an operator start or attach to a private session, send keyboard/gamepad input using the stable `console16-12btn-v1` pad layout, observe current run status and framebuffer previews, trigger Phase 3/Phase 4 captures, review recent capture metadata, draft labels for first-boss, goal-positive, goal-negative, and dedup candidates, and see sanitized validation status. Private ROM bytes, screenshots, raw captures, save RAM, decoded feature values, exact private corpus paths, and validation reports must never be exposed in static hosted files or browser persistence. No real-run data may be written to localStorage, IndexedDB, service workers, browser downloads, preview caches, source maps with private local paths, static docs, public command transcripts, or validation excerpts.
 
-The implementation should follow the existing initial planning material in `/home/infra-admin/.agents/projects/phase4-rom-operator-bridge/plans/initial/`, including its hard Phase 0 discovery and contract-freeze gate. Before service or UI implementation, inspect the real `~/git/preestablished/` checkouts to confirm the authoritative integration points for padlog parsing, `console16-12btn-v1`, hypervisor input injection, frame counters, framebuffer access, capture/export APIs, existing control-plane contracts, verifier commands, redaction scanners, deployment conventions, and test commands.
+The implementation should follow the existing initial planning material in `<initial-plan-dir>/`, including its hard Phase 0 discovery and contract-freeze gate. Before service or UI implementation, inspect the real `~/git/preestablished/` checkouts to confirm the authoritative integration points for padlog parsing, `console16-12btn-v1`, hypervisor input injection, frame counters, framebuffer access, capture/export APIs, existing control-plane contracts, verifier commands, redaction scanners, deployment conventions, and test commands.
 
-Read `/home/infra-admin/.agents/projects/phase4-rom-operator-bridge/plans/initial/README.md` first and follow its listed reading order. In shell comments, map each phase or bead group to the source plan file(s), and ensure the validation and acceptance material from `08-validation-runbook.md` and `09-implementation-sequence.md` is represented. Implementation/planning agents may use only local project docs, live checked-out repos, public platform/language/hardware docs, and operator-supplied artifacts. They must not consult third-party deterministic-testing platforms, external case studies, proprietary SDKs/APIs, or non-public implementation notes; file a docs gap instead.
+Read `<initial-plan-dir>/README.md` first and follow its listed reading order. In shell comments, map each phase or bead group to the source plan file(s), and ensure the validation and acceptance material from `08-validation-runbook.md` and `09-implementation-sequence.md` is represented. Implementation/planning agents may use only local project docs, live checked-out repos, public platform/language/hardware docs, and operator-supplied artifacts. They must not consult third-party deterministic-testing platforms, external case studies, proprietary SDKs/APIs, or non-public implementation notes; file a docs gap instead.
 
 The task graph must encode Phase 0 as a hard dependency gate. Create a Phase 0 discovery bead and a contract-freeze acceptance bead. Every service, UI, real-backend, capture, verifier, deployment, handoff, and implementation docs bead must depend on the freeze bead. Only probe and note-writing tasks may be ready before `bridge-discovery-note.md` exists and answers the contracts from `10-phase0-discovery-and-contract-freeze.md`.
 
@@ -34,9 +34,9 @@ Expected direction unless discovery shows a better local convention:
 - TypeScript for the browser operator UI, API client, WebSocket clients, state modeling, input mapping, and UI tests.
 - Synthetic backend first, with fake frame counter, generated framebuffer, padlog writer, fake capture ids, in-memory status, temp private root, and tests that keep service/UI work unblocked before real hypervisor attachment.
 - Real backend later, implementing the same service-facing abstraction as the synthetic backend.
-- HTTP plus WebSocket runtime API following `/home/infra-admin/.agents/projects/phase4-rom-operator-bridge/plans/initial/11-runtime-api-contract.md`.
-- Browser input and operator flow following `/home/infra-admin/.agents/projects/phase4-rom-operator-bridge/plans/initial/12-browser-input-and-operator-flow.md`.
-- Private deployment and security checks following `/home/infra-admin/.agents/projects/phase4-rom-operator-bridge/plans/initial/13-deployment-security-checklist.md`.
+- HTTP plus WebSocket runtime API following `<initial-plan-dir>/11-runtime-api-contract.md`.
+- Browser input and operator flow following `<initial-plan-dir>/12-browser-input-and-operator-flow.md`.
+- Private deployment and security checks following `<initial-plan-dir>/13-deployment-security-checklist.md`.
 - Mandatory verifier runbook/status integration. A service-side validation runner is optional and should be created only if Phase 0 chooses it. Both paths must keep private reports private and expose only sanitized status.
 
 ### Specific Requirements
@@ -89,7 +89,7 @@ PHASE0_DISCOVERY=$(bd create "Phase 0: locate bridge integration points" \
   --labels phase0-discovery,docs \
   --description "Inspect reference-workload, determinism-hypervisor, control-plane, and related local checkouts without changing implementation code." \
   --acceptance "Checkout paths, commit ids, padlog parser, hypervisor input API, framebuffer source, capture/export mechanism, verifier commands, and deployment constraints are recorded." \
-  --context "Use /home/infra-admin/.agents/projects/phase4-rom-operator-bridge/plans/initial/10-phase0-discovery-and-contract-freeze.md." \
+  --context "Use <initial-plan-dir>/10-phase0-discovery-and-contract-freeze.md." \
   --notes "Reserve only discovery notes and read-only inspection surfaces." \
   --silent)
 
