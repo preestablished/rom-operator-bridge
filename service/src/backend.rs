@@ -7,8 +7,8 @@ use thiserror::Error;
 
 use crate::{
     api::RUNTIME_API_SCHEMA_VERSION,
-    artifacts::{BridgeEventRow, PrivateArtifactStore, RunManifest},
-    input::PadWord,
+    artifacts::{BridgeEventRow, PadLogEventRow, PrivateArtifactStore, RunManifest},
+    input::{AppliedInputFrame, PadLog, PadWord},
     private_config::BridgePrivateConfig,
 };
 
@@ -159,6 +159,8 @@ pub struct InputScheduleRequest {
     pub session_id: SessionId,
     pub target_frame: FrameCounter,
     pub pad_word: PadWord,
+    pub client_seq: u64,
+    pub source_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -302,6 +304,7 @@ impl BridgeBackend for SyntheticBackend {
             current_frame: 0,
             last_preview_frame: 0,
             last_applied_input_frame: 0,
+            applied_inputs: Vec::new(),
         };
         inner.write_manifest(&self.private_config, &run_id)?;
         inner.append_event_for_run(
@@ -448,16 +451,48 @@ impl BridgeBackend for SyntheticBackend {
 
     fn inject_input(&self, request: InputScheduleRequest) -> BackendResult<InputScheduleReceipt> {
         let mut inner = self.inner.lock().expect("synthetic backend mutex poisoned");
+        let (run_id, frame_index, applied_inputs) = {
+            let session = inner
+                .active
+                .as_ref()
+                .filter(|session| session.session_id == request.session_id)
+                .ok_or(BackendError::BackendUnavailable)?;
+            if session.state != SessionState::Running {
+                return Err(BackendError::BackendUnavailable);
+            }
+            let frame_index = session.applied_inputs.len() as u64;
+            let mut applied_inputs = session.applied_inputs.clone();
+            applied_inputs.push(AppliedInputFrame {
+                frame: request.target_frame,
+                pad_word: request.pad_word.raw(),
+            });
+            (session.run_id.clone(), frame_index, applied_inputs)
+        };
+
+        inner.write_input_artifacts(
+            &self.private_config,
+            &run_id,
+            &applied_inputs,
+            PadLogEventRow::new(
+                &run_id,
+                frame_index,
+                request.target_frame,
+                request.pad_word.raw(),
+                request.client_seq,
+                &request.source_id,
+                "applied",
+                "input applied",
+            ),
+        )?;
+
         let session = inner
             .active
             .as_mut()
             .filter(|session| session.session_id == request.session_id)
             .ok_or(BackendError::BackendUnavailable)?;
-        if session.state != SessionState::Running {
-            return Err(BackendError::BackendUnavailable);
-        }
         session.last_applied_input_frame = request.target_frame;
         session.current_frame = session.current_frame.max(request.target_frame);
+        session.applied_inputs = applied_inputs;
         Ok(InputScheduleReceipt {
             session_id: request.session_id,
             assigned_frame: request.target_frame,
@@ -548,6 +583,29 @@ impl SyntheticBackendInner {
         self.next_event_seq = next_event_seq;
         Ok(())
     }
+
+    fn write_input_artifacts(
+        &mut self,
+        private_config: &BridgePrivateConfig,
+        run_id: &str,
+        applied_inputs: &[AppliedInputFrame],
+        event: PadLogEventRow,
+    ) -> BackendResult<()> {
+        if private_config.is_placeholder() {
+            return Ok(());
+        }
+
+        let padlog = PadLog::from_applied_frames(applied_inputs.iter().cloned())
+            .map_err(|_| BackendError::BackendUnavailable)?;
+        let store = PrivateArtifactStore::new(private_config);
+        store
+            .write_padlog(run_id, &padlog)
+            .map_err(|_| BackendError::BackendUnavailable)?;
+        store
+            .append_padlog_event(run_id, &event)
+            .map_err(|_| BackendError::BackendUnavailable)?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -558,6 +616,7 @@ struct SyntheticSession {
     current_frame: FrameCounter,
     last_preview_frame: FrameCounter,
     last_applied_input_frame: FrameCounter,
+    applied_inputs: Vec<AppliedInputFrame>,
 }
 
 impl SyntheticSession {

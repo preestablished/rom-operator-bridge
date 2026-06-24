@@ -1,5 +1,5 @@
 use axum::{
-    body::Body,
+    body::{Body, to_bytes},
     http::{
         Method, Request,
         header::{COOKIE, ORIGIN, SET_COOKIE},
@@ -15,12 +15,14 @@ use rom_operator_bridge_service::{
         RunStatus, SessionId, SessionState, StartBackendSession, StopReason, StoppedSession,
     },
     config::ServiceConfig,
+    input::{PAD_MASK, PadButton, PadLog, PadWord},
     private_config::{ENV_OPERATOR_CREDENTIAL, ENV_PRIVATE_ROOT, ENV_SESSION_SECRET},
 };
 use serde_json::{Value, json};
 use std::{
+    fs,
     net::SocketAddr,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -267,6 +269,104 @@ async fn reconnect_zero_input_is_acknowledged() {
     assert_eq!(backend.injected_requests().len(), 2);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn synthetic_ws_input_writes_padlog_and_private_diagnostics() {
+    let (_workspace, app, private_root) = synthetic_ws_app();
+    let (cookie, session) = login_session(app.clone()).await;
+    let session_id = session["session_id"]
+        .as_str()
+        .expect("session id is present");
+    let run_id = session["run_id"].as_str().expect("run id is present");
+    let server = WsServer::start(app).await;
+    let mut ws = server.connect(&cookie).await;
+    let all_buttons = [
+        "A", "B", "X", "Y", "L", "R", "Select", "Start", "Up", "Down", "Left", "Right",
+    ];
+    let expected_all_word = expected_pad_word(&all_buttons);
+
+    let all_pressed = send_input(&mut ws, input_message(1, "keyboard", &all_buttons)).await;
+    assert_eq!(all_pressed["type"], "input_ack");
+    assert_eq!(all_pressed["session_id"], session_id);
+    assert_eq!(all_pressed["payload"]["status"], "applied");
+    assert_eq!(all_pressed["payload"]["pad_word"], expected_all_word);
+    assert_ne!(expected_all_word, 0);
+    assert_eq!(u64::from(expected_all_word) & u64::from(!PAD_MASK), 0);
+
+    let duplicate_changed_payload = send_input(&mut ws, input_message(1, "keyboard", &["A"])).await;
+    assert_eq!(duplicate_changed_payload, all_pressed);
+
+    let mut zero_frames = Vec::new();
+    for (client_seq, source_id) in [
+        (2, "focus"),
+        (3, "page-hidden"),
+        (4, "reconnect"),
+        (5, "gamepad-disconnect"),
+    ] {
+        let zero = send_input(&mut ws, input_message(client_seq, source_id, &[])).await;
+        assert_eq!(zero["type"], "input_ack");
+        assert_eq!(zero["source_id"], source_id);
+        assert_eq!(zero["payload"]["status"], "applied");
+        assert_eq!(zero["payload"]["pad_word"], 0);
+        zero_frames.push(
+            zero["payload"]["assigned_frame"]
+                .as_u64()
+                .expect("assigned frame is u64"),
+        );
+    }
+    assert!(zero_frames.windows(2).all(|frames| frames[0] < frames[1]));
+
+    let run_root = private_root.join("runs").join(run_id);
+    let padlog_text = fs::read_to_string(run_root.join("input.padlog")).expect("padlog is written");
+    assert_eq!(
+        padlog_text,
+        format!("padlog v1\n{expected_all_word:04x}\n4x0000\n")
+    );
+    let parsed = PadLog::parse(&padlog_text).expect("padlog parses");
+    assert_eq!(
+        parsed
+            .frames()
+            .iter()
+            .map(|word| word.raw())
+            .collect::<Vec<_>>(),
+        vec![expected_all_word, 0, 0, 0, 0]
+    );
+
+    let event_lines = read_lines(&run_root.join("padlog-events.jsonl"));
+    assert_eq!(
+        event_lines.len(),
+        5,
+        "duplicate client_seq must not append a second private event"
+    );
+    let events = event_lines
+        .iter()
+        .map(|line| serde_json::from_str::<Value>(line).expect("event row parses"))
+        .collect::<Vec<_>>();
+    assert_eq!(events[0]["schema_version"], 1);
+    assert_eq!(events[0]["run_id"], run_id);
+    assert_eq!(events[0]["frame_index"], 0);
+    assert_eq!(events[0]["client_seq"], 1);
+    assert_eq!(events[0]["source_id"], "keyboard");
+    assert_eq!(events[0]["pad_word"], expected_all_word);
+    assert_eq!(events[0]["status"], "applied");
+    assert_eq!(events[0]["message"], "input applied");
+
+    let zero_sources = ["focus", "page-hidden", "reconnect", "gamepad-disconnect"];
+    for (event, source_id) in events.iter().skip(1).zip(zero_sources) {
+        assert_eq!(event["source_id"], source_id);
+        assert_eq!(event["pad_word"], 0);
+        assert_eq!(
+            event["pad_word"].as_u64().unwrap() & u64::from(!PAD_MASK),
+            0
+        );
+    }
+
+    let bridge_events = fs::read_to_string(run_root.join("bridge-events.jsonl"))
+        .expect("bridge event log is written");
+    assert!(bridge_events.contains("session_started"));
+    assert!(!bridge_events.contains(&private_root.display().to_string()));
+}
+
 struct WsServer {
     addr: SocketAddr,
     handle: tokio::task::JoinHandle<()>,
@@ -368,13 +468,17 @@ fn input_message(client_seq: u64, source_id: &str, buttons: &[&str]) -> Value {
         "payload": {
             "client_event_id": format!("00000000-0000-0000-0000-{client_seq:012}"),
             "client_time_ms": client_seq,
-            "source": "keyboard",
+            "source": payload_source(source_id),
             "buttons": buttons
         }
     })
 }
 
 async fn login_cookie(app: axum::Router) -> String {
+    login_session(app).await.0
+}
+
+async fn login_session(app: axum::Router) -> (String, Value) {
     let response = app
         .oneshot(
             Request::builder()
@@ -397,13 +501,27 @@ async fn login_cookie(app: axum::Router) -> String {
         .expect("login request runs");
     assert_eq!(response.status(), 200);
 
-    response
+    let cookie = response
         .headers()
         .get(SET_COOKIE)
         .and_then(|value| value.to_str().ok())
         .and_then(|cookie| cookie.split(';').next())
         .expect("session cookie pair exists")
-        .to_string()
+        .to_string();
+    let body = to_bytes(response.into_body(), 8192)
+        .await
+        .expect("login body reads");
+    let json = serde_json::from_slice(&body).expect("login response is json");
+
+    (cookie, json)
+}
+
+fn payload_source(source_id: &str) -> &'static str {
+    if source_id.contains("gamepad") {
+        "gamepad"
+    } else {
+        "keyboard"
+    }
 }
 
 fn runtime_json_request(method: Method, uri: &str, cookie: &str, body: Value) -> Request<Body> {
@@ -427,6 +545,30 @@ fn ws_app(state: SessionState) -> (tempfile::TempDir, axum::Router, Arc<Recordin
         backend.clone(),
     ));
     (workspace, app, backend)
+}
+
+fn synthetic_ws_app() -> (tempfile::TempDir, axum::Router, PathBuf) {
+    let workspace = tempfile::tempdir().expect("tempdir creates");
+    let private_root = workspace.path().join("bridge-private");
+    let app = router(AppState::synthetic_for_tests(config(&private_root)));
+    (workspace, app, private_root)
+}
+
+fn expected_pad_word(buttons: &[&str]) -> u16 {
+    PadWord::from_buttons(
+        buttons
+            .iter()
+            .map(|button| PadButton::from_name(button).expect("test button name is valid")),
+    )
+    .raw()
+}
+
+fn read_lines(path: &Path) -> Vec<String> {
+    fs::read_to_string(path)
+        .expect("jsonl file reads")
+        .lines()
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 fn config(private_root: &Path) -> ServiceConfig {

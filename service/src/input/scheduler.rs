@@ -24,6 +24,7 @@ pub const PUBLIC_INPUT_REJECTION_MESSAGE: &str = "Input rejected.";
 pub struct BrowserInputState {
     pub session_id: SessionId,
     pub client_seq: u64,
+    pub source_id: String,
     pub occurred_at: String,
     pub pad_word: PadWord,
 }
@@ -38,9 +39,15 @@ impl BrowserInputState {
         Self {
             session_id: session_id.into(),
             client_seq,
+            source_id: "input".to_string(),
             occurred_at: occurred_at.into(),
             pad_word,
         }
+    }
+
+    pub fn with_source_id(mut self, source_id: impl Into<String>) -> Self {
+        self.source_id = source_id.into();
+        self
     }
 }
 
@@ -449,6 +456,8 @@ impl InputScheduler {
             session_id: input.session_id.clone(),
             target_frame,
             pad_word: input.pad_word,
+            client_seq: input.client_seq,
+            source_id: input.source_id.clone(),
         };
 
         match backend.inject_input(request) {
@@ -491,6 +500,8 @@ impl InputScheduler {
             session_id: input.session_id.clone(),
             target_frame: retry_frame,
             pad_word: input.pad_word,
+            client_seq: input.client_seq,
+            source_id: input.source_id.clone(),
         };
 
         match backend.inject_input(retry) {
