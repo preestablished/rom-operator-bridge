@@ -1,4 +1,13 @@
 import {
+  initialAuthSessionState,
+  logoutSession,
+  refreshSession,
+  submitCredential,
+  type AuthSessionState,
+  type RuntimeSessionClient
+} from "./authSession";
+import { RuntimeApiClient } from "./runtimeClient";
+import {
   PAD_LAYOUT_ID,
   PAD_LAYOUT_VERSION,
   type BackendMode,
@@ -13,9 +22,10 @@ type OperatorViewModel = {
   previewState: "waiting" | "fresh" | "stale";
   validationState: "idle" | "queued" | "passed" | "failed";
   config: RuntimeConfig;
+  auth: AuthSessionState;
 };
 
-const INITIAL_VIEW_MODEL: Omit<OperatorViewModel, "config"> = {
+const INITIAL_VIEW_MODEL: Omit<OperatorViewModel, "config" | "auth"> = {
   backendMode: "synthetic",
   sessionState: "idle",
   currentFrame: 0,
@@ -23,10 +33,18 @@ const INITIAL_VIEW_MODEL: Omit<OperatorViewModel, "config"> = {
   validationState: "idle"
 };
 
-export function renderOperatorApp(config: RuntimeConfig): string {
+export function renderOperatorApp(
+  config: RuntimeConfig,
+  auth: AuthSessionState = initialAuthSessionState()
+): string {
   const model: OperatorViewModel = {
     ...INITIAL_VIEW_MODEL,
-    config
+    backendMode: auth.session.backend_mode,
+    sessionState: auth.session.state,
+    currentFrame: auth.session.current_frame,
+    previewState: auth.session.active ? (auth.session.preview_stale ? "stale" : "fresh") : "waiting",
+    config,
+    auth
   };
 
   return `
@@ -44,27 +62,7 @@ export function renderOperatorApp(config: RuntimeConfig): string {
       </section>
 
       <section class="workspace" aria-label="Operator workspace">
-        <article class="panel session-panel">
-          <div class="panel-header">
-            <div>
-              <p class="eyebrow">Session</p>
-              <h2>${stateLabel(model.sessionState)}</h2>
-            </div>
-            <span class="status-pill">${model.backendMode}</span>
-          </div>
-          <form class="session-form" autocomplete="off">
-            <label>
-              Operator credential
-              <input type="password" name="operator_credential" autocomplete="off" />
-            </label>
-            <div class="button-row">
-              <button type="button">Start</button>
-              <button type="button" disabled>Pause</button>
-              <button type="button" disabled>Resume</button>
-              <button type="button" class="danger" disabled>Stop</button>
-            </div>
-          </form>
-        </article>
+        ${renderSessionPanel(model.auth, model.backendMode)}
 
         <article class="panel preview-panel">
           <div class="panel-header">
@@ -111,8 +109,184 @@ export function renderOperatorApp(config: RuntimeConfig): string {
   `;
 }
 
+export function mountOperatorApp(
+  root: HTMLElement,
+  config: RuntimeConfig,
+  client: RuntimeSessionClient = new RuntimeApiClient(config)
+): void {
+  let auth = initialAuthSessionState();
+  let authRequestSeq = 0;
+  root.innerHTML = '<div data-operator-app></div><p class="session-live" aria-live="polite"></p>';
+  const appRegion = root.querySelector<HTMLElement>("[data-operator-app]");
+  const liveRegion = root.querySelector<HTMLElement>(".session-live");
+
+  const render = (focusTarget?: "alert" | "credential" | "logout") => {
+    if (!appRegion || !liveRegion) {
+      return;
+    }
+    appRegion.innerHTML = renderOperatorApp(config, auth);
+    liveRegion.textContent = sessionStatusLabel(auth);
+    if (focusTarget) {
+      focusSessionTarget(appRegion, focusTarget);
+    }
+  };
+
+  const applyAuthResult = (requestSeq: number, next: AuthSessionState) => {
+    if (requestSeq !== authRequestSeq) {
+      return;
+    }
+    auth = next;
+    render(focusTargetForAuth(auth));
+  };
+
+  root.addEventListener("submit", (event) => {
+    const form = event.target instanceof HTMLFormElement ? event.target : null;
+    if (!form || form.dataset.sessionForm !== "start") {
+      return;
+    }
+    event.preventDefault();
+    if (auth.status === "starting" || auth.status === "stopping") {
+      return;
+    }
+
+    const formData = new FormData(form);
+    const credential = String(formData.get("operator_credential") ?? "");
+    form.reset();
+    const requestSeq = ++authRequestSeq;
+    auth = { ...auth, status: "starting", error: null };
+    render();
+    submitCredential(auth, client, credential).then((next) => {
+      applyAuthResult(requestSeq, next);
+    });
+  });
+
+  root.addEventListener("click", (event) => {
+    const target = event.target instanceof Element ? event.target : null;
+    const button = target?.closest<HTMLButtonElement>("[data-session-action='logout']");
+    if (!button || button.disabled || auth.status !== "active") {
+      return;
+    }
+
+    const stateToStop = auth;
+    const requestSeq = ++authRequestSeq;
+    auth = { ...auth, status: "stopping", error: null };
+    render();
+    logoutSession(stateToStop, client).then((next) => {
+      applyAuthResult(requestSeq, next);
+    });
+  });
+
+  render("credential");
+  const refreshSeq = ++authRequestSeq;
+  refreshSession(auth, client).then((next) => {
+    applyAuthResult(refreshSeq, next);
+  });
+}
+
+function renderSessionPanel(auth: AuthSessionState, backendMode: BackendMode): string {
+  const showSession = auth.status === "active" || auth.status === "stopping";
+  const busy = auth.status === "starting" || auth.status === "stopping";
+  return `
+    <article class="panel session-panel" aria-busy="${busy}">
+      <div class="panel-header">
+        <div>
+          <p class="eyebrow">Session</p>
+          <h2>${sessionStatusLabel(auth)}</h2>
+        </div>
+        <span class="status-pill">${escapeHtml(backendMode)}</span>
+      </div>
+      ${
+        auth.error
+          ? `<p class="session-alert" role="alert" tabindex="-1" data-session-alert>${escapeHtml(auth.error.message)}</p>`
+          : ""
+      }
+      ${
+        showSession
+          ? `<dl class="session-meta" aria-label="Active session">
+              <div><dt>Session</dt><dd>${escapeHtml(auth.session.session_id ?? "")}</dd></div>
+              <div><dt>Run</dt><dd>${escapeHtml(auth.session.run_id ?? "")}</dd></div>
+              <div><dt>Frame</dt><dd>${auth.session.current_frame}</dd></div>
+            </dl>`
+          : `<form class="session-form" data-session-form="start" autocomplete="off">
+              <label>
+                Operator credential
+                <input
+                  type="password"
+                  name="operator_credential"
+                  data-credential-input
+                  autocomplete="one-time-code"
+                  autocapitalize="none"
+                  spellcheck="false"
+                  required
+                />
+              </label>
+              <div class="button-row">
+                <button type="submit" ${auth.status === "starting" ? "disabled" : ""}>Start</button>
+                <button type="button" disabled>Pause</button>
+                <button type="button" disabled>Resume</button>
+                <button type="button" class="danger" disabled>Stop</button>
+              </div>
+            </form>`
+      }
+      ${
+        showSession
+          ? `<div class="button-row single-action">
+              <button type="button" disabled>Pause</button>
+              <button type="button" disabled>Resume</button>
+              <button type="button" class="danger" data-session-action="logout" ${
+                auth.status === "stopping" ? "disabled" : ""
+              }>Logout</button>
+            </div>`
+          : ""
+      }
+    </article>
+  `;
+}
+
+function focusTargetForAuth(auth: AuthSessionState): "alert" | "credential" | "logout" {
+  if (auth.error) {
+    return "alert";
+  }
+  if (auth.status === "active") {
+    return "logout";
+  }
+  return "credential";
+}
+
+function focusSessionTarget(root: HTMLElement, target: "alert" | "credential" | "logout"): void {
+  const selector = {
+    alert: "[data-session-alert]",
+    credential: "[data-credential-input]",
+    logout: "[data-session-action='logout']"
+  }[target];
+  root.querySelector<HTMLElement>(selector)?.focus();
+}
+
 function runtimeStat(label: string, value: string): string {
   return `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`;
+}
+
+function sessionStatusLabel(auth: AuthSessionState): string {
+  switch (auth.status) {
+    case "auth_rejected":
+      return "authentication rejected";
+    case "session_active_elsewhere":
+      return "active elsewhere";
+    case "expired":
+      return "expired";
+    case "origin_rejected":
+      return "origin rejected";
+    case "starting":
+      return "starting";
+    case "stopping":
+      return "stopping";
+    case "faulted":
+      return "faulted";
+    case "active":
+      return stateLabel(auth.session.state);
+    case "locked":
+      return "locked";
+  }
 }
 
 function stateLabel(state: SessionState): string {

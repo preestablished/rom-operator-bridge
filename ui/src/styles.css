@@ -195,6 +195,62 @@ h2 {
   gap: 8px;
 }
 
+.button-row.single-action {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin-top: 14px;
+}
+
+.session-alert {
+  border: 1px solid #d8b8a8;
+  border-radius: 6px;
+  margin-bottom: 14px;
+  padding: 10px 12px;
+  color: #5f2d25;
+  background: #fff5f0;
+  font-size: 0.9rem;
+  font-weight: 700;
+}
+
+.session-live {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+.session-meta {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+}
+
+.session-meta div {
+  display: grid;
+  grid-template-columns: 82px minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
+  border-bottom: 1px solid #e0e5df;
+  padding-bottom: 8px;
+}
+
+.session-meta dt {
+  color: #5a675f;
+  font-size: 0.76rem;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.session-meta dd {
+  overflow: hidden;
+  margin: 0;
+  color: #17211c;
+  font-size: 0.9rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .preview-panel {
   grid-row: span 2;
 }
@@ -275,5 +331,9 @@ h2 {
 
   .button-row {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .button-row.single-action {
+    grid-template-columns: 1fr;
   }
 }
