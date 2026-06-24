@@ -258,6 +258,9 @@ write durable private capture payloads plus `captures/index.jsonl`.
 
 ## Deployment Checks
 
+The deployment route, bind, proxy, credential-source, TTL, restart, and rollback
+contract is recorded in `docs/deployment-note.md`.
+
 Future deployment checks once a service and route exist:
 
 ```sh
