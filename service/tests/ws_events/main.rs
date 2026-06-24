@@ -83,7 +83,11 @@ async fn authenticated_event_connection_emits_ordered_sanitized_snapshot() {
     assert_eq!(messages[3]["payload"]["label_revision"], 0);
     assert_eq!(messages[3]["payload"]["applied"], false);
     assert_eq!(messages[4]["payload"]["status"], "not_run");
+    assert_eq!(messages[4]["payload"]["command_class"], Value::Null);
+    assert_eq!(messages[4]["payload"]["started_at"], Value::Null);
+    assert_eq!(messages[4]["payload"]["completed_at"], Value::Null);
     assert_eq!(messages[4]["payload"]["summary"], "");
+    assert_eq!(messages[4]["payload"]["issue_summaries"], json!([]));
 
     let last_seq = messages
         .last()

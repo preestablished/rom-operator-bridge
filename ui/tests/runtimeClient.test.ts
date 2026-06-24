@@ -32,6 +32,7 @@ describe("runtime API client", () => {
       healthResponse(),
       startSessionResponse(),
       runStatusResponse(),
+      validationStatusResponse(),
       sessionResponse(),
       stopSessionResponse(),
       runStateResponse("paused"),
@@ -52,6 +53,7 @@ describe("runtime API client", () => {
       requestedCapabilities: ["input", "preview"]
     });
     const model = applyRunStatus(modelFromStartSession(started), await client.runStatus());
+    const validationStatus = await client.validationStatus();
 
     await client.sessionStatus();
     await client.stopSession("session-001");
@@ -82,6 +84,12 @@ describe("runtime API client", () => {
       last_applied_input_frame: 12
     });
     expect(initialRuntimeSessionModel()).toMatchObject({ active: false, state: "idle" });
+    expect(validationStatus).toMatchObject({
+      status: "failed",
+      command_class: "phase4_score_plan",
+      summary: "Validation failed.",
+      issue_summaries: ["Goal route mismatch."]
+    });
     expect(labelSnapshot.dedup_groups).toEqual([
       {
         group_id: "dedup-001",
@@ -96,6 +104,7 @@ describe("runtime API client", () => {
       "/health",
       "/api/session/start",
       "/api/run/status",
+      "/api/validation/status",
       "/api/session",
       "/api/session/stop",
       "/api/run/pause",
@@ -113,21 +122,21 @@ describe("runtime API client", () => {
       schema_version: 1,
       operator_credential: "operator-secret"
     });
-    expect(bodyAt(fetcher, 4)).toEqual({
+    expect(bodyAt(fetcher, 5)).toEqual({
       schema_version: 1,
       session_id: "session-001",
       reason: "operator_stop"
     });
-    expect(bodyAt(fetcher, 5)).toEqual({ schema_version: 1, session_id: "session-001" });
     expect(bodyAt(fetcher, 6)).toEqual({ schema_version: 1, session_id: "session-001" });
-    expect(bodyAt(fetcher, 8)).toEqual({
+    expect(bodyAt(fetcher, 7)).toEqual({ schema_version: 1, session_id: "session-001" });
+    expect(bodyAt(fetcher, 9)).toEqual({
       schema_version: 1,
       session_id: "session-001",
       idempotency_key: "00000000-0000-0000-0000-000000000001",
       observed_preview_frame: 42,
       reason: "operator_mark"
     });
-    expect(bodyAt(fetcher, 12)).toEqual({
+    expect(bodyAt(fetcher, 13)).toEqual({
       schema_version: 1,
       session_id: "session-001",
       idempotency_key: "00000000-0000-0000-0000-000000000002",
@@ -649,6 +658,18 @@ function runStatusResponse() {
     preview_stale: true,
     active_capture_job_id: null,
     capabilities
+  };
+}
+
+function validationStatusResponse() {
+  return {
+    schema_version: 1,
+    status: "failed",
+    command_class: "phase4_score_plan",
+    started_at: "2026-06-24T09:00:00Z",
+    completed_at: "2026-06-24T09:00:03Z",
+    summary: "Validation failed.",
+    issue_summaries: ["Goal route mismatch."]
   };
 }
 

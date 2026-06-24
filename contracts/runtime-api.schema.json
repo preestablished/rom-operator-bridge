@@ -12,6 +12,7 @@
     { "$ref": "#/$defs/stopSessionRequest" },
     { "$ref": "#/$defs/stopSessionResponse" },
     { "$ref": "#/$defs/runStatusResponse" },
+    { "$ref": "#/$defs/validationStatusResponse" },
     { "$ref": "#/$defs/sessionOnlyRequest" },
     { "$ref": "#/$defs/runStateResponse" },
     { "$ref": "#/$defs/frameCurrentResponse" },
@@ -74,6 +75,10 @@
         "stopped",
         "faulted"
       ]
+    },
+    "validationStatus": {
+      "type": "string",
+      "enum": ["not_run", "running", "passed", "failed"]
     },
     "capabilityName": {
       "type": "string",
@@ -308,6 +313,45 @@
           "oneOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }]
         },
         "capabilities": { "$ref": "#/$defs/capabilities" }
+      }
+    },
+    "validationStatusResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "status",
+        "command_class",
+        "started_at",
+        "completed_at",
+        "summary",
+        "issue_summaries"
+      ],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "status": { "$ref": "#/$defs/validationStatus" },
+        "command_class": {
+          "oneOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }]
+        },
+        "started_at": {
+          "oneOf": [{ "$ref": "#/$defs/rfc3339" }, { "type": "null" }]
+        },
+        "completed_at": {
+          "oneOf": [{ "$ref": "#/$defs/rfc3339" }, { "type": "null" }]
+        },
+        "summary": {
+          "type": "string",
+          "maxLength": 240
+        },
+        "issue_summaries": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 240
+          }
+        }
       }
     },
     "sessionOnlyRequest": {
@@ -883,15 +927,37 @@
     "validationUpdatedPayload": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["status", "summary"],
+      "required": [
+        "status",
+        "command_class",
+        "started_at",
+        "completed_at",
+        "summary",
+        "issue_summaries"
+      ],
       "properties": {
-        "status": {
-          "type": "string",
-          "enum": ["not_run", "running", "passed", "failed"]
+        "status": { "$ref": "#/$defs/validationStatus" },
+        "command_class": {
+          "oneOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }]
+        },
+        "started_at": {
+          "oneOf": [{ "$ref": "#/$defs/rfc3339" }, { "type": "null" }]
+        },
+        "completed_at": {
+          "oneOf": [{ "$ref": "#/$defs/rfc3339" }, { "type": "null" }]
         },
         "summary": {
           "type": "string",
           "maxLength": 240
+        },
+        "issue_summaries": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 240
+          }
         }
       }
     }

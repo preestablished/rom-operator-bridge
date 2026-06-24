@@ -22,6 +22,7 @@ import {
   type RuntimeErrorDisplay,
   type RuntimeEventMessage,
   type RuntimeWsMessage,
+  type ValidationStatusView,
   type ValidationUpdatedPayload
 } from "./runtimeClient";
 import {
@@ -49,6 +50,7 @@ type OperatorViewModel = {
   activeCaptureJobId: string | null;
   previewState: "waiting" | "fresh" | "stale";
   validationState: "idle" | "queued" | "passed" | "failed";
+  validationStatus: ValidationStatusView;
   focusState: FocusState;
   recoveryNotices: RecoveryNotice[];
   captureJob: CaptureJobView | null;
@@ -67,6 +69,7 @@ type OperatorViewModel = {
 
 type OperatorRuntimeViewState = {
   validationState: OperatorViewModel["validationState"];
+  validationStatus: ValidationStatusView;
   preview: FrameCurrentResponse | null;
   focusState: FocusState;
   recoveryEvents: RecoveryEvent[];
@@ -87,7 +90,9 @@ export type RuntimeRunClient = Pick<
   RuntimeApiClient,
   "runStatus" | "pauseRun" | "resumeRun" | "triggerCapture" | "captureJob"
 >;
-type OperatorRuntimeClient = RuntimeSessionClient & Partial<RuntimePreviewClient & RuntimeRunClient>;
+type RuntimeValidationClient = Pick<RuntimeApiClient, "validationStatus">;
+type OperatorRuntimeClient = RuntimeSessionClient &
+  Partial<RuntimePreviewClient & RuntimeRunClient & RuntimeValidationClient>;
 type OperatorSocketClient = RuntimeEventClient & Partial<RuntimeInputClient>;
 
 type FocusState = "focused" | "blurred" | "hidden";
@@ -123,6 +128,15 @@ type PadlogTailEntry = {
   buttons: PadButton[];
 };
 
+const INITIAL_VALIDATION_STATUS: ValidationStatusView = {
+  status: "not_run",
+  command_class: null,
+  started_at: null,
+  completed_at: null,
+  summary: "",
+  issue_summaries: []
+};
+
 const INITIAL_VIEW_MODEL: Omit<OperatorViewModel, "config" | "auth"> = {
   backendMode: "synthetic",
   sessionState: "idle",
@@ -132,6 +146,7 @@ const INITIAL_VIEW_MODEL: Omit<OperatorViewModel, "config" | "auth"> = {
   activeCaptureJobId: null,
   previewState: "waiting",
   validationState: "idle",
+  validationStatus: INITIAL_VALIDATION_STATUS,
   focusState: "focused",
   recoveryNotices: [],
   captureJob: null,
@@ -148,6 +163,7 @@ const INITIAL_VIEW_MODEL: Omit<OperatorViewModel, "config" | "auth"> = {
 
 const EMPTY_RUNTIME_VIEW: OperatorRuntimeViewState = {
   validationState: INITIAL_VIEW_MODEL.validationState,
+  validationStatus: INITIAL_VALIDATION_STATUS,
   preview: null,
   focusState: INITIAL_VIEW_MODEL.focusState,
   recoveryEvents: [],
@@ -173,6 +189,7 @@ export function renderOperatorApp(
     view.focusState === "hidden" ||
     inputBlockingError(auth.error?.code) ||
     Boolean(auth.session.preview_stale || view.preview?.stale);
+  const validationStatus = validationStatusForView(view.validationStatus, view.validationState);
   const model: OperatorViewModel = {
     ...INITIAL_VIEW_MODEL,
     backendMode: auth.session.backend_mode,
@@ -188,7 +205,8 @@ export function renderOperatorApp(
             ? "fresh"
             : "waiting"
       : "waiting",
-    validationState: view.validationState,
+    validationState: validationStateToViewState(validationStatus.status),
+    validationStatus,
     focusState: view.focusState,
     recoveryNotices: [],
     captureJob: view.captureJob,
@@ -255,7 +273,10 @@ export function renderOperatorApp(
             <li><span>Applied input</span><strong>#${model.lastAppliedInputFrame}</strong></li>
             <li><span>Capture job</span><strong>${escapeHtml(captureStatusSummary(model))}</strong></li>
             <li><span>Validation</span><strong>${validationLabel(model.validationState)}</strong></li>
+            <li><span>Verifier</span><strong>${escapeHtml(validationCommandLabel(model.validationStatus))}</strong></li>
+            <li><span>Checked</span><strong>${escapeHtml(validationTimestampLabel(model.validationStatus))}</strong></li>
           </ul>
+          ${renderValidationSummary(model.validationStatus)}
         </article>
 
         <article
@@ -326,8 +347,9 @@ export function mountOperatorApp(
   let authRequestSeq = 0;
   let previewRequestSeq = 0;
   let runStatusRequestSeq = 0;
+  let validationRequestSeq = 0;
   let sessionAction: SessionActionState = "idle";
-  let validationState: OperatorViewModel["validationState"] = INITIAL_VIEW_MODEL.validationState;
+  let validationStatus = INITIAL_VALIDATION_STATUS;
   let preview: FrameCurrentResponse | null = null;
   let focusState: FocusState = currentFocusState();
   let recoveryEvents: RecoveryEvent[] = [];
@@ -362,7 +384,8 @@ export function mountOperatorApp(
       ? padButtonFromElement(globalThis.document?.activeElement)
       : null;
     appRegion.innerHTML = renderOperatorApp(config, auth, {
-      validationState,
+      validationState: validationStateToViewState(validationStatus.status),
+      validationStatus,
       preview,
       focusState,
       recoveryEvents,
@@ -396,6 +419,7 @@ export function mountOperatorApp(
     if (sessionWillReset) {
       preview = null;
       previewRequestSeq += 1;
+      validationRequestSeq += 1;
       captureJob = null;
       captureError = null;
       captureErrorCode = null;
@@ -409,12 +433,14 @@ export function mountOperatorApp(
       gamepadButtons = [];
       neutralizedDirections = [];
       padlogTail = [];
+      validationStatus = INITIAL_VALIDATION_STATUS;
     }
     sessionAction = "idle";
     syncEventStream();
     syncInputStream();
     render(focusTargetForAuth(auth));
     refreshRunStatus();
+    refreshValidationStatus();
     refreshPreview();
   };
 
@@ -523,7 +549,7 @@ export function mountOperatorApp(
     }
 
     if (message.type === "validation_updated") {
-      validationState = validationStateFromEvent(message.payload.status);
+      validationStatus = validationStatusFromPayload(message.payload);
       render();
       return;
     }
@@ -584,7 +610,8 @@ export function mountOperatorApp(
       closeEventStream();
       closeInputStream(true);
       auth = initialAuthSessionState();
-      validationState = INITIAL_VIEW_MODEL.validationState;
+      validationStatus = INITIAL_VALIDATION_STATUS;
+      validationRequestSeq += 1;
       preview = null;
       previewRequestSeq += 1;
       sessionAction = "idle";
@@ -661,6 +688,42 @@ export function mountOperatorApp(
         }
         auth = { ...auth, error: runtimeDisplayError(error, "backend_unavailable") };
         render("alert");
+      });
+  }
+
+  function refreshValidationStatus() {
+    const validationStatusRequest = client.validationStatus?.bind(client);
+    if (!validationStatusRequest || auth.status !== "active" || !auth.session.session_id) {
+      return;
+    }
+    const requestSeq = ++validationRequestSeq;
+    const sessionId = auth.session.session_id;
+    validationStatusRequest()
+      .then((status) => {
+        if (
+          requestSeq !== validationRequestSeq ||
+          auth.status !== "active" ||
+          auth.session.session_id !== sessionId
+        ) {
+          return;
+        }
+        validationStatus = validationStatusFromPayload(status);
+        render();
+      })
+      .catch((error) => {
+        if (
+          requestSeq !== validationRequestSeq ||
+          auth.status !== "active" ||
+          auth.session.session_id !== sessionId
+        ) {
+          return;
+        }
+        const display = runtimeDisplayError(error, "backend_unavailable");
+        recordRecoveryEvent({
+          code: display.code,
+          message: display.message
+        });
+        render();
       });
   }
 
@@ -779,7 +842,8 @@ export function mountOperatorApp(
     form.reset();
     const requestSeq = ++authRequestSeq;
     auth = { ...auth, status: "starting", error: null };
-    validationState = INITIAL_VIEW_MODEL.validationState;
+    validationStatus = INITIAL_VALIDATION_STATUS;
+    validationRequestSeq += 1;
     recoveryEvents = [];
     preview = null;
     previewRequestSeq += 1;
@@ -1497,6 +1561,32 @@ function renderPreviewImage(model: OperatorViewModel): string {
   />`;
 }
 
+function renderValidationSummary(status: ValidationStatusView): string {
+  const summary = status.summary.trim() ? safeBrowserMessage(status.summary) : "";
+  const issues = status.issue_summaries.map((issue) => safeBrowserMessage(issue)).filter(Boolean);
+  if (!summary && issues.length === 0) {
+    return "";
+  }
+  return `
+    <div class="validation-summary" data-validation-summary>
+      ${summary ? `<p>${escapeHtml(summary)}</p>` : ""}
+      ${
+        issues.length > 0
+          ? `<ul>${issues.map((issue) => `<li>${escapeHtml(issue)}</li>`).join("")}</ul>`
+          : ""
+      }
+    </div>
+  `;
+}
+
+function validationCommandLabel(status: ValidationStatusView): string {
+  return status.command_class ?? "not selected";
+}
+
+function validationTimestampLabel(status: ValidationStatusView): string {
+  return status.completed_at ?? status.started_at ?? "not run";
+}
+
 function isRuntimeEvent(message: RuntimeWsMessage): message is RuntimeEventMessage {
   return (
     message.type === "session_updated" ||
@@ -1514,9 +1604,7 @@ function runtimeEventStopsSession(message: RuntimeEventMessage): boolean {
   );
 }
 
-function validationStateFromEvent(
-  status: ValidationUpdatedPayload["status"]
-): OperatorViewModel["validationState"] {
+function validationStateToViewState(status: ValidationUpdatedPayload["status"]): OperatorViewModel["validationState"] {
   switch (status) {
     case "running":
       return "queued";
@@ -1526,6 +1614,45 @@ function validationStateFromEvent(
       return "failed";
     case "not_run":
       return "idle";
+  }
+}
+
+function validationStatusFromPayload(payload: ValidationStatusView): ValidationStatusView {
+  return {
+    status: payload.status,
+    command_class: payload.command_class,
+    started_at: payload.started_at,
+    completed_at: payload.completed_at,
+    summary: payload.summary.trim() ? safeBrowserMessage(payload.summary) : "",
+    issue_summaries: payload.issue_summaries.map((issue) => safeBrowserMessage(issue)).filter(Boolean)
+  };
+}
+
+function validationStatusForView(
+  status: ValidationStatusView,
+  state: OperatorViewModel["validationState"]
+): ValidationStatusView {
+  if (status.status !== "not_run" || state === "idle") {
+    return validationStatusFromPayload(status);
+  }
+  return {
+    ...INITIAL_VALIDATION_STATUS,
+    status: validationStatusFromViewState(state)
+  };
+}
+
+function validationStatusFromViewState(
+  state: OperatorViewModel["validationState"]
+): ValidationUpdatedPayload["status"] {
+  switch (state) {
+    case "queued":
+      return "running";
+    case "passed":
+      return "passed";
+    case "failed":
+      return "failed";
+    case "idle":
+      return "not_run";
   }
 }
 
