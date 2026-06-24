@@ -485,6 +485,7 @@ export function mountOperatorApp(
       onReconnect: () => {
         recordRecoveryEvent({ code: "websocket_reconnect" });
         refreshRunStatus();
+        refreshValidationStatus();
         refreshPreview();
         render();
       }
@@ -708,6 +709,7 @@ export function mountOperatorApp(
           return;
         }
         validationStatus = validationStatusFromPayload(status);
+        clearRecoveryEvents("backend_unavailable", "websocket_reconnect");
         render();
       })
       .catch((error) => {
@@ -1580,7 +1582,22 @@ function renderValidationSummary(status: ValidationStatusView): string {
 }
 
 function validationCommandLabel(status: ValidationStatusView): string {
-  return status.command_class ?? "not selected";
+  switch (status.command_class) {
+    case "phase4_score_plan":
+      return "score plan";
+    case "redaction_scan":
+      return "redaction scan";
+    case "bundle_check":
+      return "bundle check";
+    case "context_check":
+      return "context check";
+    case "checksums":
+      return "checksums";
+    case "verifier":
+      return "verifier";
+    default:
+      return "not selected";
+  }
 }
 
 function validationTimestampLabel(status: ValidationStatusView): string {

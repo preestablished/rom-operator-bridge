@@ -8,9 +8,7 @@ use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 const SUMMARY_MAX_LEN: usize = 240;
-const COMMAND_CLASS_MAX_LEN: usize = 64;
 const MAX_ISSUE_SUMMARIES: usize = 8;
-const FALLBACK_TIMESTAMP: &str = "1970-01-01T00:00:00Z";
 
 #[derive(Debug, Clone, Default)]
 pub struct ValidationStatusState {
@@ -29,6 +27,11 @@ impl ValidationStatusState {
             .clone()
     }
 
+    pub fn reset(&self) {
+        *self.inner.lock().expect("validation status mutex poisoned") =
+            PublicValidationStatus::default();
+    }
+
     pub fn record_run(
         &self,
         private_config: &BridgePrivateConfig,
@@ -36,18 +39,18 @@ impl ValidationStatusState {
         update: ValidationRunUpdate,
     ) -> Result<PublicValidationStatus, ValidationStatusError> {
         let command_class = sanitize_command_class(&update.command_class, sanitizer);
-        let started_at = sanitize_timestamp(&update.started_at, sanitizer);
+        let started_at = sanitize_timestamp("started_at", &update.started_at, sanitizer)?;
         let completed_at = update
             .completed_at
             .as_deref()
-            .map(|timestamp| sanitize_timestamp(timestamp, sanitizer));
+            .map(|timestamp| sanitize_timestamp("completed_at", timestamp, sanitizer))
+            .transpose()?;
         let summary = sanitize_summary(update.status, &update.summary, sanitizer);
         let issue_summaries = update
             .issue_summaries
             .iter()
-            .filter(|issue| !issue.trim().is_empty())
             .take(MAX_ISSUE_SUMMARIES)
-            .map(|issue| sanitize_issue_summary(issue, sanitizer))
+            .map(|issue| sanitize_issue_summary(*issue, sanitizer))
             .collect::<Vec<_>>();
 
         let public = PublicValidationStatus {
@@ -126,13 +129,14 @@ impl ValidationRunStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidationRunUpdate {
+    pub session_id: Option<String>,
     pub validation_id: String,
     pub started_at: String,
     pub completed_at: Option<String>,
     pub command_class: String,
     pub status: ValidationRunStatus,
     pub summary: String,
-    pub issue_summaries: Vec<String>,
+    pub issue_summaries: Vec<PublicValidationIssue>,
 }
 
 impl ValidationRunUpdate {
@@ -144,6 +148,7 @@ impl ValidationRunUpdate {
         summary: impl Into<String>,
     ) -> Self {
         Self {
+            session_id: None,
             validation_id: validation_id.into(),
             started_at: started_at.into(),
             completed_at: None,
@@ -154,18 +159,47 @@ impl ValidationRunUpdate {
         }
     }
 
+    pub fn session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
+        self
+    }
+
+    pub fn matches_session(&self, session_id: &str) -> bool {
+        self.session_id.as_deref() == Some(session_id)
+    }
+
     pub fn completed_at(mut self, completed_at: impl Into<String>) -> Self {
         self.completed_at = Some(completed_at.into());
         self
     }
 
-    pub fn issue_summaries<I, S>(mut self, issue_summaries: I) -> Self
+    pub fn issue_summaries<I>(mut self, issue_summaries: I) -> Self
     where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
+        I: IntoIterator<Item = PublicValidationIssue>,
     {
-        self.issue_summaries = issue_summaries.into_iter().map(Into::into).collect();
+        self.issue_summaries = issue_summaries.into_iter().collect();
         self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicValidationIssue {
+    MissingRequiredLabel,
+    ConflictingLabels,
+    GoalRouteMismatch,
+    DedupArtifactMismatch,
+    ReportRedacted,
+}
+
+impl PublicValidationIssue {
+    const fn message(self) -> &'static str {
+        match self {
+            Self::MissingRequiredLabel => "Required validation label is missing.",
+            Self::ConflictingLabels => "Validation labels conflict.",
+            Self::GoalRouteMismatch => "Goal route validation failed.",
+            Self::DedupArtifactMismatch => "Dedup artifact validation failed.",
+            Self::ReportRedacted => "Validation failed; inspect the private server-side report.",
+        }
     }
 }
 
@@ -173,46 +207,39 @@ impl ValidationRunUpdate {
 pub enum ValidationStatusError {
     #[error(transparent)]
     Artifact(#[from] crate::artifacts::ArtifactError),
+    #[error("validation update does not match the active session")]
+    StaleSession,
+    #[error("validation timestamp field `{field}` is not RFC3339")]
+    InvalidTimestamp { field: &'static str },
 }
 
 fn sanitize_command_class(candidate: &str, sanitizer: &PublicSanitizer) -> String {
-    let normalized = normalize_command_class(candidate);
-    if !normalized.is_empty() && sanitizer.inspect_text(&normalized).is_ok() {
-        normalized
+    let public_class = match candidate.trim() {
+        "phase4-score-plan" => "phase4_score_plan",
+        "redaction-scan" => "redaction_scan",
+        "bundle-check" | "phase4-bundle-check" => "bundle_check",
+        "context-check" | "phase4-context-check" => "context_check",
+        "checksums" => "checksums",
+        "verifier" => "verifier",
+        _ => "verifier",
+    };
+    if sanitizer.inspect_text(public_class).is_ok() {
+        public_class.to_string()
     } else {
         "verifier".to_string()
     }
 }
 
-fn normalize_command_class(candidate: &str) -> String {
-    let mut normalized = String::new();
-    let mut last_was_separator = false;
-    for character in candidate.chars() {
-        let next = if character.is_ascii_alphanumeric() {
-            last_was_separator = false;
-            character.to_ascii_lowercase()
-        } else if matches!(character, '.' | ':' | '_' | '-') {
-            if last_was_separator {
-                continue;
-            }
-            last_was_separator = true;
-            '_'
-        } else {
-            continue;
-        };
-        if normalized.len() >= COMMAND_CLASS_MAX_LEN {
-            break;
-        }
-        normalized.push(next);
+fn sanitize_timestamp(
+    field: &'static str,
+    candidate: &str,
+    sanitizer: &PublicSanitizer,
+) -> Result<String, ValidationStatusError> {
+    if is_rfc3339_timestamp(candidate) && sanitizer.inspect_text(candidate).is_ok() {
+        Ok(candidate.to_string())
+    } else {
+        Err(ValidationStatusError::InvalidTimestamp { field })
     }
-    normalized.trim_matches('_').to_string()
-}
-
-fn sanitize_timestamp(candidate: &str, sanitizer: &PublicSanitizer) -> String {
-    bounded_public_text(
-        &sanitizer.sanitize_text(candidate, FALLBACK_TIMESTAMP),
-        SUMMARY_MAX_LEN,
-    )
 }
 
 fn sanitize_summary(
@@ -220,19 +247,98 @@ fn sanitize_summary(
     candidate: &str,
     sanitizer: &PublicSanitizer,
 ) -> String {
+    let fallback = status.fallback_summary();
+    if candidate.trim() == fallback && sanitizer.inspect_text(candidate).is_ok() {
+        return bounded_public_text(candidate, SUMMARY_MAX_LEN);
+    }
     bounded_public_text(
-        &sanitizer.sanitize_text(candidate, status.fallback_summary()),
+        &sanitizer.sanitize_text(candidate, fallback),
         SUMMARY_MAX_LEN,
     )
 }
 
-fn sanitize_issue_summary(candidate: &str, sanitizer: &PublicSanitizer) -> String {
+fn sanitize_issue_summary(issue: PublicValidationIssue, sanitizer: &PublicSanitizer) -> String {
+    let message = issue.message();
     bounded_public_text(
-        &sanitizer.sanitize_text(candidate, "Validation issue redacted."),
+        &sanitizer.sanitize_text(message, "Validation issue redacted."),
         SUMMARY_MAX_LEN,
     )
 }
 
 fn bounded_public_text(candidate: &str, max_len: usize) -> String {
     candidate.chars().take(max_len).collect()
+}
+
+fn is_rfc3339_timestamp(candidate: &str) -> bool {
+    let bytes = candidate.as_bytes();
+    if bytes.len() < 20 {
+        return false;
+    }
+    if !is_date_time_prefix(bytes) {
+        return false;
+    }
+    let mut index = 19;
+    if bytes.get(index) == Some(&b'.') {
+        index += 1;
+        let fraction_start = index;
+        while bytes.get(index).is_some_and(|byte| byte.is_ascii_digit()) {
+            index += 1;
+        }
+        if index == fraction_start {
+            return false;
+        }
+    }
+    match bytes.get(index) {
+        Some(b'Z') => index + 1 == bytes.len(),
+        Some(b'+') | Some(b'-') => {
+            bytes.len() == index + 6
+                && bytes[index + 1].is_ascii_digit()
+                && bytes[index + 2].is_ascii_digit()
+                && bytes[index + 3] == b':'
+                && bytes[index + 4].is_ascii_digit()
+                && bytes[index + 5].is_ascii_digit()
+        }
+        _ => false,
+    }
+}
+
+fn is_date_time_prefix(bytes: &[u8]) -> bool {
+    matches!(
+        bytes,
+        [
+            y0,
+            y1,
+            y2,
+            y3,
+            b'-',
+            m0,
+            m1,
+            b'-',
+            d0,
+            d1,
+            b'T',
+            h0,
+            h1,
+            b':',
+            n0,
+            n1,
+            b':',
+            s0,
+            s1,
+            ..
+        ] if y0.is_ascii_digit()
+            && y1.is_ascii_digit()
+            && y2.is_ascii_digit()
+            && y3.is_ascii_digit()
+            && m0.is_ascii_digit()
+            && m1.is_ascii_digit()
+            && d0.is_ascii_digit()
+            && d1.is_ascii_digit()
+            && h0.is_ascii_digit()
+            && h1.is_ascii_digit()
+            && n0.is_ascii_digit()
+            && n1.is_ascii_digit()
+            && s0.is_ascii_digit()
+            && s1.is_ascii_digit()
+    )
 }

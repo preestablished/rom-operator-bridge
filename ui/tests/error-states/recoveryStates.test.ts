@@ -107,7 +107,7 @@ describe("browser-safe recovery states", () => {
     expect(recovery(validationFailed, "validation_failed")?.textContent).toContain(
       "private server-side report"
     );
-    expect(validationFailed.textContent ?? "").toContain("phase4_score_plan");
+    expect(validationFailed.textContent ?? "").toContain("score plan");
     expect(validationFailed.textContent ?? "").toContain("Validation failed.");
     expect(validationFailed.textContent ?? "").toContain("Goal route mismatch.");
     expectSafe(validationFailed);
@@ -122,7 +122,7 @@ describe("browser-safe recovery states", () => {
         issue_summaries: []
       }
     });
-    expect(validationPassed.textContent ?? "").toContain("redaction_scan");
+    expect(validationPassed.textContent ?? "").toContain("redaction scan");
     expect(validationPassed.textContent ?? "").toContain("Validation passed.");
     expect(recovery(validationPassed, "validation_failed")).toBeNull();
     expectSafe(validationPassed);

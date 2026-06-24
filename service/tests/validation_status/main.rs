@@ -12,7 +12,10 @@ use rom_operator_bridge_service::{
     config::ServiceConfig,
     private_config::{ENV_OPERATOR_CREDENTIAL, ENV_PRIVATE_ROOT, ENV_SESSION_SECRET},
     sanitization::PublicSanitizer,
-    validation_status::{ValidationRunStatus, ValidationRunUpdate, ValidationStatusState},
+    validation_status::{
+        PublicValidationIssue, ValidationRunStatus, ValidationRunUpdate, ValidationStatusError,
+        ValidationStatusState,
+    },
 };
 use serde_json::{Value, json};
 use std::{fs, path::PathBuf};
@@ -45,8 +48,8 @@ fn records_private_validation_run_and_exposes_only_sanitized_status() {
             )
             .completed_at("2026-06-24T09:00:03Z")
             .issue_summaries([
-                UNSAFE_SUMMARY,
-                "Goal route failed sanitized aggregate check.",
+                PublicValidationIssue::ReportRedacted,
+                PublicValidationIssue::GoalRouteMismatch,
             ]),
         )
         .expect("validation run records");
@@ -57,8 +60,8 @@ fn records_private_validation_run_and_exposes_only_sanitized_status() {
     assert_eq!(
         public.issue_summaries,
         [
-            "Validation issue redacted.",
-            "Goal route failed sanitized aggregate check."
+            "Validation failed; inspect the private server-side report.",
+            "Goal route validation failed."
         ]
     );
     assert_public_safe(&sanitizer, &json!(public), &private_root);
@@ -75,11 +78,60 @@ fn records_private_validation_run_and_exposes_only_sanitized_status() {
     assert_public_safe(&sanitizer, &row, &private_root);
 }
 
+#[test]
+fn command_transcripts_and_invalid_timestamps_do_not_reach_public_status() {
+    let (_workspace, config, private_root) = private_config();
+    let sanitizer = config
+        .private_config()
+        .public_sanitizer()
+        .with_forbidden_literal(PRIVATE_LITERAL);
+    let state = ValidationStatusState::new();
+
+    let public = state
+        .record_run(
+            config.private_config(),
+            &sanitizer,
+            ValidationRunUpdate::new(
+                "validation-unsafe-command",
+                "2026-06-24T09:03:00Z",
+                "phase4-score-plan --captures /home/operator/private/captures/index.jsonl",
+                ValidationRunStatus::Failed,
+                UNSAFE_SUMMARY,
+            )
+            .completed_at("2026-06-24T09:03:02Z")
+            .issue_summaries([PublicValidationIssue::ReportRedacted]),
+        )
+        .expect("unsafe command class falls back");
+    assert_eq!(public.command_class.as_deref(), Some("verifier"));
+    assert_eq!(public.summary, "Validation failed.");
+    assert_public_safe(&sanitizer, &json!(public), &private_root);
+
+    let error = state
+        .record_run(
+            config.private_config(),
+            &sanitizer,
+            ValidationRunUpdate::new(
+                "validation-bad-time",
+                "later",
+                "verifier",
+                ValidationRunStatus::Passed,
+                "Validation passed.",
+            ),
+        )
+        .expect_err("invalid started_at fails");
+    assert!(matches!(
+        error,
+        ValidationStatusError::InvalidTimestamp {
+            field: "started_at"
+        }
+    ));
+}
+
 #[tokio::test]
 async fn validation_status_route_returns_sanitized_public_view() {
     let (_workspace, state, private_root) = app_state();
     let app = router(state.clone());
-    let cookie = login_cookie(app.clone()).await;
+    let login = login(app.clone()).await;
 
     state
         .record_validation_run(
@@ -90,6 +142,7 @@ async fn validation_status_route_returns_sanitized_public_view() {
                 ValidationRunStatus::Passed,
                 "Validation passed.",
             )
+            .session_id(&login.session_id)
             .completed_at("2026-06-24T09:10:02Z"),
         )
         .expect("validation run records through app state");
@@ -100,7 +153,7 @@ async fn validation_status_route_returns_sanitized_public_view() {
                 .method(Method::GET)
                 .uri("/api/validation/status")
                 .header(ORIGIN, ALLOWED_ORIGIN)
-                .header(COOKIE, cookie)
+                .header(COOKIE, &login.cookie)
                 .body(Body::empty())
                 .expect("validation status request builds"),
         )
@@ -128,6 +181,50 @@ async fn validation_status_route_returns_sanitized_public_view() {
     );
 }
 
+#[tokio::test]
+async fn validation_status_resets_for_replacement_session_and_rejects_stale_updates() {
+    let (_workspace, state, _private_root) = app_state();
+    let app = router(state.clone());
+    let first = login(app.clone()).await;
+
+    state
+        .record_validation_run(
+            ValidationRunUpdate::new(
+                "validation-first",
+                "2026-06-24T09:20:00Z",
+                "verifier",
+                ValidationRunStatus::Failed,
+                "Validation failed.",
+            )
+            .session_id(&first.session_id),
+        )
+        .expect("first validation records");
+
+    stop_session(app.clone(), &first).await;
+    let second = login(app.clone()).await;
+    let status = validation_status(app.clone(), &second.cookie).await;
+    assert_eq!(status["status"], "not_run");
+    assert_eq!(status["command_class"], Value::Null);
+    assert_eq!(status["summary"], "");
+    assert_eq!(status["issue_summaries"], json!([]));
+
+    let stale = state
+        .record_validation_run(
+            ValidationRunUpdate::new(
+                "validation-stale",
+                "2026-06-24T09:21:00Z",
+                "verifier",
+                ValidationRunStatus::Passed,
+                "Validation passed.",
+            )
+            .session_id(&first.session_id),
+        )
+        .expect_err("stale session validation is rejected");
+    assert!(matches!(stale, ValidationStatusError::StaleSession));
+    let status = validation_status(app, &second.cookie).await;
+    assert_eq!(status["status"], "not_run");
+}
+
 fn private_config() -> (tempfile::TempDir, ServiceConfig, PathBuf) {
     let workspace = tempfile::tempdir().expect("tempdir creates");
     let private_root = workspace.path().join("bridge-private");
@@ -152,7 +249,12 @@ fn app_state() -> (tempfile::TempDir, AppState, PathBuf) {
     (workspace, state, private_root)
 }
 
-async fn login_cookie(app: axum::Router) -> String {
+struct Login {
+    cookie: String,
+    session_id: String,
+}
+
+async fn login(app: axum::Router) -> Login {
     let response = app
         .oneshot(
             Request::builder()
@@ -174,13 +276,68 @@ async fn login_cookie(app: axum::Router) -> String {
         .await
         .expect("login request succeeds");
     assert_eq!(response.status(), StatusCode::OK);
-    response
+    let cookie = response
         .headers()
         .get(SET_COOKIE)
         .expect("set-cookie exists")
         .to_str()
         .expect("set-cookie header is text")
-        .to_string()
+        .to_string();
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("login body reads");
+    let json: Value = serde_json::from_slice(&body).expect("login response parses");
+    Login {
+        cookie,
+        session_id: json["session_id"]
+            .as_str()
+            .expect("session id is string")
+            .to_string(),
+    }
+}
+
+async fn stop_session(app: axum::Router, login: &Login) {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/session/stop")
+                .header(ORIGIN, ALLOWED_ORIGIN)
+                .header(COOKIE, &login.cookie)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "schema_version": 1,
+                        "session_id": login.session_id,
+                        "reason": "operator_stop"
+                    })
+                    .to_string(),
+                ))
+                .expect("stop request builds"),
+        )
+        .await
+        .expect("stop request succeeds");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+async fn validation_status(app: axum::Router, cookie: &str) -> Value {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/validation/status")
+                .header(ORIGIN, ALLOWED_ORIGIN)
+                .header(COOKIE, cookie)
+                .body(Body::empty())
+                .expect("validation status request builds"),
+        )
+        .await
+        .expect("validation status request succeeds");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("validation body reads");
+    serde_json::from_slice(&body).expect("validation response parses")
 }
 
 fn assert_public_safe(sanitizer: &PublicSanitizer, value: &Value, private_root: &PathBuf) {

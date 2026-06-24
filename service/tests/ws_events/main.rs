@@ -18,6 +18,7 @@ use rom_operator_bridge_service::{
     config::ServiceConfig,
     private_config::{ENV_OPERATOR_CREDENTIAL, ENV_PRIVATE_ROOT, ENV_SESSION_SECRET},
     sanitization::PublicSanitizer,
+    validation_status::{ValidationRunStatus, ValidationRunUpdate},
 };
 use serde_json::{Value, json};
 use std::{
@@ -213,6 +214,37 @@ async fn event_snapshot_omits_capture_event_when_no_capture_is_active() {
     assert_sanitized_ordered_events(&messages, &private_root);
     assert_eq!(messages[0]["payload"]["state"], "paused");
     assert_eq!(messages[1]["payload"]["active_capture_job_id"], Value::Null);
+}
+
+#[tokio::test]
+async fn event_snapshot_resets_validation_status_for_new_session() {
+    let (_workspace, state, app, private_root) =
+        ws_app_with_state(EventBackend::new(SESSION_ID, SessionState::Running, None));
+    let first_cookie = login_cookie(app.clone()).await;
+    state
+        .record_validation_run(
+            ValidationRunUpdate::new(
+                "validation-ws-first",
+                "2026-06-24T09:25:00Z",
+                "verifier",
+                ValidationRunStatus::Failed,
+                "Validation failed.",
+            )
+            .session_id(SESSION_ID),
+        )
+        .expect("validation run records");
+    stop_session(app.clone(), &first_cookie).await;
+    let second_cookie = login_cookie(app.clone()).await;
+    let server = WsServer::start(app).await;
+    let mut ws = server.connect(&second_cookie).await;
+
+    let messages = read_events(&mut ws, 4).await;
+
+    assert_eq!(messages[3]["type"], "validation_updated");
+    assert_eq!(messages[3]["payload"]["status"], "not_run");
+    assert_eq!(messages[3]["payload"]["command_class"], Value::Null);
+    assert_eq!(messages[3]["payload"]["summary"], "");
+    assert_sanitized_ordered_events(&messages, &private_root);
 }
 
 #[tokio::test]
@@ -412,6 +444,23 @@ async fn login_cookie(app: axum::Router) -> String {
     cookie
 }
 
+async fn stop_session(app: axum::Router, cookie: &str) {
+    let response = app
+        .oneshot(runtime_json_request(
+            Method::POST,
+            "/api/session/stop",
+            cookie,
+            json!({
+                "schema_version": 1,
+                "session_id": SESSION_ID,
+                "reason": "operator_stop"
+            }),
+        ))
+        .await
+        .expect("stop request runs");
+    assert_eq!(response.status(), 200);
+}
+
 fn runtime_json_request(method: Method, uri: &str, cookie: &str, body: Value) -> Request<Body> {
     Request::builder()
         .method(method)
@@ -424,14 +473,22 @@ fn runtime_json_request(method: Method, uri: &str, cookie: &str, body: Value) ->
 }
 
 fn ws_app(backend: EventBackend) -> (tempfile::TempDir, axum::Router, PathBuf) {
+    let (workspace, _state, app, private_root) = ws_app_with_state(backend);
+    (workspace, app, private_root)
+}
+
+fn ws_app_with_state(
+    backend: EventBackend,
+) -> (tempfile::TempDir, AppState, axum::Router, PathBuf) {
     let workspace = tempfile::tempdir().expect("tempdir creates");
     let private_root = workspace.path().join("bridge-private");
-    let app = router(AppState::for_tests_with_backend(
+    let state = AppState::for_tests_with_backend(
         config(&private_root),
         rom_operator_bridge_service::auth::AuthState::new(),
         std::sync::Arc::new(backend),
-    ));
-    (workspace, app, private_root)
+    );
+    let app = router(state.clone());
+    (workspace, state, app, private_root)
 }
 
 fn config(private_root: &Path) -> ServiceConfig {

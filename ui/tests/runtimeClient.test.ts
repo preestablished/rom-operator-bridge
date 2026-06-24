@@ -235,6 +235,28 @@ describe("runtime API client", () => {
           ]
         },
         request: (client) => client.labelsSnapshot()
+      },
+      {
+        payload: { ...validationStatusResponse(), started_at: "later" },
+        request: (client) => client.validationStatus()
+      },
+      {
+        payload: {
+          ...validationStatusResponse(),
+          issue_summaries: Array.from({ length: 9 }, () => "Validation issue.")
+        },
+        request: (client) => client.validationStatus()
+      },
+      {
+        payload: {
+          ...validationStatusResponse(),
+          command_class: "phase4-score-plan --captures /home/operator/private/captures/index.jsonl"
+        },
+        request: (client) => client.validationStatus()
+      },
+      {
+        payload: { ...validationStatusResponse(), private_path: "/home/operator/report.json" },
+        request: (client) => client.validationStatus()
       }
     ];
 

@@ -134,6 +134,11 @@ impl AppState {
         &self,
         update: ValidationRunUpdate,
     ) -> Result<PublicValidationStatus, ValidationStatusError> {
+        let active_session_id =
+            active_session_id(self).map_err(|_| ValidationStatusError::StaleSession)?;
+        if !update.matches_session(&active_session_id) {
+            return Err(ValidationStatusError::StaleSession);
+        }
         let sanitizer = state_sanitizer(self);
         let public =
             self.validation
@@ -777,6 +782,7 @@ async fn start_session(
         .reset_session(&backend_session.session_id);
     state.captures.reset_session(&backend_session.session_id);
     state.labels.reset();
+    state.validation.reset();
     state.ws_events.reset_session(&backend_session.session_id);
     state.ws_input.reset_session(&backend_session.session_id);
 
@@ -875,6 +881,7 @@ async fn stop_session(
     state.frame_previews.reset_session(&stopped.session_id);
     state.captures.reset_session(&stopped.session_id);
     state.labels.reset();
+    state.validation.reset();
     state.ws_events.reset_session(&stopped.session_id);
     state.ws_input.reset_session(&stopped.session_id);
     if let Err(error) = state.auth.clear_session_headers(&headers) {
@@ -1616,6 +1623,7 @@ fn cleanup_runtime_session(state: &AppState, reason: StopReason) -> Result<(), B
     state.frame_previews.reset_session(&stopped.session_id);
     state.captures.reset_session(&stopped.session_id);
     state.labels.reset();
+    state.validation.reset();
     state.ws_events.reset_session(&stopped.session_id);
     state.ws_input.reset_session(&stopped.session_id);
     Ok(())
