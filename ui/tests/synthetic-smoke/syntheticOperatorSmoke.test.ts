@@ -36,12 +36,20 @@ const capabilities = {
   validation_runner: false
 };
 
+let navigatorGetGamepadsDescriptor: PropertyDescriptor | undefined;
+
 describe("synthetic operator smoke", () => {
   beforeEach(() => {
+    navigatorGetGamepadsDescriptor = Object.getOwnPropertyDescriptor(navigator, "getGamepads");
     vi.spyOn(document, "hasFocus").mockReturnValue(true);
   });
 
   afterEach(() => {
+    if (navigatorGetGamepadsDescriptor) {
+      Object.defineProperty(navigator, "getGamepads", navigatorGetGamepadsDescriptor);
+    } else {
+      Reflect.deleteProperty(navigator, "getGamepads");
+    }
     document.body.replaceChildren();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
@@ -66,12 +74,18 @@ describe("synthetic operator smoke", () => {
         })
       )
       .mockResolvedValue(captureTriggerResponse());
+    const runStatus = vi
+      .fn()
+      .mockResolvedValueOnce(runStatusResponse({ preview_stale: false, current_frame: 42 }))
+      .mockResolvedValueOnce(runStatusResponse({ preview_stale: false, current_frame: 45 }))
+      .mockResolvedValue(runStatusResponse({ preview_stale: false, current_frame: 45 }));
     const currentFrame = vi
       .fn()
       .mockResolvedValueOnce(frameCurrentResponse(42, false))
       .mockResolvedValueOnce(frameCurrentResponse(42, false))
       .mockResolvedValueOnce(frameCurrentResponse(43, true))
-      .mockResolvedValue(frameCurrentResponse(44, false));
+      .mockResolvedValueOnce(frameCurrentResponse(44, false))
+      .mockResolvedValue(frameCurrentResponse(45, false));
     const updateLabels = vi.fn().mockResolvedValue({
       schema_version: 1,
       applied: false,
@@ -89,7 +103,7 @@ describe("synthetic operator smoke", () => {
       sessionStatus: vi.fn().mockResolvedValue({ schema_version: 1, active: false, state: "idle" }),
       startSession: vi.fn().mockResolvedValue(startSessionResponse()),
       stopSession: vi.fn().mockResolvedValue(stopSessionResponse()),
-      runStatus: vi.fn().mockResolvedValue(runStatusResponse({ preview_stale: false })),
+      runStatus,
       currentFrame,
       triggerCapture,
       captureJob: vi.fn().mockResolvedValue(captureJobResponse()),
@@ -147,8 +161,22 @@ describe("synthetic operator smoke", () => {
     socketClient.emitEvent(runUpdated(2, { preview_stale: true, current_frame: 43 }));
     await flushPromises();
     expect(root.textContent).toContain("stale");
-    root.querySelector<HTMLButtonElement>("[data-run-action='capture']")?.click();
+    const staleCaptureButton = root.querySelector<HTMLButtonElement>("[data-run-action='capture']");
+    expect(staleCaptureButton?.disabled).toBe(true);
+    expect(
+      Array.from(root.querySelectorAll<HTMLButtonElement>("[data-pad-button]")).every(
+        (button) => button.disabled
+      )
+    ).toBe(true);
+    socketClient.sendInput.mockClear();
+    staleCaptureButton?.click();
+    const stalePadButton = root.querySelector<HTMLButtonElement>("[data-pad-button='A']");
+    expect(stalePadButton).not.toBeNull();
+    dispatchKey(stalePadButton!, "keydown", "Enter");
+    currentGamepads = [standardGamepad({ pressed: [1] })];
+    raf.runNext();
     expect(triggerCapture).not.toHaveBeenCalled();
+    expect(socketClient.sendInput).not.toHaveBeenCalled();
 
     socketClient.emitEvent(runUpdated(3, { preview_stale: false, current_frame: 44 }));
     await flushPromises();
@@ -182,9 +210,17 @@ describe("synthetic operator smoke", () => {
     );
     expect(root.textContent ?? "").not.toMatch(/\/home\/|private\/captures|index\.jsonl/i);
 
+    const runStatusCallsBeforeReconnect = runStatus.mock.calls.length;
+    const currentFrameCallsBeforeReconnect = currentFrame.mock.calls.length;
     socketClient.triggerEventReconnect();
     expect(root.textContent).toContain("WebSocket reconnect");
     await flushPromises();
+    expect(runStatus).toHaveBeenCalledTimes(runStatusCallsBeforeReconnect + 1);
+    expect(currentFrame).toHaveBeenCalledTimes(currentFrameCallsBeforeReconnect + 1);
+    expect(root.querySelector<HTMLImageElement>("[data-preview-image]")?.getAttribute("src")).toBe(
+      "/api/frame/current/image?frame=45"
+    );
+    expect(root.textContent).not.toContain("WebSocket reconnect");
     expect(root.textContent).toContain("fresh");
 
     root.querySelector<HTMLButtonElement>("[data-session-action='logout']")?.click();

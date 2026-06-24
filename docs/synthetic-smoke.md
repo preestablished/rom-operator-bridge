@@ -9,8 +9,7 @@ real private capture exporter is available.
 Run the focused UI smoke from the repository root:
 
 ```bash
-cd ui
-npm test -- --run tests/synthetic-smoke/syntheticOperatorSmoke.test.ts
+npm --prefix ui test -- --run tests/synthetic-smoke/syntheticOperatorSmoke.test.ts
 ```
 
 The smoke mounts the operator UI with the synthetic runtime contract and covers:
