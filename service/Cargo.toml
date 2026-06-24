@@ -10,12 +10,16 @@ path = "src/lib.rs"
 
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
+dh-proto = { path = "../../determinism-hypervisor/crates/dh-proto" }
 hmac = "0.12"
+hyper-util = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync"] }
+tonic = "0.12"
+tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
@@ -24,4 +28,4 @@ futures-util = { version = "0.3", default-features = false, features = ["sink", 
 jsonschema = { version = "0.33", default-features = false }
 tempfile = "3"
 tokio-tungstenite = "0.29"
-tower = { version = "0.5", features = ["util"] }
+tokio-stream = { version = "0.1", features = ["net"] }

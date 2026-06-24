@@ -77,6 +77,7 @@ impl AppState {
                 config.private_config().clone(),
             )),
             BackendMode::Real => Arc::new(RealBackend::new(
+                config.private_config().clone(),
                 config
                     .private_config()
                     .real_runtime_config()
@@ -903,17 +904,10 @@ async fn session_status(State(state): State<AppState>, headers: HeaderMap, uri: 
         return auth_error(AuthError::MissingSession).into_response();
     };
 
-    let status = match state.backend.status(active_session.session_id) {
+    let session_id = active_session.session_id.clone();
+    let status = match state.backend.status(session_id.clone()) {
         Ok(status) => status,
-        Err(_) => {
-            return AppError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                ErrorCode::BackendUnavailable,
-                "Backend unavailable.",
-                true,
-            )
-            .into_response();
-        }
+        Err(error) => return backend_error_clearing_session(&state, &headers, &session_id, error),
     };
 
     let mut response = Json(SessionResponse {
@@ -951,20 +945,13 @@ async fn stop_session(
         .stop_session(request.session_id.clone(), request.reason)
     {
         Ok(stopped) => stopped,
-        Err(error) => return backend_error(error).into_response(),
+        Err(error) => {
+            return backend_error_clearing_session(&state, &headers, &request.session_id, error);
+        }
     };
     publish_stopped_event(&state, &stopped);
 
-    *state
-        .runtime_session
-        .lock()
-        .expect("runtime session mutex poisoned") = None;
-    state.frame_previews.reset_session(&stopped.session_id);
-    state.captures.reset_session(&stopped.session_id);
-    state.labels.reset();
-    state.validation.reset();
-    state.ws_events.reset_session(&stopped.session_id);
-    state.ws_input.reset_session(&stopped.session_id);
+    clear_runtime_session_state(&state, &stopped.session_id);
     if let Err(error) = state.auth.clear_session_headers(&headers) {
         return auth_error(error).into_response();
     }
@@ -996,7 +983,7 @@ async fn run_status(State(state): State<AppState>, headers: HeaderMap, uri: Uri)
 
     let status = match state.backend.status(session_id.clone()) {
         Ok(status) => status,
-        Err(error) => return backend_error(error).into_response(),
+        Err(error) => return backend_error_clearing_session(&state, &headers, &session_id, error),
     };
     if status.session_id != session_id {
         return auth_error(AuthError::BadSession).into_response();
@@ -1735,21 +1722,67 @@ fn cleanup_runtime_session(state: &AppState, reason: StopReason) -> Result<(), B
         return Ok(());
     };
 
-    let stopped = state
+    match state
         .backend
-        .stop_session(active_session.session_id, reason)?;
-    publish_stopped_event(state, &stopped);
-    *state
-        .runtime_session
-        .lock()
-        .expect("runtime session mutex poisoned") = None;
-    state.frame_previews.reset_session(&stopped.session_id);
-    state.captures.reset_session(&stopped.session_id);
-    state.labels.reset();
-    state.validation.reset();
-    state.ws_events.reset_session(&stopped.session_id);
-    state.ws_input.reset_session(&stopped.session_id);
-    Ok(())
+        .stop_session(active_session.session_id.clone(), reason)
+    {
+        Ok(stopped) => {
+            publish_stopped_event(state, &stopped);
+            clear_runtime_session_state(state, &stopped.session_id);
+            Ok(())
+        }
+        Err(error) => {
+            clear_runtime_session_state(state, &active_session.session_id);
+            Err(error)
+        }
+    }
+}
+
+fn clear_runtime_session_state(state: &AppState, session_id: &str) -> bool {
+    let cleared = {
+        let mut active = state
+            .runtime_session
+            .lock()
+            .expect("runtime session mutex poisoned");
+        if active
+            .as_ref()
+            .is_some_and(|active| active.session_id == session_id)
+        {
+            *active = None;
+            true
+        } else {
+            false
+        }
+    };
+    if cleared {
+        state.frame_previews.reset_session(session_id);
+        state.captures.reset_session(session_id);
+        state.labels.reset();
+        state.validation.reset();
+        state.ws_events.reset_session(session_id);
+        state.ws_input.reset_session(session_id);
+    }
+    cleared
+}
+
+fn backend_error_clearing_session(
+    state: &AppState,
+    headers: &HeaderMap,
+    session_id: &str,
+    error: BackendError,
+) -> Response {
+    if clear_runtime_session_state(state, session_id) {
+        let _ = state.auth.clear_session_headers(headers);
+        let mut response = backend_error(error).into_response();
+        response.headers_mut().insert(
+            SET_COOKIE,
+            HeaderValue::from_str(&expired_session_cookie_header())
+                .expect("expired session cookie contains only valid header characters"),
+        );
+        response
+    } else {
+        backend_error(error).into_response()
+    }
 }
 
 fn publish_run_boundary_event(state: &AppState, boundary: &crate::backend::RunBoundary) {

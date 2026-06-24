@@ -213,6 +213,24 @@ impl BridgePrivateConfig {
         )
     }
 
+    pub fn read_private_file(
+        &self,
+        relative_path: impl AsRef<Path>,
+    ) -> Result<Vec<u8>, PrivateConfigError> {
+        let root = self
+            .root
+            .as_ref()
+            .ok_or(PrivateConfigError::MissingEnv {
+                env: ENV_PRIVATE_ROOT,
+            })?
+            .path();
+        ensure_private_root_dir(root)?;
+        let relative_path = validate_relative_path(relative_path.as_ref())?;
+        let path = root.join(&relative_path);
+        validate_private_file(&path)?;
+        fs::read(&path).map_err(|error| io_error("read private file", &path, error))
+    }
+
     pub fn write_private_file_atomic(
         &self,
         relative_path: impl AsRef<Path>,
@@ -477,6 +495,20 @@ impl HypervisorEndpoint {
         matches!(self, Self::Unix { .. })
     }
 
+    pub fn unix_path(&self) -> Option<&Path> {
+        match self {
+            Self::Unix { path } => Some(path),
+            Self::Http { .. } => None,
+        }
+    }
+
+    pub fn http_uri(&self) -> Option<&str> {
+        match self {
+            Self::Unix { .. } => None,
+            Self::Http { uri } => Some(uri.as_str()),
+        }
+    }
+
     fn add_to_sanitizer(&self, sanitizer: PublicSanitizer) -> PublicSanitizer {
         match self {
             Self::Unix { path } => sanitizer.with_private_root(path),
@@ -507,6 +539,24 @@ impl RealStartSource {
 
     pub fn is_create_vm(&self) -> bool {
         matches!(self, Self::CreateVm { .. })
+    }
+
+    pub fn snapshot_hash(&self) -> Result<Option<[u8; 32]>, PrivateConfigError> {
+        match self {
+            Self::Snapshot { snapshot_ref } => {
+                parse_hex32(ENV_REAL_SNAPSHOT_REF, snapshot_ref.as_str()).map(Some)
+            }
+            Self::CreateVm { .. } => Ok(None),
+        }
+    }
+
+    pub fn create_vm_config_relative_path(&self) -> Result<Option<PathBuf>, PrivateConfigError> {
+        match self {
+            Self::Snapshot { .. } => Ok(None),
+            Self::CreateVm { config_ref } => {
+                validate_relative_path(Path::new(config_ref.as_str())).map(Some)
+            }
+        }
     }
 }
 
@@ -1063,6 +1113,30 @@ fn validate_relative_path(path: &Path) -> Result<PathBuf, PrivateConfigError> {
     Ok(normalized)
 }
 
+fn parse_hex32(env: &'static str, value: &str) -> Result<[u8; 32], PrivateConfigError> {
+    let value = value.trim();
+    if value.len() != 64 {
+        return Err(PrivateConfigError::InvalidPrivateRef { env });
+    }
+
+    let mut bytes = [0_u8; 32];
+    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+        let high = hex_nibble(chunk[0]).ok_or(PrivateConfigError::InvalidPrivateRef { env })?;
+        let low = hex_nibble(chunk[1]).ok_or(PrivateConfigError::InvalidPrivateRef { env })?;
+        bytes[index] = (high << 4) | low;
+    }
+    Ok(bytes)
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 #[cfg(unix)]
 fn path_mode(path: &Path) -> Result<u32, PrivateConfigError> {
     Ok(fs::metadata(path)
@@ -1135,6 +1209,8 @@ pub enum PrivateConfigError {
     InvalidSessionSecret,
     #[error("{env} must be unix://, http://, or https://")]
     InvalidEndpoint { env: &'static str },
+    #[error("{env} must be a valid private reference")]
+    InvalidPrivateRef { env: &'static str },
     #[error("{env} must be an absolute path")]
     PathNotAbsolute { env: &'static str, path: PathBuf },
     #[error("{env} must not contain parent directory segments")]

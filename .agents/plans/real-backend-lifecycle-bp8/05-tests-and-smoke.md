@@ -76,7 +76,7 @@ show the pattern:
 - create tempdir;
 - pass `BRIDGE_PRIVATE_ROOT` or `ROM_OPERATOR_BRIDGE_PRIVATE_ROOT`;
 - set operator credential and session secret;
-- set `BRIDGE_HYPERVISOR_ENDPOINT=unix://<temp sock>`;
+- set `BRIDGE_HYPERVISOR_ENDPOINT=<unix temp socket endpoint>`;
 - set `BRIDGE_REAL_SNAPSHOT_REF=<64 hex>` or a private
   `BRIDGE_CREATE_VM_CONFIG_REF`.
 
@@ -112,13 +112,13 @@ Bridge env shape:
 
 ```bash
 ROM_OPERATOR_BRIDGE_BACKEND=real
-BRIDGE_HYPERVISOR_ENDPOINT=unix:///run/dh/grpc.sock
+BRIDGE_HYPERVISOR_ENDPOINT=<unix UDS endpoint>
 BRIDGE_PRIVATE_ROOT=<private root>
 ROM_OPERATOR_BRIDGE_OPERATOR_CREDENTIAL=<private credential>
 ROM_OPERATOR_BRIDGE_SESSION_SECRET=<private secret>
 BRIDGE_WORKLOAD_IMAGE_REF=<private image ref>
 BRIDGE_CAPTURE_SPEC_REF=<private capture spec ref>
-BRIDGE_REFERENCE_WORKLOAD_CHECKOUT=/home/infra-admin/git/preestablished/reference-workload
+BRIDGE_REFERENCE_WORKLOAD_CHECKOUT=<absolute reference workload checkout>
 BRIDGE_REAL_SNAPSHOT_REF=<64 hex private snapshot ref>
 ```
 
