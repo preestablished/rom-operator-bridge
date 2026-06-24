@@ -296,6 +296,34 @@ describe("runtime API client", () => {
       }
     });
   });
+
+  it("redacts private paths even when they follow separators", async () => {
+    const client = new RuntimeApiClient(config, {
+      fetcher: queuedFetch(
+        [
+          {
+            schema_version: 1,
+            error: {
+              code: "backend_unavailable",
+              message: "failed path=/home/operator/private.env",
+              retryable: true,
+              details: {}
+            }
+          }
+        ],
+        503
+      )
+    });
+
+    await expect(client.runStatus()).rejects.toMatchObject({
+      display: {
+        code: "backend_unavailable",
+        message: "Request failed.",
+        retryable: true,
+        details: {}
+      }
+    });
+  });
 });
 
 describe("runtime WebSocket clients", () => {
