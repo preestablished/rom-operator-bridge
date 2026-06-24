@@ -256,7 +256,11 @@ h2 {
 }
 
 .preview-surface {
+  display: flex;
+  align-items: center;
+  justify-content: center;
   min-height: 342px;
+  overflow: hidden;
   border: 1px solid #24362f;
   border-radius: 6px;
   background:
@@ -269,6 +273,14 @@ h2 {
       transparent 18px
     );
   aspect-ratio: 4 / 3;
+}
+
+.preview-surface img {
+  width: 100%;
+  height: 100%;
+  background: #101611;
+  image-rendering: pixelated;
+  object-fit: contain;
 }
 
 .pad-grid {

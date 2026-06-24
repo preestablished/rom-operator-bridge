@@ -3,6 +3,7 @@ pub mod artifacts;
 pub mod auth;
 pub mod backend;
 pub mod config;
+pub mod framebuffer;
 pub mod input;
 pub mod private_config;
 pub mod sanitization;

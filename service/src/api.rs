@@ -1,10 +1,10 @@
 use crate::{
     auth::{
         ALLOWED_ORIGIN, AuthError, AuthState, expired_session_cookie_header, session_cookie_header,
-        validate_runtime_request,
+        validate_origin, validate_runtime_request,
     },
     backend::{
-        BackendError, BackendMode, BridgeBackend, RealBackendUnavailable, StopReason,
+        BackendError, BackendMode, BridgeBackend, FramePreview, RealBackendUnavailable, StopReason,
         SyntheticBackend,
     },
     config::ServiceConfig,
@@ -14,19 +14,28 @@ use crate::{
 };
 use axum::{
     Json, Router,
+    body::Body,
     extract::{State, ws::WebSocketUpgrade},
     http::{
         HeaderMap, HeaderName, HeaderValue, StatusCode, Uri,
-        header::{ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, PRAGMA, SET_COOKIE, VARY},
+        header::{
+            ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, CONTENT_TYPE, PRAGMA, SET_COOKIE, VARY,
+        },
     },
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::sync::{Arc, Mutex};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+};
 
 pub const RUNTIME_API_SCHEMA_VERSION: u16 = 1;
+const JSON_SAFE_U64_MAX: u64 = 9_007_199_254_740_991;
+const MAX_CACHED_FRAME_PREVIEWS: usize = 16;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -34,6 +43,7 @@ pub struct AppState {
     backend: Arc<dyn BridgeBackend>,
     auth: AuthState,
     runtime_session: Arc<Mutex<Option<String>>>,
+    frame_previews: FramePreviewState,
     ws_events: WsEventState,
     ws_input: WsInputState,
 }
@@ -52,6 +62,7 @@ impl AppState {
             backend,
             auth: AuthState::new(),
             runtime_session: Arc::new(Mutex::new(None)),
+            frame_previews: FramePreviewState::new(),
             ws_events: WsEventState::new(),
             ws_input: WsInputState::new(),
         }
@@ -68,6 +79,7 @@ impl AppState {
             backend: Arc::new(SyntheticBackend::with_private_config(private_config)),
             auth,
             runtime_session: Arc::new(Mutex::new(None)),
+            frame_previews: FramePreviewState::new(),
             ws_events: WsEventState::new(),
             ws_input: WsInputState::new(),
         }
@@ -83,9 +95,48 @@ impl AppState {
             backend,
             auth,
             runtime_session: Arc::new(Mutex::new(None)),
+            frame_previews: FramePreviewState::new(),
             ws_events: WsEventState::new(),
             ws_input: WsInputState::new(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct FramePreviewState {
+    inner: Arc<Mutex<VecDeque<FramePreview>>>,
+}
+
+impl FramePreviewState {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn reset_session(&self, _session_id: &str) {
+        self.inner
+            .lock()
+            .expect("frame preview mutex poisoned")
+            .clear();
+    }
+
+    fn remember(&self, preview: &FramePreview) {
+        let mut previews = self.inner.lock().expect("frame preview mutex poisoned");
+        previews.retain(|cached| {
+            cached.session_id != preview.session_id || cached.frame != preview.frame
+        });
+        previews.push_back(preview.clone());
+        while previews.len() > MAX_CACHED_FRAME_PREVIEWS {
+            previews.pop_front();
+        }
+    }
+
+    fn get(&self, session_id: &str, frame: u64) -> Option<FramePreview> {
+        self.inner
+            .lock()
+            .expect("frame preview mutex poisoned")
+            .iter()
+            .find(|preview| preview.session_id == session_id && preview.frame == frame)
+            .cloned()
     }
 }
 
@@ -115,6 +166,14 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/run/resume",
             post(resume_run).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/frame/current",
+            get(frame_current).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/frame/current/image",
+            get(frame_current_image).fallback(method_not_allowed),
         )
         .route(
             "/ws/input",
@@ -204,6 +263,9 @@ async fn start_session(
         .runtime_session
         .lock()
         .expect("runtime session mutex poisoned") = Some(session_id);
+    state
+        .frame_previews
+        .reset_session(&backend_session.session_id);
     state.ws_events.reset_session(&backend_session.session_id);
     state.ws_input.reset_session(&backend_session.session_id);
 
@@ -299,6 +361,7 @@ async fn stop_session(
         .runtime_session
         .lock()
         .expect("runtime session mutex poisoned") = None;
+    state.frame_previews.reset_session(&stopped.session_id);
     state.ws_events.reset_session(&stopped.session_id);
     state.ws_input.reset_session(&stopped.session_id);
     if let Err(error) = state.auth.clear_session_headers(&headers) {
@@ -337,6 +400,102 @@ async fn run_status(State(state): State<AppState>, headers: HeaderMap, uri: Uri)
 
     let mut response = Json(RunStatusResponse::from(status)).into_response();
     apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
+    response
+}
+
+async fn frame_current(State(state): State<AppState>, headers: HeaderMap, uri: Uri) -> Response {
+    if let Err(response) = authenticate_runtime_request(&state, &headers, &uri) {
+        return response;
+    }
+    let session_id = match active_session_id(&state) {
+        Ok(session_id) => session_id,
+        Err(response) => return response,
+    };
+
+    let status = match state.backend.status(session_id.clone()) {
+        Ok(status) => status,
+        Err(error) => return backend_error(error).into_response(),
+    };
+    if status.session_id != session_id {
+        return auth_error(AuthError::BadSession).into_response();
+    }
+    let preview = match state.backend.framebuffer(session_id.clone()) {
+        Ok(preview) => preview,
+        Err(error) => return backend_error(error).into_response(),
+    };
+    if let Err(response) = validate_frame_preview(&session_id, &preview) {
+        return response;
+    }
+    state.frame_previews.remember(&preview);
+
+    let mut response = Json(FrameCurrentResponse {
+        schema_version: RUNTIME_API_SCHEMA_VERSION,
+        frame: preview.frame,
+        captured_at: "1970-01-01T00:00:00Z",
+        stale: preview.frame < status.current_frame,
+        width: preview.width,
+        height: preview.height,
+        format: "image/png",
+        image_url: format!("/api/frame/current/image?frame={}", preview.frame),
+        preview_hash: sha256_ref(&preview.png_bytes),
+    })
+    .into_response();
+    apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
+    response
+}
+
+async fn frame_current_image(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    if let Err(response) = authenticate_runtime_request_allowing_frame_hint(&state, &headers, &uri)
+    {
+        return response;
+    }
+    let requested_frame = match requested_frame_hint(&uri) {
+        Ok(requested_frame) => requested_frame,
+        Err(response) => return response,
+    };
+    let session_id = match active_session_id(&state) {
+        Ok(session_id) => session_id,
+        Err(response) => return response,
+    };
+    let preview = if let Some(frame) = requested_frame {
+        match state.frame_previews.get(&session_id, frame) {
+            Some(preview) => preview,
+            None => {
+                let preview = match state.backend.framebuffer(session_id.clone()) {
+                    Ok(preview) => preview,
+                    Err(error) => return backend_error(error).into_response(),
+                };
+                if let Err(response) = validate_frame_preview(&session_id, &preview) {
+                    return response;
+                }
+                if preview.frame != frame {
+                    return bad_request("Preview frame unavailable.").into_response();
+                }
+                state.frame_previews.remember(&preview);
+                preview
+            }
+        }
+    } else {
+        let preview = match state.backend.framebuffer(session_id.clone()) {
+            Ok(preview) => preview,
+            Err(error) => return backend_error(error).into_response(),
+        };
+        if let Err(response) = validate_frame_preview(&session_id, &preview) {
+            return response;
+        }
+        state.frame_previews.remember(&preview);
+        preview
+    };
+
+    let mut response = Response::new(Body::from(preview.png_bytes));
+    apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("image/png"));
     response
 }
 
@@ -483,6 +642,61 @@ fn authenticate_runtime_request(
     }
 }
 
+fn authenticate_runtime_request_allowing_frame_hint(
+    state: &AppState,
+    headers: &HeaderMap,
+    uri: &Uri,
+) -> Result<(), Response> {
+    if uri.query().is_some_and(is_frame_hint_query) {
+        if let Err(error) = validate_origin(headers) {
+            return Err(auth_error(error).into_response());
+        }
+        match state.auth.authenticate_headers(headers) {
+            Ok(()) => Ok(()),
+            Err(AuthError::ExpiredSession) => {
+                if let Err(error) = cleanup_runtime_session(state, StopReason::SessionReplaced) {
+                    return Err(backend_error(error).into_response());
+                }
+                Err(auth_error(AuthError::ExpiredSession).into_response())
+            }
+            Err(error) => Err(auth_error(error).into_response()),
+        }
+    } else {
+        authenticate_runtime_request(state, headers, uri)
+    }
+}
+
+fn is_frame_hint_query(query: &str) -> bool {
+    let Some(frame) = query.strip_prefix("frame=") else {
+        return false;
+    };
+    !frame.is_empty() && frame.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn requested_frame_hint(uri: &Uri) -> Result<Option<u64>, Response> {
+    let Some(query) = uri.query().filter(|query| is_frame_hint_query(query)) else {
+        return Ok(None);
+    };
+    let frame = query
+        .strip_prefix("frame=")
+        .expect("frame hint query was validated")
+        .parse::<u64>()
+        .ok()
+        .filter(|frame| *frame <= JSON_SAFE_U64_MAX)
+        .ok_or_else(|| bad_request("Preview frame unavailable.").into_response())?;
+    Ok(Some(frame))
+}
+
+fn validate_frame_preview(session_id: &str, preview: &FramePreview) -> Result<(), Response> {
+    if preview.session_id != session_id {
+        return Err(auth_error(AuthError::BadSession).into_response());
+    }
+    if preview.frame > JSON_SAFE_U64_MAX {
+        return Err(bad_request("Preview frame unavailable.").into_response());
+    }
+    Ok(())
+}
+
 fn cleanup_runtime_session(state: &AppState, reason: StopReason) -> Result<(), BackendError> {
     let session_id = state
         .runtime_session
@@ -499,6 +713,7 @@ fn cleanup_runtime_session(state: &AppState, reason: StopReason) -> Result<(), B
         .runtime_session
         .lock()
         .expect("runtime session mutex poisoned") = None;
+    state.frame_previews.reset_session(&stopped.session_id);
     state.ws_events.reset_session(&stopped.session_id);
     state.ws_input.reset_session(&stopped.session_id);
     Ok(())
@@ -640,6 +855,19 @@ pub struct RunStatusResponse {
     pub capabilities: crate::backend::BackendCapabilities,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FrameCurrentResponse {
+    pub schema_version: u16,
+    pub frame: u64,
+    pub captured_at: &'static str,
+    pub stale: bool,
+    pub width: u32,
+    pub height: u32,
+    pub format: &'static str,
+    pub image_url: String,
+    pub preview_hash: String,
+}
+
 impl From<crate::backend::RunStatus> for RunStatusResponse {
     fn from(status: crate::backend::RunStatus) -> Self {
         Self {
@@ -777,6 +1005,25 @@ fn backend_error(_error: crate::backend::BackendError) -> AppError {
         "Backend unavailable.",
         true,
     )
+}
+
+fn sha256_ref(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut output = String::with_capacity("sha256:".len() + digest.len() * 2);
+    output.push_str("sha256:");
+    for byte in digest {
+        output.push(hex_nibble(byte >> 4));
+        output.push(hex_nibble(byte & 0x0f));
+    }
+    output
+}
+
+fn hex_nibble(value: u8) -> char {
+    match value {
+        0..=9 => (b'0' + value) as char,
+        10..=15 => (b'a' + value - 10) as char,
+        _ => unreachable!("nibble is masked to four bits"),
+    }
 }
 
 fn auth_error(error: AuthError) -> AppError {

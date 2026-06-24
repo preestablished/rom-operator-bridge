@@ -8,6 +8,7 @@ use thiserror::Error;
 use crate::{
     api::RUNTIME_API_SCHEMA_VERSION,
     artifacts::{BridgeEventRow, PadLogEventRow, PrivateArtifactStore, RunManifest},
+    framebuffer::{SYNTHETIC_FRAME_HEIGHT, SYNTHETIC_FRAME_WIDTH, synthetic_frame_png},
     input::{AppliedInputFrame, PadLog, PadWord},
     private_config::BridgePrivateConfig,
 };
@@ -508,12 +509,21 @@ impl BridgeBackend for SyntheticBackend {
     }
 
     fn framebuffer(&self, session_id: SessionId) -> BackendResult<FramePreview> {
+        let mut inner = self.inner.lock().expect("synthetic backend mutex poisoned");
+        let session = inner
+            .active
+            .as_mut()
+            .filter(|session| session.session_id == session_id)
+            .ok_or(BackendError::BackendUnavailable)?;
+        let frame = session.current_frame;
+        session.last_preview_frame = frame;
+
         Ok(FramePreview {
             session_id,
-            frame: 0,
-            width: 1,
-            height: 1,
-            png_bytes: Vec::new(),
+            frame,
+            width: SYNTHETIC_FRAME_WIDTH,
+            height: SYNTHETIC_FRAME_HEIGHT,
+            png_bytes: synthetic_frame_png(frame),
         })
     }
 
