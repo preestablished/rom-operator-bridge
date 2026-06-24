@@ -2,14 +2,14 @@ use axum::{
     body::{Body, to_bytes},
     http::{
         Method, Request, StatusCode,
-        header::{COOKIE, ORIGIN, SET_COOKIE, UPGRADE},
+        header::{COOKIE, ORIGIN, SET_COOKIE},
     },
 };
 use rom_operator_bridge_service::{
     api::{AppState, router},
     auth::{
-        ALLOWED_ORIGIN, AuthState, MAX_FAILED_AUTH_ATTEMPTS, SESSION_COOKIE_NAME,
-        SESSION_TTL_SECONDS,
+        ALLOWED_ORIGIN, AUTH_RATE_LIMIT_WINDOW_SECONDS, AuthState, MAX_FAILED_AUTH_ATTEMPTS,
+        SESSION_COOKIE_NAME, SESSION_TTL_SECONDS,
     },
     config::{ENV_BACKEND_MODE, ServiceConfig},
     private_config::{ENV_OPERATOR_CREDENTIAL, ENV_PRIVATE_ROOT, ENV_SESSION_SECRET},
@@ -53,7 +53,7 @@ async fn bad_credential_and_credential_in_query_are_rejected_without_leaks() {
     let query_response = app
         .oneshot(runtime_request(
             Method::POST,
-            "/api/session/start?operator_credential=operator-credential-from-test-source",
+            "/api/session/start?next=operator-credential-from-test-source",
             Body::from(start_session_body(GOOD_CREDENTIAL)),
         ))
         .await
@@ -220,7 +220,13 @@ async fn only_one_operator_session_can_be_active() {
 
 #[tokio::test]
 async fn failed_auth_attempts_are_rate_limited() {
-    let (_workspace, app, private_root) = auth_app();
+    let workspace = tempfile::tempdir().expect("tempdir creates");
+    let private_root = workspace.path().join("bridge-private");
+    let auth = AuthState::fixed_for_tests(1_000);
+    let app = router(AppState::synthetic_for_tests_with_auth(
+        config(&private_root),
+        auth.clone(),
+    ));
 
     let mut last_response = None;
     for _ in 0..MAX_FAILED_AUTH_ATTEMPTS {
@@ -239,6 +245,19 @@ async fn failed_auth_attempts_are_rate_limited() {
     let response = last_response.expect("at least one response");
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_auth_safe_error(response, "auth_rejected", &private_root).await;
+
+    auth.advance_for_tests(AUTH_RATE_LIMIT_WINDOW_SECONDS);
+
+    let recovered = app
+        .oneshot(runtime_request(
+            Method::POST,
+            "/api/session/start",
+            Body::from(start_session_body(GOOD_CREDENTIAL)),
+        ))
+        .await
+        .expect("post-cooldown credential request runs");
+
+    assert_eq!(recovered.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -275,15 +294,8 @@ async fn backend_start_failure_does_not_leave_session_locked() {
 async fn websocket_handshake_uses_same_origin_and_cookie_auth() {
     let (_workspace, app, _private_root) = auth_app();
 
-    let missing_cookie = app
-        .clone()
-        .oneshot(
-            runtime_request(Method::GET, "/ws/input", Body::empty())
-                .with_header(UPGRADE, "websocket"),
-        )
-        .await
-        .expect("ws missing cookie request runs");
-    assert_eq!(missing_cookie.status(), StatusCode::UNAUTHORIZED);
+    let missing_cookie = raw_ws_response(app.clone(), None, true).await;
+    assert!(missing_cookie.starts_with("HTTP/1.1 401 Unauthorized"));
 
     let login_response = app
         .clone()
@@ -302,16 +314,15 @@ async fn websocket_handshake_uses_same_origin_and_cookie_auth() {
         .expect("cookie pair")
         .to_string();
 
-    let accepted = app
-        .oneshot(
-            runtime_request(Method::GET, "/ws/input", Body::empty())
-                .with_header(COOKIE, cookie)
-                .with_header(UPGRADE, "websocket"),
-        )
-        .await
-        .expect("ws accepted request runs");
+    let non_upgrade = raw_ws_response(app.clone(), Some(&cookie), false).await;
+    assert!(!non_upgrade.starts_with("HTTP/1.1 101"));
 
-    assert_eq!(accepted.status(), StatusCode::SWITCHING_PROTOCOLS);
+    let accepted = raw_ws_response(app, Some(&cookie), true).await;
+    let accepted_lower = accepted.to_ascii_lowercase();
+
+    assert!(accepted.starts_with("HTTP/1.1 101 Switching Protocols"));
+    assert!(accepted_lower.contains("upgrade: websocket"));
+    assert!(accepted_lower.contains("sec-websocket-accept:"));
 }
 
 trait RequestExt {
@@ -382,6 +393,46 @@ fn runtime_request(method: Method, uri: &str, body: Body) -> Request<Body> {
         .header("content-type", "application/json")
         .body(body)
         .expect("request builds")
+}
+
+async fn raw_ws_response(app: axum::Router, cookie: Option<&str>, upgrade: bool) -> String {
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test listener binds");
+    let addr = listener.local_addr().expect("listener addr is available");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("server runs");
+    });
+
+    let mut stream = TcpStream::connect(addr)
+        .await
+        .expect("test client connects");
+    let mut request =
+        format!("GET /ws/input HTTP/1.1\r\nHost: {addr}\r\nOrigin: {ALLOWED_ORIGIN}\r\n");
+    if upgrade {
+        request.push_str(
+            "Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+        );
+    }
+    if let Some(cookie) = cookie {
+        request.push_str(&format!("Cookie: {cookie}\r\n"));
+    }
+    request.push_str("\r\n");
+
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("request writes");
+    let mut buffer = [0_u8; 4096];
+    let read = stream.read(&mut buffer).await.expect("response reads");
+    server.abort();
+
+    String::from_utf8_lossy(&buffer[..read]).into_owned()
 }
 
 fn start_session_body(credential: &str) -> String {

@@ -13,6 +13,7 @@ pub const ALLOWED_ORIGIN: &str = "https://rombridge.birb.homes";
 pub const SESSION_COOKIE_NAME: &str = "rom_operator_bridge_session";
 pub const SESSION_TTL_SECONDS: u64 = 4 * 60 * 60;
 pub const MAX_FAILED_AUTH_ATTEMPTS: u32 = 3;
+pub const AUTH_RATE_LIMIT_WINDOW_SECONDS: u64 = 60;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperatorSession {
@@ -61,12 +62,16 @@ impl AuthState {
         let mut inner = self.inner.lock().expect("auth mutex poisoned");
         let now = self.clock.now_unix_seconds();
         inner.clear_expired(now);
+        inner.clear_stale_failures(now);
 
         if inner.failed_attempts >= MAX_FAILED_AUTH_ATTEMPTS {
             return Err(AuthError::RateLimited);
         }
 
         if !private_config.verify_operator_credential(credential) {
+            if inner.failed_attempts_started_at.is_none() {
+                inner.failed_attempts_started_at = Some(now);
+            }
             inner.failed_attempts += 1;
             return if inner.failed_attempts >= MAX_FAILED_AUTH_ATTEMPTS {
                 Err(AuthError::RateLimited)
@@ -91,6 +96,7 @@ impl AuthState {
             expires_at_unix_seconds: session.expires_at_unix_seconds,
         });
         inner.failed_attempts = 0;
+        inner.failed_attempts_started_at = None;
 
         Ok(session)
     }
@@ -147,6 +153,7 @@ struct AuthInner {
     active: Option<ActiveSession>,
     next_nonce: u64,
     failed_attempts: u32,
+    failed_attempts_started_at: Option<u64>,
 }
 
 impl AuthInner {
@@ -157,6 +164,15 @@ impl AuthInner {
             .is_some_and(|session| session.expires_at_unix_seconds <= now_unix_seconds)
         {
             self.active = None;
+        }
+    }
+
+    fn clear_stale_failures(&mut self, now_unix_seconds: u64) {
+        if self.failed_attempts_started_at.is_some_and(|started_at| {
+            now_unix_seconds.saturating_sub(started_at) >= AUTH_RATE_LIMIT_WINDOW_SECONDS
+        }) {
+            self.failed_attempts = 0;
+            self.failed_attempts_started_at = None;
         }
     }
 }
@@ -195,19 +211,8 @@ pub fn validate_runtime_request(headers: &HeaderMap, uri: &Uri) -> Result<(), Au
 }
 
 pub fn reject_credentials_in_url(uri: &Uri) -> Result<(), AuthError> {
-    let Some(query) = uri.query() else {
-        return Ok(());
-    };
-
-    for pair in query.split('&') {
-        let key = pair.split_once('=').map_or(pair, |(key, _)| key);
-        let key = key.to_ascii_lowercase();
-        if ["credential", "token", "password", "secret", "auth"]
-            .iter()
-            .any(|forbidden| key.contains(forbidden))
-        {
-            return Err(AuthError::CredentialInUrl);
-        }
+    if uri.query().is_some() {
+        return Err(AuthError::CredentialInUrl);
     }
 
     Ok(())

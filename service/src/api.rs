@@ -6,7 +6,7 @@ use crate::{
 };
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{State, ws::WebSocketUpgrade},
     http::{
         HeaderMap, HeaderName, HeaderValue, StatusCode, Uri,
         header::{ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, PRAGMA, SET_COOKIE, VARY},
@@ -214,6 +214,7 @@ async fn session_status(State(state): State<AppState>, headers: HeaderMap, uri: 
 }
 
 async fn input_ws_handshake(
+    ws: WebSocketUpgrade,
     State(state): State<AppState>,
     headers: HeaderMap,
     uri: Uri,
@@ -224,7 +225,7 @@ async fn input_ws_handshake(
         return auth_error(error).into_response();
     }
 
-    let mut response = StatusCode::SWITCHING_PROTOCOLS.into_response();
+    let mut response = ws.on_upgrade(|_socket| async {}).into_response();
     apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
     response
 }
