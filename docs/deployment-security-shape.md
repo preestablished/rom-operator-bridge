@@ -15,11 +15,11 @@ command transcripts.
 Use the dedicated same-network HTTPS origin `https://rombridge.birb.homes/`
 for the private operator bridge.
 
-The operator added DNS for `rombridge.birb.homes` pointing at `10.0.0.106`.
+The operator added DNS for `rombridge.birb.homes` pointing at `<bridge-private-ip>`.
 Local resolution confirms:
 
 ```text
-10.0.0.106      rombridge.birb.homes
+<bridge-private-ip>      rombridge.birb.homes
 ```
 
 This avoids the mixed-content risk called out in the initial plan while avoiding
@@ -71,7 +71,7 @@ wss://birb.homes/rom-bridge/ws/...
 - `/home/infra-admin/.agents/projects/forgejo/README.md` records the current
   local service-style HTTPS pattern as K3s Traefik plus cert-manager.
 - `/home/infra-admin/gitea/k8s-forgejo-ingress.yaml` shows the active pattern
-  for routing a service on `10.0.0.106` through Traefik with TLS.
+  for routing a service on `<bridge-private-ip>` through Traefik with TLS.
 - Repository and planning-doc searches found no existing committed
   `rombridge.birb.homes` or `/rom-bridge` route before this note.
 
@@ -80,7 +80,7 @@ wss://birb.homes/rom-bridge/ws/...
 Chosen Phase 0 target for the dedicated hostname:
 
 ```text
-10.0.0.106:<bridge-port>
+<bridge-private-ip>:<bridge-port>
 ```
 
 Use K3s Traefik/cert-manager as the HTTPS/WSS edge, following the current local
@@ -116,7 +116,7 @@ documents a non-browser exception. If responses vary by request origin, include
 
 The proxy route must also enforce Host/SNI routing for `rombridge.birb.homes` so
 the bridge is not accidentally served under another host that resolves to
-`10.0.0.106`.
+`<bridge-private-ip>`.
 
 ## Runtime Cache Policy
 
@@ -210,7 +210,7 @@ DNS and TLS route:
 
 ```sh
 getent hosts rombridge.birb.homes
-curl -I --resolve rombridge.birb.homes:443:10.0.0.106 https://rombridge.birb.homes/
+curl -I --resolve rombridge.birb.homes:443:<bridge-private-ip> https://rombridge.birb.homes/
 ```
 
 Origin rejection:
@@ -226,7 +226,7 @@ curl -i https://rombridge.birb.homes/api/session
 curl -I https://rombridge.birb.homes/api/session
 ```
 
-The expected results are: hostname resolves to `10.0.0.106`, TLS is served only
+The expected results are: hostname resolves to `<bridge-private-ip>`, TLS is served only
 for `rombridge.birb.homes`, unrelated origins are rejected, unauthenticated API
 requests are rejected without private details, and runtime responses include
 `Cache-Control: no-store`.

@@ -15,7 +15,7 @@ The frozen implementation location and stack are:
 repo: /home/infra-admin/git/preestablished/rom-operator-bridge
 service: Rust host-control service at service/Cargo.toml
 ui: TypeScript Vite/Vitest SPA/static web UI at ui/package.json
-service bind: 10.0.0.106:7410
+service bind: <bridge-private-ip>:7410
 backend strategy: synthetic backend first, real hypervisor backend behind the same interface
 ```
 
@@ -69,9 +69,9 @@ All Phase 0 gate bullets pass:
 - Deployment is frozen to `https://rombridge.birb.homes/`,
   `https://rombridge.birb.homes/api/...`, and
   `wss://rombridge.birb.homes/ws/...`, with DNS already pointing at
-  `10.0.0.106`.
+  `<bridge-private-ip>`.
 - Deployment/security deviations are explicit: only DNS exists today; the service
-  bind is `10.0.0.106:7410`; exact systemd/K3s paths and restart/rollback
+  bind is `<bridge-private-ip>:7410`; exact systemd/K3s paths and restart/rollback
   commands are frozen; deployment files and install material are later
   implementation outputs.
 

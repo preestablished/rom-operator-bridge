@@ -432,7 +432,7 @@ feature_bytes.ref: private artifact ref
 feature_bytes.len: equals layout.json total_len when known
 feature_bytes.blake3: blake3 hash/ref
 decoded_order: non-empty array matching feature-map order when known
-decoded_values: array with the same length as decoded_order
+decoded feature value array: same length as decoded_order
 framebuffer.ref: private artifact ref
 framebuffer.blake3: blake3 hash/ref
 framebuffer.encoding
@@ -443,18 +443,16 @@ framebuffer.stride
 framebuffer.uncompressed_len
 ```
 
-Forbidden inline payload fields include:
+Forbidden inline payload classes include:
 
 ```text
-feature_bytes.bytes
-framebuffer.bytes
-raw_wram
-wram_bytes
-framebuffer_bytes
-screenshot
-save_ram
-rom_bytes
-raw_capture_bytes
+feature byte payloads
+framebuffer byte payloads
+raw working-memory payloads
+screenshot payloads
+save-memory payloads
+ROM byte payloads
+raw capture byte payloads
 ```
 
 Fallback if unavailable:
@@ -533,7 +531,7 @@ schema_version
 frame_index
 capture_id
 decoded_order
-decoded_values
+decoded feature values
 active_stages
 expected_highest_stage
 prune
@@ -545,11 +543,11 @@ Privacy boundary:
 
 `captures/index.jsonl`, `trajectory/*.jsonl`, `score-plan.json`,
 `dedup-groups.jsonl`, validation reports, checksum manifests, label drafts,
-capture ids, `decoded_values`, private artifact refs, and raw verifier or scorer
-error details are operator-private server-side artifacts. Browser APIs may return
-only sanitized aggregate status, counts, pass/fail booleans, and
-operator-approved labels. Public handoff text must run `redaction-scan` with the
-operator forbidden-literal file before publication.
+capture ids, decoded feature values, private artifact refs, and raw verifier or
+scorer error details are operator-private server-side artifacts. Browser APIs
+may return only sanitized aggregate status, counts, pass/fail booleans, and
+operator-approved labels. Public handoff text must run `redaction-scan` with
+the operator forbidden-literal file before publication.
 
 Dedup artifact:
 
@@ -744,14 +742,14 @@ target. The dedicated same-network HTTPS origin above is the chosen target.
 Service bind address:
 
 ```text
-10.0.0.106:7410
+<bridge-private-ip>:7410
 ```
 
-The operator has added DNS for `rombridge.birb.homes` pointing to `10.0.0.106`,
+The operator has added DNS for `rombridge.birb.homes` pointing to `<bridge-private-ip>`,
 and local resolution has confirmed:
 
 ```text
-10.0.0.106      rombridge.birb.homes
+<bridge-private-ip>      rombridge.birb.homes
 ```
 
 Only DNS exists today. No bridge service, TLS route, proxy route, service unit,
@@ -761,7 +759,7 @@ Do not bind the bridge service to `0.0.0.0`. Do not use a
 `127.0.0.1:7410` bind for the dedicated-hostname deployment unless the
 deployment bead adds a host-local reverse proxy that can reach loopback. The edge
 route must enforce Host/SNI for `rombridge.birb.homes` only, so the bridge is not
-served under another host that resolves to `10.0.0.106`.
+served under another host that resolves to `<bridge-private-ip>`.
 
 Frozen deployment paths:
 
@@ -841,7 +839,7 @@ Future deployment checks once a service and route exist:
 
 ```sh
 getent hosts rombridge.birb.homes
-curl -I --resolve rombridge.birb.homes:443:10.0.0.106 https://rombridge.birb.homes/
+curl -I --resolve rombridge.birb.homes:443:<bridge-private-ip> https://rombridge.birb.homes/
 curl -i -H 'Origin: https://example.invalid' https://rombridge.birb.homes/api/session
 curl -i https://rombridge.birb.homes/api/session
 curl -I https://rombridge.birb.homes/api/session
@@ -849,7 +847,7 @@ curl -I https://rombridge.birb.homes/api/session
 
 Expected deployment check results:
 
-- hostname resolves to `10.0.0.106`;
+- hostname resolves to `<bridge-private-ip>`;
 - TLS is served for `rombridge.birb.homes`;
 - unrelated origins are rejected;
 - unauthenticated API requests are rejected without private details;

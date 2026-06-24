@@ -26,6 +26,7 @@ npm --prefix ui ci
 npm --prefix ui run typecheck
 npm --prefix ui test -- --run
 npm --prefix ui run build
+scripts/redaction-gate.sh
 ```
 
 The base branch defaults to `main`. If `.ralph` defines `main_branch=<branch>`,
@@ -48,15 +49,16 @@ skip is printed with an explicit `SKIP` message:
 
 - Missing `service/Cargo.toml` means the service scaffold is not available yet.
 - Missing `ui/package.json` means the UI scaffold is not available yet.
-- Missing `scripts/redaction-gate.sh` means the static redaction gate is still
-  deferred to `rom-operator-bridge-25u`.
+- Missing `scripts/redaction-gate.sh` means the static redaction gate scaffold
+  is not available yet.
 
 ## Extension Points
 
 Add new branch-wide checks here when the matching bead lands:
 
-- `rom-operator-bridge-25u` should provide `scripts/redaction-gate.sh` and keep
-  the public output limited to pass/fail status plus sanitized counts.
+- Future redaction changes must keep public output limited to pass/fail status
+  plus sanitized counts; private finding paths and reports stay in the
+  validation directory.
 - Synthetic integration-test beads should add commands to this script after
   their tests are committed.
 - Deployment or publish-readiness beads should add only agent-runnable checks;

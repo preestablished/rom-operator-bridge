@@ -55,7 +55,7 @@ cargo run --manifest-path service/Cargo.toml
 Check deployment-bind liveness:
 
 ```sh
-curl -fsS http://10.0.0.106:7410/health
+curl -fsS http://<bridge-private-ip>:7410/health
 ```
 
 Run the synthetic service on loopback for local development:
@@ -204,16 +204,16 @@ For private bundle context validation, `phase4-context-check` validates
 Run before sharing public notes, static artifacts, or handoff text:
 
 ```sh
-(cd /home/infra-admin/git/preestablished/reference-workload && cargo run --locked -p refwork-verify -- redaction-scan \
-  --input <public-note.md> \
-  --report <validation/redaction-scan.json> \
-  --forbid-file <private-forbid-literals.txt>)
+ROM_OPERATOR_BRIDGE_FORBID_FILE=<private-forbid-literals.txt> \
+ROM_OPERATOR_BRIDGE_VALIDATION_DIR=<private-validation-dir> \
+scripts/redaction-gate.sh
 ```
 
-The redaction scanner reports finding kind, line, and column only; it must not
-echo matched private literals or source excerpts. Add operator-specific
-forbidden literals with repeatable `--forbid` and `--forbid-file` arguments
-before producing any public handoff.
+The gate builds the static UI output, scans committed public docs and deployable
+UI artifacts, and invokes the Phase-0-confirmed `refwork-verify redaction-scan`
+command with a forbidden-literals file. Reports stay under the private
+validation directory. Public console output is limited to pass/fail status and
+sanitized counts; it must not echo matched private literals or source excerpts.
 
 ## Private Real-Host Checks
 
@@ -260,7 +260,7 @@ Future deployment checks once a service and route exist:
 
 ```sh
 getent hosts rombridge.birb.homes
-curl -I --resolve rombridge.birb.homes:443:10.0.0.106 https://rombridge.birb.homes/
+curl -I --resolve rombridge.birb.homes:443:<bridge-private-ip> https://rombridge.birb.homes/
 curl -i -H 'Origin: https://example.invalid' https://rombridge.birb.homes/api/session
 curl -i https://rombridge.birb.homes/api/session
 curl -I https://rombridge.birb.homes/api/session
@@ -268,7 +268,7 @@ curl -I https://rombridge.birb.homes/api/session
 
 Expected deployment check results:
 
-- hostname resolves to `10.0.0.106`;
+- hostname resolves to `<bridge-private-ip>`;
 - TLS is served for `rombridge.birb.homes`;
 - unrelated origins are rejected;
 - unauthenticated API requests are rejected without private details;
