@@ -2,7 +2,7 @@ use axum::{
     body::{Body, to_bytes},
     http::{
         HeaderMap, HeaderName, Request, StatusCode,
-        header::{CACHE_CONTROL, CONTENT_TYPE, PRAGMA},
+        header::{CACHE_CONTROL, PRAGMA},
     },
 };
 use rom_operator_bridge_service::{
@@ -58,76 +58,6 @@ async fn health_route_returns_schema_v1_without_private_paths() {
     assert!(!body.contains("/run/"));
     assert!(!body.contains("rom-operator-bridge.env"));
     assert!(!body.contains(DEFAULT_BIND_ADDR));
-}
-
-#[tokio::test]
-async fn spa_shell_routes_include_security_headers() {
-    let app = router(AppState::synthetic_for_tests(
-        ServiceConfig::synthetic_for_addr("127.0.0.1:0".parse().expect("test address parses")),
-    ));
-
-    for uri in ["/", "/index.html"] {
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri(uri)
-                    .body(Body::empty())
-                    .expect("request builds"),
-            )
-            .await
-            .expect("spa request succeeds");
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_spa_headers(response.headers());
-        assert_eq!(
-            response
-                .headers()
-                .get(CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok()),
-            Some("text/html; charset=utf-8")
-        );
-
-        let body = to_bytes(response.into_body(), 8192)
-            .await
-            .expect("body reads");
-        let html = String::from_utf8(body.to_vec()).expect("spa shell is utf8");
-        assert!(html.contains(r#"<div id="app"></div>"#));
-    }
-}
-
-#[tokio::test]
-async fn runtime_config_includes_spa_security_headers() {
-    let app = router(AppState::synthetic_for_tests(
-        ServiceConfig::synthetic_for_addr("127.0.0.1:0".parse().expect("test address parses")),
-    ));
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/runtime-config.json")
-                .body(Body::empty())
-                .expect("request builds"),
-        )
-        .await
-        .expect("runtime config request succeeds");
-
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_spa_headers(response.headers());
-    assert_eq!(
-        response
-            .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok()),
-        Some("application/json")
-    );
-
-    let body = to_bytes(response.into_body(), 4096)
-        .await
-        .expect("body reads");
-    let json: Value = serde_json::from_slice(&body).expect("runtime config is json");
-    assert_eq!(json["schema_version"], 1);
-    assert_eq!(json["allow_persistence"], false);
 }
 
 #[tokio::test]
@@ -331,29 +261,5 @@ fn assert_no_store_headers(headers: &HeaderMap) {
             .get(HeaderName::from_static("x-content-type-options"))
             .and_then(|value| value.to_str().ok()),
         Some("nosniff")
-    );
-}
-
-fn assert_spa_headers(headers: &HeaderMap) {
-    assert_no_store_headers(headers);
-    assert_eq!(
-        headers
-            .get(HeaderName::from_static("content-security-policy"))
-            .and_then(|value| value.to_str().ok()),
-        Some(
-            "default-src 'self'; connect-src 'self' wss://rombridge.birb.homes; img-src 'self' blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
-        )
-    );
-    assert_eq!(
-        headers
-            .get(HeaderName::from_static("referrer-policy"))
-            .and_then(|value| value.to_str().ok()),
-        Some("no-referrer")
-    );
-    assert_eq!(
-        headers
-            .get(HeaderName::from_static("x-frame-options"))
-            .and_then(|value| value.to_str().ok()),
-        Some("DENY")
     );
 }

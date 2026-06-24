@@ -45,9 +45,6 @@ const JSON_SAFE_U64_MAX: u64 = 9_007_199_254_740_991;
 const MAX_CACHED_FRAME_PREVIEWS: usize = 16;
 const DEFAULT_CAPTURE_LIMIT: usize = 50;
 const MAX_CAPTURE_LIMIT: usize = 200;
-const SPA_INDEX_HTML: &str = include_str!("../../ui/index.html");
-const SPA_RUNTIME_CONFIG_JSON: &str = include_str!("../../ui/public/runtime-config.json");
-const SPA_CONTENT_SECURITY_POLICY: &str = "default-src 'self'; connect-src 'self' wss://rombridge.birb.homes; img-src 'self' blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -597,12 +594,6 @@ enum CaptureTriggerError {
 
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .route("/", get(spa_index).fallback(method_not_allowed))
-        .route("/index.html", get(spa_index).fallback(method_not_allowed))
-        .route(
-            "/runtime-config.json",
-            get(spa_runtime_config).fallback(method_not_allowed),
-        )
         .route("/health", get(health).fallback(method_not_allowed))
         .route(
             "/api/session",
@@ -672,23 +663,6 @@ pub fn router(state: AppState) -> Router {
         )
         .fallback(not_found)
         .with_state(state)
-}
-
-async fn spa_index() -> Response {
-    let mut response =
-        ([(CONTENT_TYPE, "text/html; charset=utf-8")], SPA_INDEX_HTML).into_response();
-    apply_spa_headers(response.headers_mut());
-    response
-}
-
-async fn spa_runtime_config() -> Response {
-    let mut response = (
-        [(CONTENT_TYPE, "application/json")],
-        SPA_RUNTIME_CONFIG_JSON,
-    )
-        .into_response();
-    apply_spa_headers(response.headers_mut());
-    response
 }
 
 async fn health(State(state): State<AppState>) -> Response {
@@ -2084,22 +2058,6 @@ fn apply_no_store_headers(headers: &mut HeaderMap) {
     headers.insert(
         HeaderName::from_static("x-content-type-options"),
         HeaderValue::from_static("nosniff"),
-    );
-}
-
-fn apply_spa_headers(headers: &mut HeaderMap) {
-    apply_no_store_headers(headers);
-    headers.insert(
-        HeaderName::from_static("content-security-policy"),
-        HeaderValue::from_static(SPA_CONTENT_SECURITY_POLICY),
-    );
-    headers.insert(
-        HeaderName::from_static("referrer-policy"),
-        HeaderValue::from_static("no-referrer"),
-    );
-    headers.insert(
-        HeaderName::from_static("x-frame-options"),
-        HeaderValue::from_static("DENY"),
     );
 }
 
