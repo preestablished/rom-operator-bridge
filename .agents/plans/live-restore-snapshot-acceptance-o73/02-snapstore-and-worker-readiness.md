@@ -104,11 +104,10 @@ Save raw JSON privately:
 ```bash
 cd /home/infra-admin/git/preestablished/determinism-hypervisor
 timeout 20s grpcurl -plaintext \
-  -unix \
   -import-path proto \
   -proto hypervisor.proto \
   -d '{}' \
-  /run/dh/grpc.sock \
+  unix:///run/dh/grpc.sock \
   determinism.hypervisor.v1.HypervisorWorker/GetWorkerInfo \
   > "$O73_PRIVATE_ROOT/evidence/worker-info-before.private.json" \
   2> "$O73_PRIVATE_ROOT/evidence/worker-info-before.private.err"

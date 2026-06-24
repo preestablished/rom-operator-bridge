@@ -6,8 +6,8 @@ Two subagents reviewed this plan before handoff.
 
 Accepted changes:
 
-- corrected `grpcurl` UDS syntax so `/run/dh/grpc.sock` is the positional
-  address after `-unix`;
+- corrected `grpcurl` UDS syntax to use the host-validated
+  `unix:///run/dh/grpc.sock` address form;
 - added HTTP status capture and explicit `200` checks for start, session,
   run-status, and stop;
 - fixed the sanitized `GET /api/session` summary shape to use top-level response
@@ -48,3 +48,8 @@ switching the run back to `CreateVm`.
 
 Long-running service commands use `setsid` plus PID files so cleanup can signal
 the process group rather than only the Cargo wrapper process.
+
+During implementation, the local `grpcurl` binary still tried to dial
+`/run/dh/grpc.sock` as TCP when passed as a positional path with `-unix` or
+`-unix=true`. The plan now uses the verified `unix:///run/dh/grpc.sock` address
+form for worker readiness and slot-count checks.

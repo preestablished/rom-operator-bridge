@@ -135,11 +135,10 @@ Capture worker info while the session is active:
 ```bash
 cd /home/infra-admin/git/preestablished/determinism-hypervisor
 timeout 20s grpcurl -plaintext \
-  -unix \
   -import-path proto \
   -proto hypervisor.proto \
   -d '{}' \
-  /run/dh/grpc.sock \
+  unix:///run/dh/grpc.sock \
   determinism.hypervisor.v1.HypervisorWorker/GetWorkerInfo \
   > "$O73_PRIVATE_ROOT/evidence/worker-info-active.private.json" \
   2> "$O73_PRIVATE_ROOT/evidence/worker-info-active.private.err"
@@ -186,11 +185,10 @@ Capture worker info after stop:
 ```bash
 cd /home/infra-admin/git/preestablished/determinism-hypervisor
 timeout 20s grpcurl -plaintext \
-  -unix \
   -import-path proto \
   -proto hypervisor.proto \
   -d '{}' \
-  /run/dh/grpc.sock \
+  unix:///run/dh/grpc.sock \
   determinism.hypervisor.v1.HypervisorWorker/GetWorkerInfo \
   > "$O73_PRIVATE_ROOT/evidence/worker-info-after-stop.private.json" \
   2> "$O73_PRIVATE_ROOT/evidence/worker-info-after-stop.private.err"
