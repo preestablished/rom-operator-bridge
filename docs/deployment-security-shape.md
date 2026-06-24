@@ -26,11 +26,11 @@ This avoids the mixed-content risk called out in the initial plan while avoiding
 the need to share the existing `https://birb.homes/plans/<slug>/` static-publish
 surface with a runtime control API.
 
-Only DNS exists at this point. This branch does not deploy a bridge service,
-configure TLS, or install a proxy route for `rombridge.birb.homes`. Until the
-later deployment bead creates the route and smoke checks pass, the hostname
-should be treated as unavailable for bridge operation and may return default
-virtual-host behavior.
+Only DNS exists at this point. This branch does not configure TLS or install a
+proxy route for `rombridge.birb.homes`. Until the later deployment bead creates
+the route and smoke checks pass, the hostname should be treated as unavailable
+for bridge operation and may return default virtual-host behavior. The current
+deployment handoff is recorded in `docs/deployment-note.md`.
 
 ## URLs
 
@@ -80,7 +80,7 @@ wss://birb.homes/rom-bridge/ws/...
 Chosen Phase 0 target for the dedicated hostname:
 
 ```text
-<bridge-private-ip>:<bridge-port>
+<bridge-private-ip>:7410
 ```
 
 Use K3s Traefik/cert-manager as the HTTPS/WSS edge, following the current local
@@ -89,13 +89,15 @@ service-style pattern recorded for Forgejo. The Traefik route must match only
 interface above, or to an equivalent Kubernetes Service if the bridge is deployed
 inside the cluster.
 
-Do not bind the bridge to `0.0.0.0`. Do not use a `127.0.0.1:<bridge-port>`
+Do not bind the bridge to `0.0.0.0`. Do not use a `127.0.0.1:7410`
 service bind for the dedicated-hostname deployment unless the later deployment
 bead also replaces the Traefik external-endpoint shape with a host-local reverse
 proxy that can reach loopback.
 
-The exact port is unresolved because the bridge service does not exist yet. The
-deployment bead must fill in `<bridge-port>` before any publish/deploy step.
+The dedicated-hostname deployment uses the documented trusted interface above,
+not localhost. The deployment bead must still create the proxy manifest,
+installable service unit, release artifact, and private env file before any
+publish/deploy step.
 
 ## Origin And CORS Allowlist
 
@@ -182,29 +184,34 @@ Emergency bridge service shutdown:
 sudo systemctl stop rom-operator-bridge.service
 ```
 
-K3s Traefik route apply, if that deployment shape is chosen:
+K3s Traefik route apply:
 
 ```sh
-KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl apply -f <rombridge-ingress.yaml>
+KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl apply -f deploy/k8s/rombridge-ingress.yaml
 ```
 
 K3s Traefik route rollback:
 
 ```sh
-KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl delete -f <rombridge-ingress.yaml>
+KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl delete -f deploy/k8s/rombridge-ingress.yaml
 ```
 
-Service artifact rollback remains a deployment-bead blocker until the service
-unit, binary/artifact location, and private env file path exist. The deployment
-note must replace `<bridge-port>` and `<rombridge-ingress.yaml>` with exact
-values and add the concrete service rollback command, such as restoring the
-previous service artifact and env file, running `systemctl daemon-reload` if the
-unit changed, and restarting `rom-operator-bridge.service`.
+Service artifact rollback:
+
+```sh
+sudo ln -sfn /opt/rom-operator-bridge/previous /opt/rom-operator-bridge/current
+sudo systemctl restart rom-operator-bridge.service
+```
+
+The deployment bead must create `deploy/k8s/rombridge-ingress.yaml`,
+`deploy/systemd/rom-operator-bridge.service`, the private env file, and the
+release symlinks before these commands are run. If the unit changes during a
+deployment, run `sudo systemctl daemon-reload` before restart.
 
 ## Future Deployment Checks
 
 These command shapes are for the later deployment bead. They were not run during
-Phase 0 discovery because no bridge service or proxy route exists yet.
+Phase 0 discovery because no deployed service instance or proxy route exists yet.
 
 DNS and TLS route:
 
@@ -235,8 +242,8 @@ requests are rejected without private details, and runtime responses include
 
 - No committed `rombridge.birb.homes` Traefik/Ingress/Apache/Caddy config exists
   yet in this repo.
-- No bridge service exists yet, so the exact runtime port is still a later
-  implementation decision.
+- The bridge service exists in this repo, but deployment install material does
+  not exist yet.
 - Publish/deploy commands must remain blocked until the redaction scan, auth
   rejection, origin rejection, no-store header checks, and browser no-persistence
   checks are green.
