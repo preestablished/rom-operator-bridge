@@ -451,7 +451,7 @@ impl BridgeBackend for SyntheticBackend {
 
     fn inject_input(&self, request: InputScheduleRequest) -> BackendResult<InputScheduleReceipt> {
         let mut inner = self.inner.lock().expect("synthetic backend mutex poisoned");
-        let (run_id, frame_index, applied_inputs) = {
+        let (run_id, frame_index, previous_inputs, applied_inputs) = {
             let session = inner
                 .active
                 .as_ref()
@@ -461,17 +461,24 @@ impl BridgeBackend for SyntheticBackend {
                 return Err(BackendError::BackendUnavailable);
             }
             let frame_index = session.applied_inputs.len() as u64;
-            let mut applied_inputs = session.applied_inputs.clone();
+            let previous_inputs = session.applied_inputs.clone();
+            let mut applied_inputs = previous_inputs.clone();
             applied_inputs.push(AppliedInputFrame {
                 frame: request.target_frame,
                 pad_word: request.pad_word.raw(),
             });
-            (session.run_id.clone(), frame_index, applied_inputs)
+            (
+                session.run_id.clone(),
+                frame_index,
+                previous_inputs,
+                applied_inputs,
+            )
         };
 
         inner.write_input_artifacts(
             &self.private_config,
             &run_id,
+            &previous_inputs,
             &applied_inputs,
             PadLogEventRow::new(
                 &run_id,
@@ -588,6 +595,7 @@ impl SyntheticBackendInner {
         &mut self,
         private_config: &BridgePrivateConfig,
         run_id: &str,
+        previous_inputs: &[AppliedInputFrame],
         applied_inputs: &[AppliedInputFrame],
         event: PadLogEventRow,
     ) -> BackendResult<()> {
@@ -595,16 +603,26 @@ impl SyntheticBackendInner {
             return Ok(());
         }
 
+        let store = PrivateArtifactStore::new(private_config);
+        Self::write_padlog_snapshot(&store, run_id, applied_inputs)?;
+        if store.append_padlog_event(run_id, &event).is_err() {
+            let _ = Self::write_padlog_snapshot(&store, run_id, previous_inputs);
+            return Err(BackendError::BackendUnavailable);
+        }
+        Ok(())
+    }
+
+    fn write_padlog_snapshot(
+        store: &PrivateArtifactStore<'_>,
+        run_id: &str,
+        applied_inputs: &[AppliedInputFrame],
+    ) -> BackendResult<()> {
         let padlog = PadLog::from_applied_frames(applied_inputs.iter().cloned())
             .map_err(|_| BackendError::BackendUnavailable)?;
-        let store = PrivateArtifactStore::new(private_config);
         store
             .write_padlog(run_id, &padlog)
-            .map_err(|_| BackendError::BackendUnavailable)?;
-        store
-            .append_padlog_event(run_id, &event)
-            .map_err(|_| BackendError::BackendUnavailable)?;
-        Ok(())
+            .map(|_| ())
+            .map_err(|_| BackendError::BackendUnavailable)
     }
 }
 
