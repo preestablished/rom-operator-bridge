@@ -178,6 +178,15 @@ impl CaptureState {
         });
     }
 
+    fn active_job_id(&self, session_id: &str) -> Option<String> {
+        let inner = self.inner.lock().expect("capture mutex poisoned");
+        inner
+            .jobs
+            .values()
+            .find(|job| job.session_id == session_id && job.status.is_active())
+            .map(|job| job.job_id.clone())
+    }
+
     fn trigger(&self, input: CaptureTriggerInput) -> Result<CaptureJobView, CaptureTriggerError> {
         let mut inner = self.inner.lock().expect("capture mutex poisoned");
         let key = (input.session_id.clone(), input.idempotency_key.clone());
@@ -208,7 +217,7 @@ impl CaptureState {
             labelable: false,
             has_preview: false,
             error: None,
-            preview_png: input.preview.png_bytes,
+            preview_png: input.preview_png,
             durable: false,
         };
 
@@ -417,6 +426,7 @@ impl CaptureJobRecord {
     fn view(&self) -> CaptureJobView {
         CaptureJobView {
             job_id: self.job_id.clone(),
+            session_id: self.session_id.clone(),
             status: self.status,
             requested_frame: self.requested_frame,
             scheduled_frame: self.scheduled_frame,
@@ -468,6 +478,7 @@ struct CaptureRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CaptureJobView {
     job_id: String,
+    session_id: String,
     status: CaptureStatus,
     requested_frame: u64,
     scheduled_frame: u64,
@@ -513,7 +524,7 @@ struct CaptureTriggerInput {
     idempotency_key: String,
     observed_preview_frame: u64,
     current_frame: u64,
-    preview: FramePreview,
+    preview_png: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -822,10 +833,14 @@ async fn run_status(State(state): State<AppState>, headers: HeaderMap, uri: Uri)
         Err(response) => return response,
     };
 
-    let status = match state.backend.status(session_id) {
+    let status = match state.backend.status(session_id.clone()) {
         Ok(status) => status,
         Err(error) => return backend_error(error).into_response(),
     };
+    if status.session_id != session_id {
+        return auth_error(AuthError::BadSession).into_response();
+    }
+    let status = project_active_capture(&state, status);
 
     let mut response = Json(RunStatusResponse::from(status)).into_response();
     apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
@@ -943,7 +958,7 @@ async fn capture_trigger(
     if request.reason != CaptureReason::OperatorMark {
         return bad_request("Unsupported capture reason.").into_response();
     }
-    if request.observed_preview_frame > JSON_SAFE_U64_MAX {
+    if request.observed_preview_frame >= JSON_SAFE_U64_MAX {
         return bad_request("Preview frame unavailable.").into_response();
     }
     if !is_contract_id(&request.session_id) || !is_contract_uuid(&request.idempotency_key) {
@@ -953,33 +968,52 @@ async fn capture_trigger(
         return response;
     }
 
-    let preview = match state
-        .frame_previews
-        .get(&request.session_id, request.observed_preview_frame)
-    {
-        Some(preview) => preview,
-        None => {
-            let preview = match state.backend.framebuffer(request.session_id.clone()) {
-                Ok(preview) => preview,
-                Err(error) => return backend_error(error).into_response(),
-            };
-            if let Err(response) = validate_frame_preview(&request.session_id, &preview) {
-                return response;
-            }
-            state.frame_previews.remember(&preview);
-            preview
-        }
+    let status = match state.backend.status(request.session_id.clone()) {
+        Ok(status) => status,
+        Err(error) => return backend_error(error).into_response(),
     };
-    if preview.frame > JSON_SAFE_U64_MAX {
+    if status.session_id != request.session_id {
+        return auth_error(AuthError::BadSession).into_response();
+    }
+    if status.current_frame > JSON_SAFE_U64_MAX {
         return bad_request("Preview frame unavailable.").into_response();
     }
+
+    let preview_png = if request.observed_preview_frame < status.current_frame {
+        Vec::new()
+    } else {
+        if request.observed_preview_frame > status.current_frame {
+            return bad_request("Preview frame unavailable.").into_response();
+        }
+        let preview = match state
+            .frame_previews
+            .get(&request.session_id, request.observed_preview_frame)
+        {
+            Some(preview) => preview,
+            None => {
+                let preview = match state.backend.framebuffer(request.session_id.clone()) {
+                    Ok(preview) => preview,
+                    Err(error) => return backend_error(error).into_response(),
+                };
+                if let Err(response) = validate_frame_preview(&request.session_id, &preview) {
+                    return response;
+                }
+                state.frame_previews.remember(&preview);
+                preview
+            }
+        };
+        if preview.frame != request.observed_preview_frame || preview.frame > JSON_SAFE_U64_MAX {
+            return bad_request("Preview frame unavailable.").into_response();
+        }
+        preview.png_bytes
+    };
 
     let input = CaptureTriggerInput {
         session_id: request.session_id.clone(),
         idempotency_key: request.idempotency_key,
         observed_preview_frame: request.observed_preview_frame,
-        current_frame: preview.frame,
-        preview,
+        current_frame: status.current_frame,
+        preview_png,
     };
     let view = match state.captures.trigger(input) {
         Ok(view) => view,
@@ -993,6 +1027,7 @@ async fn capture_trigger(
             .into_response();
         }
     };
+    publish_capture_event(&state, &request.session_id, &view);
 
     let mut response = Json(CaptureTriggerResponse::from(view)).into_response();
     apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
@@ -1015,6 +1050,7 @@ async fn capture_job_status(
         Ok(view) => view,
         Err(error) => return backend_error(error).into_response(),
     };
+    publish_capture_event(&state, &view.session_id, &view);
 
     let mut response = Json(CaptureJobResponse::from(view)).into_response();
     apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
@@ -1175,6 +1211,7 @@ async fn events_ws_handshake(
     if status.session_id != session_id {
         return auth_error(AuthError::BadSession).into_response();
     }
+    let status = project_active_capture(&state, status);
 
     let ws_events = state.ws_events.clone();
     let sanitizer = state.config.private_config().public_sanitizer();
@@ -1414,6 +1451,7 @@ fn publish_run_boundary_event(state: &AppState, boundary: &crate::backend::RunBo
         boundary,
         state.backend.mode(),
         state.backend.capabilities(),
+        state.captures.active_job_id(&boundary.session_id),
         &sanitizer,
     );
 }
@@ -1426,6 +1464,27 @@ fn publish_stopped_event(state: &AppState, stopped: &crate::backend::StoppedSess
         state.backend.capabilities(),
         &sanitizer,
     );
+}
+
+fn publish_capture_event(state: &AppState, session_id: &str, view: &CaptureJobView) {
+    let sanitizer = state.config.private_config().public_sanitizer();
+    let _ = state.ws_events.publish_capture(
+        session_id,
+        view.job_id.clone(),
+        view.status.as_str(),
+        view.capture_id.clone(),
+        &sanitizer,
+    );
+}
+
+fn project_active_capture(
+    state: &AppState,
+    mut status: crate::backend::RunStatus,
+) -> crate::backend::RunStatus {
+    if status.active_capture_job_id.is_none() {
+        status.active_capture_job_id = state.captures.active_job_id(&status.session_id);
+    }
+    status
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

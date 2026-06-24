@@ -51,6 +51,7 @@ impl WsEventState {
         boundary: &RunBoundary,
         backend_mode: BackendMode,
         capabilities: BackendCapabilities,
+        active_capture_job_id: Option<String>,
         sanitizer: &PublicSanitizer,
     ) -> Result<(), WsEventError> {
         ensure_json_safe(boundary.current_frame)?;
@@ -74,7 +75,7 @@ impl WsEventState {
                     state: boundary.state,
                     current_frame: boundary.current_frame,
                     preview_stale: boundary.current_frame > 0,
-                    active_capture_job_id: None,
+                    active_capture_job_id,
                 }),
                 sanitizer,
             )?,
@@ -119,6 +120,30 @@ impl WsEventState {
         ];
         drop(inner);
         self.publish(messages);
+        Ok(())
+    }
+
+    pub(crate) fn publish_capture(
+        &self,
+        session_id: &str,
+        job_id: String,
+        status: &'static str,
+        capture_id: Option<String>,
+        sanitizer: &PublicSanitizer,
+    ) -> Result<(), WsEventError> {
+        let mut inner = self.inner.lock().expect("ws event mutex poisoned");
+        let message = inner.message(
+            session_id,
+            "capture_updated",
+            json!(CaptureUpdatedPayload {
+                job_id,
+                status,
+                capture_id,
+            }),
+            sanitizer,
+        )?;
+        drop(inner);
+        self.publish(vec![message]);
         Ok(())
     }
 

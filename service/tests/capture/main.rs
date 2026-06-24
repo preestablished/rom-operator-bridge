@@ -1,13 +1,14 @@
 use axum::{
     body::{Body, to_bytes},
     http::{
-        Method, Request, StatusCode,
+        HeaderName, HeaderValue, Method, Request, StatusCode,
         header::{
             ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, CONTENT_TYPE, COOKIE, ORIGIN, PRAGMA,
             SET_COOKIE, VARY,
         },
     },
 };
+use futures_util::StreamExt;
 use rom_operator_bridge_service::{
     api::{AppState, router},
     artifacts::RecentCapturesFile,
@@ -27,8 +28,17 @@ use serde_json::{Value, json};
 use std::{
     collections::VecDeque,
     fs,
+    net::SocketAddr,
     path::{Path, PathBuf},
     sync::Mutex,
+};
+use tokio::{
+    net::TcpListener,
+    time::{Duration, timeout},
+};
+use tokio_tungstenite::{
+    MaybeTlsStream, WebSocketStream, connect_async,
+    tungstenite::{Message, client::IntoClientRequest},
 };
 use tower::ServiceExt;
 
@@ -36,6 +46,9 @@ const GOOD_CREDENTIAL: &str = "operator-credential-from-test-source";
 const SESSION_SECRET: &str = "session-secret-from-test-source-32-bytes";
 const SESSION_ID: &str = "synthetic-session-capture";
 const RUN_ID: &str = "synthetic-run-capture";
+const JSON_SAFE_U64_MAX: u64 = 9_007_199_254_740_991;
+
+type TestSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 #[tokio::test]
 async fn trigger_is_idempotent_and_rejects_parallel_active_capture() {
@@ -53,6 +66,9 @@ async fn trigger_is_idempotent_and_rejects_parallel_active_capture() {
     assert_eq!(first["status"], "requested");
     assert_eq!(first["requested_frame"], 7);
     assert_eq!(first["scheduled_frame"], 8);
+
+    let status = request_json(app.clone(), runtime_get("/api/run/status", &cookie)).await;
+    assert_eq!(status["active_capture_job_id"], first["job_id"]);
 
     let same = trigger_capture(
         app.clone(),
@@ -83,6 +99,107 @@ async fn trigger_is_idempotent_and_rejects_parallel_active_capture() {
     assert_eq!(active_conflict.status(), StatusCode::CONFLICT);
     let error = json_body(active_conflict).await;
     assert_eq!(error["error"]["code"], "capture_in_progress");
+}
+
+#[tokio::test]
+async fn trigger_publishes_capture_updated_event_for_api_owned_jobs() {
+    let (_workspace, app, _private_root) = capture_app(CaptureBackend::new([7]));
+    let cookie = login_cookie(app.clone()).await;
+    let server = WsServer::start(app.clone()).await;
+    let mut ws = server.connect(&cookie).await;
+
+    let snapshot = read_events(&mut ws, 4).await;
+    assert_eq!(
+        event_types(&snapshot),
+        [
+            "session_updated",
+            "run_updated",
+            "label_updated",
+            "validation_updated"
+        ]
+    );
+
+    let trigger = trigger_capture(
+        app,
+        &cookie,
+        SESSION_ID,
+        "00000000-0000-4000-8000-000000000008",
+        7,
+    )
+    .await;
+    let updates = read_events(&mut ws, 1).await;
+
+    assert_eq!(updates[0]["type"], "capture_updated");
+    assert_eq!(updates[0]["payload"]["job_id"], trigger["job_id"]);
+    assert_eq!(updates[0]["payload"]["status"], "requested");
+    assert_eq!(updates[0]["payload"]["capture_id"], Value::Null);
+}
+
+#[tokio::test]
+async fn trigger_rejects_stale_cached_preview_and_future_or_overflow_frames() {
+    let (_workspace, app, _private_root) = capture_app(CaptureBackend::new([7, 10]));
+    let cookie = login_cookie(app.clone()).await;
+
+    let metadata = request_json(app.clone(), runtime_get("/api/frame/current", &cookie)).await;
+    assert_eq!(metadata["frame"], 7);
+
+    let failed = trigger_capture(
+        app.clone(),
+        &cookie,
+        SESSION_ID,
+        "00000000-0000-4000-8000-000000000005",
+        7,
+    )
+    .await;
+    assert_eq!(failed["status"], "failed");
+    let failed_job = request_json(
+        app.clone(),
+        runtime_get(
+            &format!(
+                "/api/capture/jobs/{}",
+                failed["job_id"].as_str().expect("failed job id")
+            ),
+            &cookie,
+        ),
+    )
+    .await;
+    assert_eq!(failed_job["error"]["code"], "frame_stale");
+    assert_eq!(failed_job["error"]["retryable"], true);
+
+    let future = app
+        .clone()
+        .oneshot(runtime_json_request(
+            Method::POST,
+            "/api/capture/trigger",
+            &cookie,
+            json!({
+                "schema_version": 1,
+                "session_id": SESSION_ID,
+                "idempotency_key": "00000000-0000-4000-8000-000000000006",
+                "observed_preview_frame": 99,
+                "reason": "operator_mark"
+            }),
+        ))
+        .await
+        .expect("future capture trigger runs");
+    assert_eq!(future.status(), StatusCode::BAD_REQUEST);
+
+    let boundary = app
+        .oneshot(runtime_json_request(
+            Method::POST,
+            "/api/capture/trigger",
+            &cookie,
+            json!({
+                "schema_version": 1,
+                "session_id": SESSION_ID,
+                "idempotency_key": "00000000-0000-4000-8000-000000000007",
+                "observed_preview_frame": JSON_SAFE_U64_MAX,
+                "reason": "operator_mark"
+            }),
+        ))
+        .await
+        .expect("boundary capture trigger runs");
+    assert_eq!(boundary.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -482,6 +599,74 @@ fn assert_matches_runtime_schema(json: &Value) {
     validator.validate(json).unwrap_or_else(|error| {
         panic!("runtime schema validation failed: {error}");
     });
+}
+
+struct WsServer {
+    addr: SocketAddr,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl WsServer {
+    async fn start(app: axum::Router) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener binds");
+        let addr = listener.local_addr().expect("listener addr is available");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server runs");
+        });
+
+        Self { addr, handle }
+    }
+
+    async fn connect(&self, cookie: &str) -> TestSocket {
+        let mut request = format!("ws://{}/ws/events", self.addr)
+            .into_client_request()
+            .expect("websocket request builds");
+        request
+            .headers_mut()
+            .insert("Origin", HeaderValue::from_static(ALLOWED_ORIGIN));
+        request.headers_mut().insert(
+            HeaderName::from_static("cookie"),
+            HeaderValue::from_str(cookie).expect("cookie header parses"),
+        );
+
+        connect_async(request)
+            .await
+            .map(|(socket, _)| socket)
+            .expect("websocket connects")
+    }
+}
+
+impl Drop for WsServer {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+async fn read_events(ws: &mut TestSocket, count: usize) -> Vec<Value> {
+    let mut messages = Vec::with_capacity(count);
+    for _ in 0..count {
+        let message = timeout(Duration::from_secs(2), ws.next())
+            .await
+            .expect("event message is available before timeout")
+            .expect("event message is available")
+            .expect("event message succeeds");
+        let Message::Text(text) = message else {
+            panic!("expected text websocket response");
+        };
+        let json: Value = serde_json::from_str(&text).expect("event json parses");
+        assert_matches_runtime_schema(&json);
+        messages.push(json);
+    }
+    messages
+}
+
+fn event_types(messages: &[Value]) -> Vec<&str> {
+    messages
+        .iter()
+        .map(|message| message["type"].as_str().expect("event type is string"))
+        .collect()
 }
 
 fn capture_app(backend: CaptureBackend) -> (tempfile::TempDir, axum::Router, PathBuf) {
