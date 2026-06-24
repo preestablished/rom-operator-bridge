@@ -28,6 +28,13 @@ import {
   type BackendMode,
   type SessionState
 } from "./runtimeContract";
+import {
+  buttonsFromStandardGamepad,
+  keyboardButtonForCode,
+  mergeInputButtons,
+  samePadButtons,
+  type NeutralizedDirection
+} from "./inputUx";
 import type { RuntimeConfig } from "./runtimeConfig";
 
 type OperatorViewModel = {
@@ -46,6 +53,7 @@ type OperatorViewModel = {
   capturePending: boolean;
   controlsDisabled: boolean;
   pressedButtons: PadButton[];
+  neutralizedDirections: NeutralizedDirection[];
   padlogTail: PadlogTailEntry[];
   config: RuntimeConfig;
   auth: AuthSessionState;
@@ -61,6 +69,7 @@ type OperatorRuntimeViewState = {
   sessionAction: SessionActionState;
   capturePending: boolean;
   pressedButtons: PadButton[];
+  neutralizedDirections: NeutralizedDirection[];
   padlogTail: PadlogTailEntry[];
 };
 
@@ -112,6 +121,7 @@ const INITIAL_VIEW_MODEL: Omit<OperatorViewModel, "config" | "auth"> = {
   capturePending: false,
   controlsDisabled: true,
   pressedButtons: [],
+  neutralizedDirections: [],
   padlogTail: [],
   preview: null
 };
@@ -125,6 +135,7 @@ const EMPTY_RUNTIME_VIEW: OperatorRuntimeViewState = {
   sessionAction: "idle",
   capturePending: false,
   pressedButtons: [],
+  neutralizedDirections: [],
   padlogTail: []
 };
 
@@ -162,6 +173,7 @@ export function renderOperatorApp(
     capturePending: view.capturePending,
     controlsDisabled,
     pressedButtons: view.pressedButtons,
+    neutralizedDirections: view.neutralizedDirections,
     padlogTail: view.padlogTail,
     config,
     auth,
@@ -219,7 +231,13 @@ export function renderOperatorApp(
           </ul>
         </article>
 
-        <article class="panel input-panel" aria-disabled="${model.controlsDisabled}">
+        <article
+          class="panel input-panel"
+          aria-disabled="${model.controlsDisabled}"
+          aria-label="Input surface"
+          tabindex="0"
+          data-input-focus-surface
+        >
           <div class="panel-header">
             <div>
               <p class="eyebrow">Input</p>
@@ -242,6 +260,7 @@ export function renderOperatorApp(
           <div class="pressed-summary" aria-label="Pressed buttons">
             ${renderPressedButtons(model.pressedButtons)}
           </div>
+          ${renderNeutralizedDirections(model.neutralizedDirections)}
           ${renderPadlogTail(model.padlogTail)}
         </article>
 
@@ -289,12 +308,17 @@ export function mountOperatorApp(
   let capturePending = false;
   let captureRequestSeq = 0;
   let pressedButtons: PadButton[] = [];
+  let manualButtons: PadButton[] = [];
+  let keyboardButtons: PadButton[] = [];
   let keyboardPadButtons: PadButton[] = [];
+  let gamepadButtons: PadButton[] = [];
+  let neutralizedDirections: NeutralizedDirection[] = [];
   let padlogTail: PadlogTailEntry[] = [];
   let eventSocket: ReturnType<RuntimeEventClient["eventSocket"]> | null = null;
   let eventSessionId: string | null = null;
   let inputSocket: ReturnType<RuntimeInputClient["inputSocket"]> | null = null;
   let inputSessionId: string | null = null;
+  let gamepadPollCancel: (() => void) | null = null;
   root.innerHTML = '<div data-operator-app></div><p class="session-live" aria-live="polite"></p>';
   const appRegion = root.querySelector<HTMLElement>("[data-operator-app]");
   const liveRegion = root.querySelector<HTMLElement>(".session-live");
@@ -303,6 +327,7 @@ export function mountOperatorApp(
     if (!appRegion || !liveRegion) {
       return;
     }
+    const shouldRestoreInputFocus = !focusTarget && inputSurfaceFocused();
     appRegion.innerHTML = renderOperatorApp(config, auth, {
       validationState,
       preview,
@@ -312,11 +337,14 @@ export function mountOperatorApp(
       sessionAction,
       capturePending,
       pressedButtons,
+      neutralizedDirections,
       padlogTail
     });
     liveRegion.textContent = sessionStatusLabel(auth);
     if (focusTarget) {
       focusSessionTarget(appRegion, focusTarget);
+    } else if (shouldRestoreInputFocus) {
+      focusInputSurface(appRegion);
     }
   };
 
@@ -338,7 +366,11 @@ export function mountOperatorApp(
       capturePending = false;
       captureRequestSeq += 1;
       pressedButtons = [];
+      manualButtons = [];
+      keyboardButtons = [];
       keyboardPadButtons = [];
+      gamepadButtons = [];
+      neutralizedDirections = [];
       padlogTail = [];
     }
     sessionAction = "idle";
@@ -356,9 +388,8 @@ export function mountOperatorApp(
   }
 
   function closeInputStream(sendRelease = false) {
-    if (sendRelease && pressedButtons.length > 0) {
-      sendInputState([]);
-    }
+    clearInputSources(sendRelease);
+    stopGamepadPolling();
     inputSocket?.close();
     inputSocket = null;
     inputSessionId = null;
@@ -406,8 +437,13 @@ export function mountOperatorApp(
     inputSessionId = nextSessionId;
     inputSocket = eventClient.inputSocket(nextSessionId, "combined", {
       onMessage: handleRuntimeEvent,
-      onError: () => undefined
+      onError: () => undefined,
+      onReconnect: () => {
+        clearInputSources(false);
+        render();
+      }
     });
+    startGamepadPolling();
   }
 
   function handleRuntimeEvent(message: RuntimeWsMessage) {
@@ -500,8 +536,7 @@ export function mountOperatorApp(
       captureError = null;
       capturePending = false;
       captureRequestSeq += 1;
-      pressedButtons = [];
-      keyboardPadButtons = [];
+      clearInputSources(false);
       padlogTail = [];
       render("credential");
       return;
@@ -532,7 +567,7 @@ export function mountOperatorApp(
   }
 
   function applyInputReject(message: InputRejectMessage) {
-    pressedButtons = [];
+    clearInputSources(false);
     padlogTail = applyInputRejectToState(message, padlogTail);
     auth = { ...auth, error: message.payload.error };
   }
@@ -724,9 +759,8 @@ export function mountOperatorApp(
     }
 
     event.preventDefault();
-    pressedButtons = appendPadButton(pressedButtons, padButton);
-    sendInputState(pressedButtons);
-    render();
+    manualButtons = appendPadButton(manualButtons, padButton);
+    publishMergedInputState();
   });
 
   root.addEventListener("keydown", (event) => {
@@ -745,11 +779,47 @@ export function mountOperatorApp(
     }
 
     event.preventDefault();
-    pressedButtons = appendPadButton(pressedButtons, padButton);
+    manualButtons = appendPadButton(manualButtons, padButton);
     keyboardPadButtons = appendPadButton(keyboardPadButtons, padButton);
-    sendInputState(pressedButtons);
-    render();
+    publishMergedInputState();
+    return;
   });
+
+  root.addEventListener("keydown", (event) => {
+    const button = keyboardButtonForCode(event.code);
+    if (
+      !button ||
+      !inputSurfaceFocused() ||
+      isTextInputTarget(event.target) ||
+      isVisiblePadButtonTarget(event.target)
+    ) {
+      return;
+    }
+
+    event.preventDefault();
+    if (event.repeat || inputControlsDisabled()) {
+      return;
+    }
+    keyboardButtons = appendPadButton(keyboardButtons, button);
+    publishMergedInputState();
+  });
+
+  const releaseMappedKeyboardButton = (event: KeyboardEvent) => {
+    const button = keyboardButtonForCode(event.code);
+    if (!button || isTextInputTarget(event.target) || isVisiblePadButtonTarget(event.target)) {
+      return;
+    }
+
+    if (inputSurfaceFocused() || keyboardButtons.includes(button)) {
+      event.preventDefault();
+    }
+    if (!keyboardButtons.includes(button)) {
+      return;
+    }
+    keyboardButtons = removePadButton(keyboardButtons, button);
+    publishMergedInputState();
+  };
+  globalThis.addEventListener?.("keyup", releaseMappedKeyboardButton);
 
   const releaseKeyboardPadButtons = (event: KeyboardEvent) => {
     if (!isPadActivationKey(event.key) || keyboardPadButtons.length === 0) {
@@ -757,25 +827,32 @@ export function mountOperatorApp(
     }
 
     event.preventDefault();
-    pressedButtons = removePadButtons(pressedButtons, keyboardPadButtons);
+    manualButtons = removePadButtons(manualButtons, keyboardPadButtons);
     keyboardPadButtons = [];
-    sendInputState(pressedButtons);
-    render();
+    publishMergedInputState();
   };
   globalThis.addEventListener?.("keyup", releaseKeyboardPadButtons);
 
   const releasePadButtons = () => {
-    if (pressedButtons.length === 0) {
+    if (manualButtons.length === 0) {
       return;
     }
-    pressedButtons = [];
+    manualButtons = [];
     keyboardPadButtons = [];
-    sendInputState([]);
-    render();
+    publishMergedInputState();
   };
   root.addEventListener("pointercancel", releasePadButtons);
   root.addEventListener("pointerleave", releasePadButtons);
   globalThis.addEventListener?.("pointerup", releasePadButtons);
+  globalThis.addEventListener?.("gamepadconnected", () => startGamepadPolling());
+  globalThis.addEventListener?.("gamepaddisconnected", () => {
+    stopGamepadPolling();
+    if (gamepadButtons.length === 0) {
+      return;
+    }
+    gamepadButtons = [];
+    publishMergedInputState();
+  });
 
   async function transitionRun(
     nextAction: Exclude<SessionActionState, "idle">,
@@ -905,6 +982,111 @@ export function mountOperatorApp(
     });
   }
 
+  function publishMergedInputState() {
+    const previousButtons = pressedButtons;
+    const previousNeutralizedDirections = neutralizedDirections;
+    const merged = mergeInputButtons([manualButtons, keyboardButtons, gamepadButtons]);
+    if (
+      samePadButtons(previousButtons, merged.buttons) &&
+      sameNeutralizedDirections(previousNeutralizedDirections, merged.neutralizedDirections)
+    ) {
+      return;
+    }
+    pressedButtons = merged.buttons;
+    neutralizedDirections = merged.neutralizedDirections;
+    sendInputState(pressedButtons);
+    render();
+  }
+
+  function clearInputSources(sendRelease = true): boolean {
+    const hadInput = pressedButtons.length > 0 || neutralizedDirections.length > 0;
+    manualButtons = [];
+    keyboardButtons = [];
+    keyboardPadButtons = [];
+    gamepadButtons = [];
+    pressedButtons = [];
+    neutralizedDirections = [];
+    if (sendRelease && hadInput) {
+      sendInputState([]);
+    }
+    return hadInput;
+  }
+
+  function startGamepadPolling() {
+    if (gamepadPollCancel || !canPollGamepad()) {
+      return;
+    }
+    const requestAnimationFrame = globalThis.requestAnimationFrame?.bind(globalThis);
+    const cancelAnimationFrame = globalThis.cancelAnimationFrame?.bind(globalThis);
+    if (!requestAnimationFrame || !cancelAnimationFrame) {
+      return;
+    }
+
+    let frameId = 0;
+    let active = true;
+    const poll = () => {
+      if (!active) {
+        return;
+      }
+      if (!canPollGamepad()) {
+        gamepadPollCancel = null;
+        if (gamepadButtons.length > 0) {
+          gamepadButtons = [];
+          publishMergedInputState();
+        }
+        return;
+      }
+
+      const nextButtons = readGamepadButtons();
+      if (!samePadButtons(gamepadButtons, nextButtons)) {
+        gamepadButtons = nextButtons;
+        publishMergedInputState();
+      }
+      frameId = requestAnimationFrame(poll);
+    };
+
+    frameId = requestAnimationFrame(poll);
+    gamepadPollCancel = () => {
+      active = false;
+      cancelAnimationFrame(frameId);
+      gamepadPollCancel = null;
+    };
+  }
+
+  function stopGamepadPolling() {
+    gamepadPollCancel?.();
+  }
+
+  function canPollGamepad(): boolean {
+    return (
+      auth.status === "active" &&
+      auth.session.state === "running" &&
+      !auth.session.preview_stale &&
+      !preview?.stale &&
+      currentFocusState() === "focused" &&
+      inputSurfaceFocused()
+    );
+  }
+
+  function readGamepadButtons(): PadButton[] {
+    const getGamepads = globalThis.navigator?.getGamepads?.bind(globalThis.navigator);
+    const gamepads = getGamepads?.() ?? [];
+    const gamepad = Array.from(gamepads).find(
+      (candidate): candidate is Gamepad =>
+        Boolean(candidate && candidate.mapping === "standard" && candidate.connected !== false)
+    );
+    return buttonsFromStandardGamepad(gamepad);
+  }
+
+  function inputSurfaceFocused(): boolean {
+    const activeElement = globalThis.document?.activeElement;
+    return (
+      activeElement instanceof Element &&
+      root.contains(activeElement) &&
+      Boolean(activeElement.closest("[data-input-focus-surface]"))
+    );
+  }
+
   root.addEventListener(
     "error",
     (event) => {
@@ -923,29 +1105,57 @@ export function mountOperatorApp(
     true
   );
 
-  const updateFocusState = () => {
-    const nextFocusState = currentFocusState();
-    if (focusState === nextFocusState) {
-      return;
-    }
+  const updateFocusState = (forcedFocusState?: FocusState) => {
+    const nextFocusState = forcedFocusState ?? operatorFocusState();
+    const focusChanged = focusState !== nextFocusState;
     focusState = nextFocusState;
-    if (focusState === "hidden") {
-      sendInputState([]);
-      pressedButtons = [];
-      keyboardPadButtons = [];
+    let inputStateCleared = false;
+    if (focusState === "hidden" || focusState === "blurred") {
+      inputStateCleared = clearInputSources();
+      stopGamepadPolling();
+    } else {
+      startGamepadPolling();
     }
-    render();
+    if (focusChanged || inputStateCleared) {
+      render();
+    }
   };
-  globalThis.addEventListener?.("focus", updateFocusState);
-  globalThis.addEventListener?.("blur", updateFocusState);
-  globalThis.document?.addEventListener?.("visibilitychange", updateFocusState);
-  globalThis.addEventListener?.("pagehide", updateFocusState);
+  const queueFocusStateUpdate = () => {
+    globalThis.queueMicrotask?.(() => updateFocusState());
+  };
+  root.addEventListener("focusin", () => updateFocusState());
+  root.addEventListener("focusout", queueFocusStateUpdate);
+  globalThis.addEventListener?.("focus", () => updateFocusState());
+  globalThis.addEventListener?.("blur", () => updateFocusState("blurred"));
+  globalThis.document?.addEventListener?.("visibilitychange", () => updateFocusState());
+  globalThis.addEventListener?.("pagehide", () => updateFocusState("hidden"));
 
   render("credential");
   const refreshSeq = ++authRequestSeq;
   refreshSession(auth, client).then((next) => {
     applyAuthResult(refreshSeq, next);
   });
+}
+
+function sameNeutralizedDirections(
+  left: NeutralizedDirection[],
+  right: NeutralizedDirection[]
+): boolean {
+  if (left.length !== right.length) {
+    return false;
+  }
+  return left.every((direction, index) => direction === right[index]);
+}
+
+function operatorFocusState(): FocusState {
+  const baseFocusState = currentFocusState();
+  if (baseFocusState !== "focused") {
+    return baseFocusState;
+  }
+  const activeElement = globalThis.document?.activeElement;
+  return activeElement instanceof Element && activeElement.closest("[data-input-focus-surface]")
+    ? "focused"
+    : "blurred";
 }
 
 function applyInputAckToState(
@@ -1199,6 +1409,15 @@ function renderPressedButtons(buttons: PadButton[]): string {
   return `<span>Pressed: ${buttons.map(escapeHtml).join(", ")}</span>`;
 }
 
+function renderNeutralizedDirections(directions: NeutralizedDirection[]): string {
+  if (directions.length === 0) {
+    return "";
+  }
+  return `<p class="neutralized-summary" aria-label="Neutralized directions">Neutralized: ${directions
+    .map(escapeHtml)
+    .join(", ")}</p>`;
+}
+
 function renderPadlogTail(entries: PadlogTailEntry[]): string {
   if (entries.length === 0) {
     return `
@@ -1308,6 +1527,24 @@ function focusSessionTarget(root: HTMLElement, target: "alert" | "credential" | 
     logout: "[data-session-action='logout']"
   }[target];
   root.querySelector<HTMLElement>(selector)?.focus();
+}
+
+function focusInputSurface(root: HTMLElement): void {
+  root.querySelector<HTMLElement>("[data-input-focus-surface]")?.focus({ preventScroll: true });
+}
+
+function isTextInputTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof Element)) {
+    return false;
+  }
+  return Boolean(target.closest("input, textarea, select, [contenteditable='true']"));
+}
+
+function isVisiblePadButtonTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof Element)) {
+    return false;
+  }
+  return Boolean(target.closest("[data-pad-button]"));
 }
 
 function runtimeStat(label: string, value: string): string {
