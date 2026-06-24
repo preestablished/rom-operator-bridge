@@ -7,8 +7,8 @@ use crate::{
         validate_origin, validate_runtime_request,
     },
     backend::{
-        BackendError, BackendMode, BridgeBackend, FramePreview, RealBackendUnavailable, StopReason,
-        SyntheticBackend,
+        BackendCapabilities, BackendError, BackendMode, BridgeBackend, FramePreview,
+        RealBackendUnavailable, StopReason, SyntheticBackend,
     },
     config::ServiceConfig,
     input::{PAD_LAYOUT_ID, PAD_LAYOUT_VERSION},
@@ -55,13 +55,19 @@ pub struct AppState {
     config: ServiceConfig,
     backend: Arc<dyn BridgeBackend>,
     auth: AuthState,
-    runtime_session: Arc<Mutex<Option<String>>>,
+    runtime_session: Arc<Mutex<Option<ActiveRuntimeSession>>>,
     captures: CaptureState,
     labels: LabelState,
     validation: ValidationStatusState,
     frame_previews: FramePreviewState,
     ws_events: WsEventState,
     ws_input: WsInputState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveRuntimeSession {
+    session_id: String,
+    capabilities: BackendCapabilities,
 }
 
 impl AppState {
@@ -282,6 +288,7 @@ impl CaptureState {
             error: None,
             preview_png: input.preview_png,
             durable: false,
+            features: None,
         };
 
         if input.observed_preview_frame < input.current_frame {
@@ -408,6 +415,7 @@ impl CaptureState {
             job.labelable = labelable;
             job.has_preview = true;
             job.durable = true;
+            job.features = synthetic_capture_features(&capture_id, job.scheduled_frame, labelable);
             (job.view(), job.job_id.clone())
         };
         inner.capture_order.push_front(capture_id.clone());
@@ -451,6 +459,17 @@ impl CaptureState {
         Some(job.detail())
     }
 
+    fn features(&self, capture_id: &str) -> Option<CaptureFeaturesView> {
+        let inner = self.inner.lock().expect("capture mutex poisoned");
+        let record = inner.captures.get(capture_id)?;
+        let job = inner.jobs.get(&record.job_id)?;
+        Some(CaptureFeaturesView {
+            capture_id: capture_id.to_string(),
+            available: job.features.is_some(),
+            features: job.features.clone().unwrap_or_default(),
+        })
+    }
+
     fn preview(&self, capture_id: &str) -> Option<Vec<u8>> {
         let inner = self.inner.lock().expect("capture mutex poisoned");
         let record = inner.captures.get(capture_id)?;
@@ -483,6 +502,7 @@ struct CaptureJobRecord {
     error: Option<ErrorObject>,
     preview_png: Vec<u8>,
     durable: bool,
+    features: Option<Vec<CaptureFeatureValue>>,
 }
 
 impl CaptureJobRecord {
@@ -521,7 +541,7 @@ impl CaptureJobRecord {
             status: self.status,
             labelable: self.labelable,
             preview_image_url: format!("/api/capture/{capture_id}/preview"),
-            privileged_features_available: false,
+            privileged_features_available: self.features.is_some(),
             labels: Vec::new(),
             sanitized_provenance: SanitizedProvenance {
                 capture_source: "synthetic",
@@ -581,6 +601,19 @@ struct CaptureDetailView {
     sanitized_provenance: SanitizedProvenance,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct CaptureFeaturesView {
+    capture_id: String,
+    available: bool,
+    features: Vec<CaptureFeatureValue>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct CaptureFeatureValue {
+    name: String,
+    value: f64,
+}
+
 #[derive(Debug, Clone)]
 struct CaptureTriggerInput {
     session_id: String,
@@ -614,6 +647,34 @@ impl CaptureStatus {
     fn is_active(self) -> bool {
         matches!(self, Self::Requested | Self::Capturing)
     }
+}
+
+fn synthetic_capture_features(
+    capture_id: &str,
+    scheduled_frame: u64,
+    labelable: bool,
+) -> Option<Vec<CaptureFeatureValue>> {
+    if !labelable {
+        return None;
+    }
+    let capture_bucket = capture_id
+        .rsplit_once('-')
+        .and_then(|(_, suffix)| suffix.parse::<u64>().ok())
+        .unwrap_or(0);
+    Some(vec![
+        CaptureFeatureValue {
+            name: "screen.room_id".to_string(),
+            value: (capture_bucket % 8) as f64,
+        },
+        CaptureFeatureValue {
+            name: "player.health".to_string(),
+            value: ((scheduled_frame % 10) as f64) / 10.0,
+        },
+        CaptureFeatureValue {
+            name: "encounter.phase".to_string(),
+            value: ((scheduled_frame / 2) % 4) as f64,
+        },
+    ])
 }
 
 #[derive(Debug, Clone)]
@@ -675,6 +736,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/capture/{capture_id}",
             get(capture_detail).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/capture/{capture_id}/features",
+            get(capture_features).fallback(method_not_allowed),
         )
         .route(
             "/api/capture/{capture_id}/preview",
@@ -741,6 +806,13 @@ async fn start_session(
         .into_response();
     }
 
+    let requested_capabilities = match requested_capabilities(&request.requested_capabilities) {
+        Ok(capabilities) => capabilities,
+        Err(response) => return response,
+    };
+    let granted_capabilities =
+        grant_capabilities(state.backend.capabilities(), requested_capabilities);
+
     let operator_session = match state
         .auth
         .login(state.config.private_config(), &request.operator_credential)
@@ -757,7 +829,7 @@ async fn start_session(
     let backend_session = match state
         .backend
         .start_session(crate::backend::StartBackendSession {
-            requested_capabilities: state.backend.capabilities(),
+            requested_capabilities: granted_capabilities,
         }) {
         Ok(session) => session,
         Err(_) => {
@@ -776,7 +848,10 @@ async fn start_session(
     *state
         .runtime_session
         .lock()
-        .expect("runtime session mutex poisoned") = Some(session_id);
+        .expect("runtime session mutex poisoned") = Some(ActiveRuntimeSession {
+        session_id,
+        capabilities: granted_capabilities,
+    });
     state
         .frame_previews
         .reset_session(&backend_session.session_id);
@@ -796,7 +871,7 @@ async fn start_session(
             layout_id: PAD_LAYOUT_ID,
             layout_version: PAD_LAYOUT_VERSION,
         },
-        capabilities: backend_session.capabilities,
+        capabilities: granted_capabilities,
     })
     .into_response();
     apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
@@ -813,7 +888,7 @@ async fn session_status(State(state): State<AppState>, headers: HeaderMap, uri: 
         return response;
     }
 
-    let Some(session_id) = state
+    let Some(active_session) = state
         .runtime_session
         .lock()
         .expect("runtime session mutex poisoned")
@@ -822,7 +897,7 @@ async fn session_status(State(state): State<AppState>, headers: HeaderMap, uri: 
         return auth_error(AuthError::MissingSession).into_response();
     };
 
-    let status = match state.backend.status(session_id) {
+    let status = match state.backend.status(active_session.session_id) {
         Ok(status) => status,
         Err(_) => {
             return AppError::new(
@@ -1216,6 +1291,44 @@ async fn capture_detail(
     response
 }
 
+async fn capture_features(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(capture_id): Path<String>,
+) -> Response {
+    if let Err(response) = authenticate_runtime_request(&state, &headers, &uri) {
+        return response;
+    }
+    if !active_session_capabilities(&state)
+        .is_some_and(|capabilities| capabilities.privileged_features)
+    {
+        return AppError::new(
+            StatusCode::FORBIDDEN,
+            ErrorCode::AuthRejected,
+            "Privileged feature access is not granted.",
+            false,
+        )
+        .into_response();
+    }
+    if !is_contract_id(&capture_id) {
+        return bad_request("Invalid capture id.").into_response();
+    }
+    let Some(view) = state.captures.features(&capture_id) else {
+        return AppError::new(
+            StatusCode::NOT_FOUND,
+            ErrorCode::BadRequest,
+            "Capture not found.",
+            false,
+        )
+        .into_response();
+    };
+
+    let mut response = Json(CaptureFeaturesResponse::from(view)).into_response();
+    apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
+    response
+}
+
 async fn capture_preview(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1344,7 +1457,7 @@ async fn input_ws_handshake(
         return response;
     }
 
-    let Some(session_id) = state
+    let Some(active_session) = state
         .runtime_session
         .lock()
         .expect("runtime session mutex poisoned")
@@ -1352,6 +1465,7 @@ async fn input_ws_handshake(
     else {
         return auth_error(AuthError::MissingSession).into_response();
     };
+    let session_id = active_session.session_id;
 
     let backend = state.backend.clone();
     let ws_input = state.ws_input.clone();
@@ -1606,16 +1720,18 @@ fn is_contract_uuid(candidate: &str) -> bool {
 }
 
 fn cleanup_runtime_session(state: &AppState, reason: StopReason) -> Result<(), BackendError> {
-    let session_id = state
+    let active_session = state
         .runtime_session
         .lock()
         .expect("runtime session mutex poisoned")
         .clone();
-    let Some(session_id) = session_id else {
+    let Some(active_session) = active_session else {
         return Ok(());
     };
 
-    let stopped = state.backend.stop_session(session_id, reason)?;
+    let stopped = state
+        .backend
+        .stop_session(active_session.session_id, reason)?;
     publish_stopped_event(state, &stopped);
     *state
         .runtime_session
@@ -1635,7 +1751,7 @@ fn publish_run_boundary_event(state: &AppState, boundary: &crate::backend::RunBo
     let _ = state.ws_events.publish_boundary(
         boundary,
         state.backend.mode(),
-        state.backend.capabilities(),
+        event_capabilities(state),
         state.captures.active_job_id(&boundary.session_id),
         &sanitizer,
     );
@@ -1646,7 +1762,7 @@ fn publish_stopped_event(state: &AppState, stopped: &crate::backend::StoppedSess
     let _ = state.ws_events.publish_stopped(
         stopped,
         state.backend.mode(),
-        state.backend.capabilities(),
+        event_capabilities(state),
         &sanitizer,
     );
 }
@@ -1660,6 +1776,47 @@ fn publish_capture_event(state: &AppState, session_id: &str, view: &CaptureJobVi
         view.capture_id.clone(),
         &sanitizer,
     );
+}
+
+fn requested_capabilities(requested: &[String]) -> Result<BackendCapabilities, Response> {
+    let mut capabilities = BackendCapabilities {
+        input: false,
+        preview: false,
+        capture: false,
+        labels: false,
+        privileged_features: false,
+        validation_runner: false,
+    };
+    let mut seen = BTreeSet::new();
+    for capability in requested {
+        if !seen.insert(capability.as_str()) {
+            return Err(bad_request("Invalid requested capabilities.").into_response());
+        }
+        match capability.as_str() {
+            "input" => capabilities.input = true,
+            "preview" => capabilities.preview = true,
+            "capture" => capabilities.capture = true,
+            "labels" => capabilities.labels = true,
+            "privileged_features" => capabilities.privileged_features = true,
+            "validation_runner" => capabilities.validation_runner = true,
+            _ => return Err(bad_request("Invalid requested capabilities.").into_response()),
+        }
+    }
+    Ok(capabilities)
+}
+
+fn grant_capabilities(
+    supported: BackendCapabilities,
+    requested: BackendCapabilities,
+) -> BackendCapabilities {
+    BackendCapabilities {
+        input: supported.input && requested.input,
+        preview: supported.preview && requested.preview,
+        capture: supported.capture && requested.capture,
+        labels: supported.labels && requested.labels,
+        privileged_features: supported.privileged_features && requested.privileged_features,
+        validation_runner: supported.validation_runner && requested.validation_runner,
+    }
 }
 
 fn publish_label_event(state: &AppState, label_revision: u64, applied: bool) {
@@ -1690,6 +1847,9 @@ fn project_active_capture(
     state: &AppState,
     mut status: crate::backend::RunStatus,
 ) -> crate::backend::RunStatus {
+    if let Some(capabilities) = active_session_capabilities(state) {
+        status.capabilities = capabilities;
+    }
     if status.active_capture_job_id.is_none() {
         status.active_capture_job_id = state.captures.active_job_id(&status.session_id);
     }
@@ -1707,8 +1867,22 @@ fn active_session_id(state: &AppState) -> Result<String, Response> {
         .runtime_session
         .lock()
         .expect("runtime session mutex poisoned")
-        .clone()
+        .as_ref()
+        .map(|session| session.session_id.clone())
         .ok_or_else(|| auth_error(AuthError::MissingSession).into_response())
+}
+
+fn active_session_capabilities(state: &AppState) -> Option<BackendCapabilities> {
+    state
+        .runtime_session
+        .lock()
+        .expect("runtime session mutex poisoned")
+        .as_ref()
+        .map(|session| session.capabilities)
+}
+
+fn event_capabilities(state: &AppState) -> BackendCapabilities {
+    active_session_capabilities(state).unwrap_or_else(|| state.backend.capabilities())
 }
 
 fn ensure_active_session(state: &AppState, session_id: &str) -> Result<(), Response> {
@@ -1961,6 +2135,44 @@ impl From<CaptureDetailView> for CaptureDetailResponse {
             privileged_features_available: view.privileged_features_available,
             labels: view.labels,
             sanitized_provenance: view.sanitized_provenance,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CaptureFeaturesResponse {
+    pub schema_version: u16,
+    pub capture_id: String,
+    pub available: bool,
+    pub features: Vec<CaptureFeatureResponse>,
+}
+
+impl From<CaptureFeaturesView> for CaptureFeaturesResponse {
+    fn from(view: CaptureFeaturesView) -> Self {
+        Self {
+            schema_version: RUNTIME_API_SCHEMA_VERSION,
+            capture_id: view.capture_id,
+            available: view.available,
+            features: view
+                .features
+                .into_iter()
+                .map(CaptureFeatureResponse::from)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CaptureFeatureResponse {
+    pub name: String,
+    pub value: f64,
+}
+
+impl From<CaptureFeatureValue> for CaptureFeatureResponse {
+    fn from(feature: CaptureFeatureValue) -> Self {
+        Self {
+            name: feature.name,
+            value: feature.value,
         }
     }
 }

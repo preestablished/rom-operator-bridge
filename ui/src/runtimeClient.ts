@@ -30,6 +30,7 @@ const RFC3339_PATTERN =
 const FRAME_IMAGE_PATTERN = /^\/api\/frame\/current\/image(?:\?frame=\d+)?$/;
 const CAPTURE_PREVIEW_PATTERN =
   /^\/api\/capture\/[A-Za-z0-9._:-]+\/preview(?:\?frame=\d+)?$/;
+const FEATURE_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9 ._:-]{0,127}$/;
 const PAD_WORD_MAX = 0x0fff;
 const WS_OPEN = 1;
 const INBOUND_WS_MESSAGE_TYPES = [
@@ -207,6 +208,18 @@ export type CaptureDetailResponse = {
     capture_spec_hash: string;
     map_hash: string;
   };
+};
+
+export type CaptureFeature = {
+  name: string;
+  value: number;
+};
+
+export type CaptureFeaturesResponse = {
+  schema_version: 1;
+  capture_id: string;
+  available: boolean;
+  features: CaptureFeature[];
 };
 
 export type ChangedOffsetRange = {
@@ -425,6 +438,10 @@ export class RuntimeApiClient {
 
   captureDetail(captureId: string): Promise<CaptureDetailResponse> {
     return this.request(`/capture/${encodeURIComponent(captureId)}`, parseCaptureDetailResponse);
+  }
+
+  captureFeatures(captureId: string): Promise<CaptureFeaturesResponse> {
+    return this.request(`/capture/${encodeURIComponent(captureId)}/features`, parseCaptureFeaturesResponse);
   }
 
   updateLabels(input: {
@@ -1130,6 +1147,27 @@ function parseCaptureDetailResponse(value: unknown): CaptureDetailResponse {
   };
 }
 
+function parseCaptureFeaturesResponse(value: unknown): CaptureFeaturesResponse {
+  const record = schemaRecord(value);
+  assertOnlyFields(record, ["schema_version", "capture_id", "available", "features"]);
+  return {
+    schema_version: RUNTIME_API_SCHEMA_VERSION,
+    capture_id: idField(record, "capture_id"),
+    available: booleanField(record, "available"),
+    features: maxLengthArray(
+      arrayField(record, "features").map((entry) => {
+        const feature = recordValue(entry);
+        assertOnlyFields(feature, ["name", "value"]);
+        return {
+          name: featureNameValue(feature["name"]),
+          value: finiteNumberField(feature, "value")
+        };
+      }),
+      256
+    )
+  };
+}
+
 function parseLabelsResponse(value: unknown): LabelsResponse {
   const record = schemaRecord(value);
   assertOnlyFields(record, ["schema_version", "applied", "label_revision", "conflicts"]);
@@ -1550,6 +1588,14 @@ function boundedStringValue(value: unknown, minLength: number, maxLength: number
   return value;
 }
 
+function featureNameValue(value: unknown): string {
+  const text = boundedStringValue(value, 1, 128);
+  if (!FEATURE_NAME_PATTERN.test(text)) {
+    throw new Error("expected feature name");
+  }
+  return text;
+}
+
 function stringValue(value: unknown): string {
   if (typeof value !== "string" || value.length === 0) {
     throw new Error("expected string");
@@ -1574,6 +1620,14 @@ function u64Field(record: JsonRecord, key: string): number {
 
 function nullableU64Field(record: JsonRecord, key: string): number | null {
   return record[key] === null ? null : u64Field(record, key);
+}
+
+function finiteNumberField(record: JsonRecord, key: string): number {
+  const value = record[key];
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new Error("expected finite number");
+  }
+  return value;
 }
 
 function boundedIntegerField(record: JsonRecord, key: string, min: number, max: number): number {

@@ -248,7 +248,9 @@ async fn stopping_session_clears_active_capture_for_reused_session_id() {
 #[tokio::test]
 async fn capture_completes_to_recent_detail_and_preview_after_durable_private_index() {
     let (_workspace, app, private_root) = capture_app(CaptureBackend::new([3, 4]));
-    let cookie = login_cookie(app.clone()).await;
+    let cookie =
+        login_cookie_with_capabilities(app.clone(), &["capture", "preview", "privileged_features"])
+            .await;
 
     let first = complete_capture(
         app.clone(),
@@ -311,7 +313,7 @@ async fn capture_completes_to_recent_detail_and_preview_after_durable_private_in
     .await;
     assert_matches_runtime_schema(&detail);
     assert_eq!(detail["capture_id"], second_capture_id);
-    assert_eq!(detail["privileged_features_available"], false);
+    assert_eq!(detail["privileged_features_available"], true);
     assert_eq!(
         detail["sanitized_provenance"]["capture_source"],
         "synthetic"
@@ -322,6 +324,52 @@ async fn capture_completes_to_recent_detail_and_preview_after_durable_private_in
         .with_forbidden_literal(SESSION_SECRET)
         .inspect_json(&detail)
         .expect("capture detail is public-safe");
+
+    let features_response = app
+        .clone()
+        .oneshot(runtime_get(
+            &format!("/api/capture/{second_capture_id}/features"),
+            &cookie,
+        ))
+        .await
+        .expect("capture features request runs");
+    assert_eq!(features_response.status(), StatusCode::OK);
+    assert_no_store_headers(features_response.headers());
+    let features = json_body(features_response).await;
+    assert_matches_runtime_schema(&features);
+    assert_eq!(features["capture_id"], second_capture_id);
+    assert_eq!(features["available"], true);
+    assert_eq!(features["features"][0]["name"], "screen.room_id");
+    assert_eq!(features["features"][0]["value"], 2.0);
+    assert_eq!(features["features"][1]["name"], "player.health");
+    assert_eq!(features["features"][1]["value"], 0.5);
+    PublicSanitizer::new()
+        .with_private_root(&private_root)
+        .with_forbidden_literal(GOOD_CREDENTIAL)
+        .with_forbidden_literal(SESSION_SECRET)
+        .inspect_json(&features)
+        .expect("capture features response is route-scoped and public-safe");
+
+    let unauthenticated_features = app
+        .clone()
+        .oneshot(runtime_get_without_cookie(&format!(
+            "/api/capture/{second_capture_id}/features"
+        )))
+        .await
+        .expect("unauthenticated capture features request runs");
+    assert_eq!(unauthenticated_features.status(), StatusCode::UNAUTHORIZED);
+    assert_private_no_store_headers(unauthenticated_features.headers());
+    let unauthenticated_features = json_body(unauthenticated_features).await;
+    assert_eq!(
+        unauthenticated_features["error"]["code"],
+        "session_inactive"
+    );
+    PublicSanitizer::new()
+        .with_private_root(&private_root)
+        .with_forbidden_literal(GOOD_CREDENTIAL)
+        .with_forbidden_literal(SESSION_SECRET)
+        .inspect_json(&unauthenticated_features)
+        .expect("unauthenticated feature error is public-safe");
 
     let preview_url = detail["preview_image_url"]
         .as_str()
@@ -350,6 +398,39 @@ async fn capture_completes_to_recent_detail_and_preview_after_durable_private_in
         serde_json::from_str(&recent_file).expect("recent captures file parses");
     assert_eq!(persisted.captures[0].capture_id, second_capture_id);
     assert_eq!(persisted.captures[1].capture_id, first_capture_id);
+}
+
+#[tokio::test]
+async fn capture_features_route_requires_privileged_capability_grant() {
+    let (_workspace, app, private_root) = capture_app(CaptureBackend::new([3]));
+    let cookie = login_cookie(app.clone()).await;
+    let capture = complete_capture(
+        app.clone(),
+        &cookie,
+        3,
+        "00000000-0000-4000-8000-000000000012",
+    )
+    .await;
+    let capture_id = capture["capture_id"].as_str().expect("capture id");
+
+    let response = app
+        .oneshot(runtime_get(
+            &format!("/api/capture/{capture_id}/features"),
+            &cookie,
+        ))
+        .await
+        .expect("capture features request runs");
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_private_no_store_headers(response.headers());
+    let body = json_body(response).await;
+    assert_eq!(body["error"]["code"], "auth_rejected");
+    assert_eq!(body["error"]["details"], json!({}));
+    PublicSanitizer::new()
+        .with_private_root(&private_root)
+        .with_forbidden_literal(GOOD_CREDENTIAL)
+        .with_forbidden_literal(SESSION_SECRET)
+        .inspect_json(&body)
+        .expect("non-privileged feature error is public-safe");
 }
 
 #[tokio::test]
@@ -778,6 +859,15 @@ fn runtime_get(uri: &str, cookie: &str) -> Request<Body> {
         .expect("runtime request builds")
 }
 
+fn runtime_get_without_cookie(uri: &str) -> Request<Body> {
+    Request::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .header(ORIGIN, ALLOWED_ORIGIN)
+        .body(Body::empty())
+        .expect("runtime request builds")
+}
+
 fn runtime_json_request(method: Method, uri: &str, cookie: &str, body: Value) -> Request<Body> {
     Request::builder()
         .method(method)
@@ -790,6 +880,20 @@ fn runtime_json_request(method: Method, uri: &str, cookie: &str, body: Value) ->
 }
 
 fn assert_no_store_headers(headers: &axum::http::HeaderMap) {
+    assert_private_no_store_headers(headers);
+    assert_eq!(
+        headers
+            .get(ACCESS_CONTROL_ALLOW_ORIGIN)
+            .and_then(|value| value.to_str().ok()),
+        Some(ALLOWED_ORIGIN)
+    );
+    assert_eq!(
+        headers.get(VARY).and_then(|value| value.to_str().ok()),
+        Some("Origin")
+    );
+}
+
+fn assert_private_no_store_headers(headers: &axum::http::HeaderMap) {
     assert_eq!(
         headers
             .get(CACHE_CONTROL)
@@ -805,16 +909,6 @@ fn assert_no_store_headers(headers: &axum::http::HeaderMap) {
             .get("x-content-type-options")
             .and_then(|value| value.to_str().ok()),
         Some("nosniff")
-    );
-    assert_eq!(
-        headers
-            .get(ACCESS_CONTROL_ALLOW_ORIGIN)
-            .and_then(|value| value.to_str().ok()),
-        Some(ALLOWED_ORIGIN)
-    );
-    assert_eq!(
-        headers.get(VARY).and_then(|value| value.to_str().ok()),
-        Some("Origin")
     );
 }
 

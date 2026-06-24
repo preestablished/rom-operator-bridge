@@ -94,6 +94,7 @@ Route-to-schema map:
 | `GET /api/capture/jobs/<job_id>` | none | `captureJobResponse` | Job ids are service-local runtime ids, not private artifact refs. |
 | `GET /api/capture/recent` | query `limit`, `cursor` | `captureRecentResponse` | `limit` defaults to 50 and maxes at 200. |
 | `GET /api/capture/<capture_id>` | none | `captureDetailResponse` | Browser-safe detail only. |
+| `GET /api/capture/<capture_id>/features` | none | `captureFeaturesResponse` | Authenticated privileged decoded feature names/values; no-store; no private artifact refs. |
 | `GET /api/capture/<capture_id>/preview` | none | PNG body | `Content-Type: image/png`; no-store; never an artifact ref. |
 | `POST /api/labels` | `labelsRequest` | `labelsResponse` | Private notes may be submitted but are stored server-side. |
 | `GET /api/labels` | none | `labelsSnapshotResponse` | Typed target labels, status labels, and dedup groups. |
@@ -123,8 +124,9 @@ Phase 0 freezes these deviations from the initial
   `docs/real-backend-availability.md` are available.
 - `HttpOnly; Secure; SameSite=Strict` cookie auth is the selected MVP transport;
   credentials are never accepted in URLs.
-- The planning-time privileged decoded-feature route is not part of schema
-  version 1. Browser runtime APIs must not expose decoded feature arrays.
+- The privileged decoded-feature route is part of schema version 1, but it is a
+  runtime-only authenticated route. Static output, public handoff material, and
+  unauthenticated browser paths must not contain decoded feature values.
 
 ## Auth And Session
 
@@ -223,6 +225,9 @@ The runtime API may expose:
 - high-level capture job state;
 - labels approved for the authenticated operator session;
 - sanitized hashes and provenance names.
+- decoded feature names and numeric values only from
+  `GET /api/capture/<capture_id>/features` after runtime authentication and
+  only for captures whose detail marks privileged features available.
 
 The runtime API must not expose:
 
@@ -231,7 +236,7 @@ The runtime API must not expose:
 - operator credentials;
 - raw framebuffer bytes except through no-store image response bodies;
 - feature bytes;
-- decoded feature arrays;
+- decoded feature arrays outside the authenticated privileged feature route;
 - raw verifier/scorer errors;
 - private artifact refs;
 - real private capture ids in public handoff material.

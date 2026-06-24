@@ -572,7 +572,7 @@ h3 {
 }
 
 .capture-detail-header,
-.feature-shell {
+.feature-shell-header {
   display: flex;
   gap: 12px;
   align-items: start;
@@ -615,10 +615,53 @@ h3 {
   background: #fbfcfa;
 }
 
-.feature-shell span {
+.feature-shell {
+  display: grid;
+  gap: 10px;
+}
+
+.feature-shell span,
+.feature-empty {
   color: #5a675f;
   font-size: 0.84rem;
   font-weight: 700;
+}
+
+.feature-empty {
+  margin: 0;
+  line-height: 1.45;
+}
+
+.feature-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 8px;
+  margin: 0;
+}
+
+.feature-list div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  border: 1px solid #dfe6dd;
+  border-radius: 6px;
+  padding: 8px;
+  background: #ffffff;
+}
+
+.feature-list dt {
+  overflow-wrap: anywhere;
+  color: #4d5d53;
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.feature-list dd {
+  margin: 0;
+  color: #101611;
+  font-variant-numeric: tabular-nums;
+  font-weight: 800;
 }
 
 .label-drawer {

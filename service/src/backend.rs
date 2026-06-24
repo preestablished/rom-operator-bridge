@@ -61,7 +61,7 @@ impl BackendCapabilities {
             preview: true,
             capture: true,
             labels: true,
-            privileged_features: false,
+            privileged_features: true,
             validation_runner: false,
         }
     }
@@ -261,10 +261,7 @@ impl SyntheticBackend {
                 .ok_or(BackendError::BackendUnavailable)?;
             let mut faulted = session.clone();
             faulted.state = SessionState::Faulted;
-            (
-                session.run_id.clone(),
-                faulted.status(self.mode(), self.capabilities()),
-            )
+            (session.run_id.clone(), faulted.status(self.mode()))
         };
         inner.append_event_for_run(
             &self.private_config,
@@ -290,7 +287,7 @@ impl BridgeBackend for SyntheticBackend {
         BackendCapabilities::synthetic_mvp()
     }
 
-    fn start_session(&self, _request: StartBackendSession) -> BackendResult<BackendSession> {
+    fn start_session(&self, request: StartBackendSession) -> BackendResult<BackendSession> {
         let mut inner = self.inner.lock().expect("synthetic backend mutex poisoned");
         if inner.active.is_some() {
             return Err(BackendError::BackendUnavailable);
@@ -306,6 +303,7 @@ impl BridgeBackend for SyntheticBackend {
             last_preview_frame: 0,
             last_applied_input_frame: 0,
             applied_inputs: Vec::new(),
+            capabilities: request.requested_capabilities,
         };
         inner.write_manifest(&self.private_config, &run_id)?;
         inner.append_event_for_run(
@@ -317,7 +315,7 @@ impl BridgeBackend for SyntheticBackend {
         inner.next_sequence += 1;
         inner.active = Some(session.clone());
 
-        Ok(session.backend_session(self.capabilities()))
+        Ok(session.backend_session())
     }
 
     fn stop_session(
@@ -363,7 +361,7 @@ impl BridgeBackend for SyntheticBackend {
             session.current_frame = session.current_frame.saturating_add(1);
         }
 
-        Ok(session.status(self.mode(), self.capabilities()))
+        Ok(session.status(self.mode()))
     }
 
     fn pause(&self, session_id: SessionId) -> BackendResult<RunBoundary> {
@@ -645,27 +643,28 @@ struct SyntheticSession {
     last_preview_frame: FrameCounter,
     last_applied_input_frame: FrameCounter,
     applied_inputs: Vec<AppliedInputFrame>,
+    capabilities: BackendCapabilities,
 }
 
 impl SyntheticSession {
-    fn backend_session(&self, capabilities: BackendCapabilities) -> BackendSession {
+    fn backend_session(&self) -> BackendSession {
         BackendSession {
             session_id: self.session_id.clone(),
             run_id: self.run_id.clone(),
             state: self.state,
             current_frame: self.current_frame,
-            capabilities,
+            capabilities: self.capabilities,
         }
     }
 
-    fn status(&self, backend_mode: BackendMode, capabilities: BackendCapabilities) -> RunStatus {
+    fn status(&self, backend_mode: BackendMode) -> RunStatus {
         RunStatus {
             session_id: self.session_id.clone(),
             run_id: self.run_id.clone(),
             state: self.state,
             backend_mode,
             current_frame: self.current_frame,
-            capabilities,
+            capabilities: self.capabilities,
             last_applied_input_frame: self.last_applied_input_frame,
             last_preview_frame: self.last_preview_frame,
             active_capture_job_id: None,
