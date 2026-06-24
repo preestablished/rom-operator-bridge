@@ -10,7 +10,7 @@ use crate::{
     artifacts::{BridgeEventRow, PadLogEventRow, PrivateArtifactStore, RunManifest},
     framebuffer::{SYNTHETIC_FRAME_HEIGHT, SYNTHETIC_FRAME_WIDTH, synthetic_frame_png},
     input::{AppliedInputFrame, PadLog, PadWord},
-    private_config::BridgePrivateConfig,
+    private_config::{BridgePrivateConfig, RealRuntimeConfig},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -690,6 +690,68 @@ fn synthetic_run_id(sequence: u64) -> String {
 
 fn synthetic_timestamp() -> &'static str {
     "1970-01-01T00:00:00Z"
+}
+
+#[derive(Debug, Clone)]
+pub struct RealBackend {
+    #[allow(dead_code)]
+    runtime_config: RealRuntimeConfig,
+}
+
+impl RealBackend {
+    pub fn new(runtime_config: RealRuntimeConfig) -> Self {
+        Self { runtime_config }
+    }
+}
+
+impl BridgeBackend for RealBackend {
+    fn mode(&self) -> BackendMode {
+        BackendMode::Real
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities::unavailable_real()
+    }
+
+    fn start_session(&self, _request: StartBackendSession) -> BackendResult<BackendSession> {
+        Err(BackendError::BackendUnavailable)
+    }
+
+    fn stop_session(
+        &self,
+        _session_id: SessionId,
+        _reason: StopReason,
+    ) -> BackendResult<StoppedSession> {
+        Err(BackendError::BackendUnavailable)
+    }
+
+    fn status(&self, _session_id: SessionId) -> BackendResult<RunStatus> {
+        Err(BackendError::BackendUnavailable)
+    }
+
+    fn pause(&self, _session_id: SessionId) -> BackendResult<RunBoundary> {
+        Err(BackendError::BackendUnavailable)
+    }
+
+    fn resume(&self, _session_id: SessionId) -> BackendResult<RunBoundary> {
+        Err(BackendError::BackendUnavailable)
+    }
+
+    fn inject_input(&self, _request: InputScheduleRequest) -> BackendResult<InputScheduleReceipt> {
+        Err(BackendError::BackendUnavailable)
+    }
+
+    fn framebuffer(&self, _session_id: SessionId) -> BackendResult<FramePreview> {
+        Err(BackendError::BackendUnavailable)
+    }
+
+    fn trigger_capture(&self, _request: CaptureRequest) -> BackendResult<CaptureJob> {
+        Err(BackendError::BackendUnavailable)
+    }
+
+    fn capture_job(&self, _job_id: CaptureJobId) -> BackendResult<CaptureJob> {
+        Err(BackendError::BackendUnavailable)
+    }
 }
 
 #[derive(Debug, Default)]

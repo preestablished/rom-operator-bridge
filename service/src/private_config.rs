@@ -17,9 +17,17 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 pub const ENV_CONFIG_FILE: &str = "ROM_OPERATOR_BRIDGE_CONFIG_FILE";
 pub const ENV_PRIVATE_ROOT: &str = "ROM_OPERATOR_BRIDGE_PRIVATE_ROOT";
+pub const ENV_PRIVATE_ROOT_ALIAS: &str = "BRIDGE_PRIVATE_ROOT";
 pub const ENV_STATIC_PUBLISH_ROOT: &str = "ROM_OPERATOR_BRIDGE_STATIC_PUBLISH_ROOT";
 pub const ENV_OPERATOR_CREDENTIAL: &str = "ROM_OPERATOR_BRIDGE_OPERATOR_CREDENTIAL";
 pub const ENV_SESSION_SECRET: &str = "ROM_OPERATOR_BRIDGE_SESSION_SECRET";
+pub const ENV_HYPERVISOR_ENDPOINT: &str = "BRIDGE_HYPERVISOR_ENDPOINT";
+pub const ENV_WORKLOAD_IMAGE_REF: &str = "BRIDGE_WORKLOAD_IMAGE_REF";
+pub const ENV_CAPTURE_SPEC_REF: &str = "BRIDGE_CAPTURE_SPEC_REF";
+pub const ENV_REFERENCE_WORKLOAD_CHECKOUT: &str = "BRIDGE_REFERENCE_WORKLOAD_CHECKOUT";
+pub const ENV_REAL_SNAPSHOT_REF: &str = "BRIDGE_REAL_SNAPSHOT_REF";
+pub const ENV_CREATE_VM_CONFIG_REF: &str = "BRIDGE_CREATE_VM_CONFIG_REF";
+pub const DEFAULT_HYPERVISOR_ENDPOINT: &str = "unix:///run/dh/grpc.sock";
 
 pub const PRIVATE_ROOT_MARKER: &str = ".rom-operator-bridge-private-root";
 pub const PRIVATE_DIR_MODE: u32 = 0o700;
@@ -32,6 +40,7 @@ pub struct BridgePrivateConfig {
     root: Option<PrivateRootConfig>,
     operator_credential: Option<SecretValue>,
     session_secret: Option<SecretValue>,
+    real_runtime: Option<RealRuntimeConfig>,
 }
 
 impl BridgePrivateConfig {
@@ -40,6 +49,7 @@ impl BridgePrivateConfig {
             root: None,
             operator_credential: None,
             session_secret: None,
+            real_runtime: None,
         }
     }
 
@@ -49,6 +59,7 @@ impl BridgePrivateConfig {
     ) -> Result<Self, PrivateConfigError> {
         let has_private_value = [
             ENV_PRIVATE_ROOT,
+            ENV_PRIVATE_ROOT_ALIAS,
             ENV_STATIC_PUBLISH_ROOT,
             ENV_OPERATOR_CREDENTIAL,
             ENV_SESSION_SECRET,
@@ -70,7 +81,7 @@ impl BridgePrivateConfig {
             });
         }
 
-        let root = required_path(values, ENV_PRIVATE_ROOT)?;
+        let root = required_path_any(values, &[ENV_PRIVATE_ROOT, ENV_PRIVATE_ROOT_ALIAS])?;
         let static_publish_root = optional_path(values, ENV_STATIC_PUBLISH_ROOT)?;
         validate_private_root(&root, static_publish_root.as_deref())?;
 
@@ -82,18 +93,27 @@ impl BridgePrivateConfig {
             ENV_SESSION_SECRET,
             required_value(values, ENV_SESSION_SECRET)?,
         )?;
+        let real_runtime = if backend_mode == BackendMode::Real {
+            Some(RealRuntimeConfig::from_values(values)?)
+        } else {
+            None
+        };
 
         let config = Self {
             root: Some(PrivateRootConfig { path: root }),
             operator_credential: Some(operator_credential),
             session_secret: Some(session_secret),
+            real_runtime,
         };
         config.prepare_runtime_dirs()?;
         Ok(config)
     }
 
     pub fn is_placeholder(&self) -> bool {
-        self.root.is_none() && self.operator_credential.is_none() && self.session_secret.is_none()
+        self.root.is_none()
+            && self.operator_credential.is_none()
+            && self.session_secret.is_none()
+            && self.real_runtime.is_none()
     }
 
     pub fn private_root(&self) -> Option<&Path> {
@@ -108,6 +128,10 @@ impl BridgePrivateConfig {
         self.session_secret.is_some()
     }
 
+    pub fn real_runtime_config(&self) -> Option<&RealRuntimeConfig> {
+        self.real_runtime.as_ref()
+    }
+
     pub fn public_sanitizer(&self) -> PublicSanitizer {
         let mut sanitizer = PublicSanitizer::new();
         if let Some(root) = self.private_root() {
@@ -118,6 +142,9 @@ impl BridgePrivateConfig {
         }
         if let Some(secret) = &self.session_secret {
             sanitizer = sanitizer.with_forbidden_literal(secret.as_str());
+        }
+        if let Some(real_runtime) = &self.real_runtime {
+            sanitizer = real_runtime.add_to_sanitizer(sanitizer);
         }
         sanitizer
     }
@@ -325,7 +352,170 @@ impl fmt::Debug for BridgePrivateConfig {
                 &self.operator_credential.is_some(),
             )
             .field("session_secret_configured", &self.session_secret.is_some())
+            .field("real_runtime_configured", &self.real_runtime.is_some())
             .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct RealRuntimeConfig {
+    hypervisor_endpoint: HypervisorEndpoint,
+    workload_image_ref: PrivateValue,
+    capture_spec_ref: PrivateValue,
+    reference_workload_checkout: PathBuf,
+    start_source: RealStartSource,
+}
+
+impl RealRuntimeConfig {
+    fn from_values(values: &BTreeMap<String, String>) -> Result<Self, PrivateConfigError> {
+        let hypervisor_endpoint = HypervisorEndpoint::from_values(values)?;
+        let workload_image_ref = PrivateValue::new(
+            ENV_WORKLOAD_IMAGE_REF,
+            required_value(values, ENV_WORKLOAD_IMAGE_REF)?,
+        )?;
+        let capture_spec_ref = PrivateValue::new(
+            ENV_CAPTURE_SPEC_REF,
+            required_value(values, ENV_CAPTURE_SPEC_REF)?,
+        )?;
+        let reference_workload_checkout = required_path(values, ENV_REFERENCE_WORKLOAD_CHECKOUT)?;
+        let snapshot_ref = optional_private_value(values, ENV_REAL_SNAPSHOT_REF)?;
+        let create_vm_config_ref = optional_private_value(values, ENV_CREATE_VM_CONFIG_REF)?;
+        let start_source = match (snapshot_ref, create_vm_config_ref) {
+            (Some(snapshot_ref), None) => RealStartSource::Snapshot { snapshot_ref },
+            (None, Some(config_ref)) => RealStartSource::CreateVm { config_ref },
+            (None, None) => {
+                return Err(PrivateConfigError::MissingAnyEnv {
+                    envs: &[ENV_REAL_SNAPSHOT_REF, ENV_CREATE_VM_CONFIG_REF],
+                });
+            }
+            (Some(_), Some(_)) => {
+                return Err(PrivateConfigError::ConflictingRealStartRefs {
+                    envs: &[ENV_REAL_SNAPSHOT_REF, ENV_CREATE_VM_CONFIG_REF],
+                });
+            }
+        };
+
+        Ok(Self {
+            hypervisor_endpoint,
+            workload_image_ref,
+            capture_spec_ref,
+            reference_workload_checkout,
+            start_source,
+        })
+    }
+
+    pub fn hypervisor_endpoint(&self) -> &HypervisorEndpoint {
+        &self.hypervisor_endpoint
+    }
+
+    pub fn start_source(&self) -> &RealStartSource {
+        &self.start_source
+    }
+
+    fn add_to_sanitizer(&self, mut sanitizer: PublicSanitizer) -> PublicSanitizer {
+        sanitizer = self.hypervisor_endpoint.add_to_sanitizer(sanitizer);
+        sanitizer = sanitizer
+            .with_forbidden_literal(self.workload_image_ref.as_str())
+            .with_forbidden_literal(self.capture_spec_ref.as_str())
+            .with_private_root(&self.reference_workload_checkout);
+        match &self.start_source {
+            RealStartSource::Snapshot { snapshot_ref } => {
+                sanitizer.with_forbidden_literal(snapshot_ref.as_str())
+            }
+            RealStartSource::CreateVm { config_ref } => {
+                sanitizer.with_forbidden_literal(config_ref.as_str())
+            }
+        }
+    }
+}
+
+impl fmt::Debug for RealRuntimeConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RealRuntimeConfig")
+            .field("hypervisor_endpoint", &self.hypervisor_endpoint)
+            .field("workload_image_ref_configured", &true)
+            .field("capture_spec_ref_configured", &true)
+            .field("reference_workload_checkout_configured", &true)
+            .field("start_source", &self.start_source)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum HypervisorEndpoint {
+    Unix { path: PathBuf },
+    Http { uri: PrivateValue },
+}
+
+impl HypervisorEndpoint {
+    fn from_values(values: &BTreeMap<String, String>) -> Result<Self, PrivateConfigError> {
+        let endpoint = values
+            .get(ENV_HYPERVISOR_ENDPOINT)
+            .map(String::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(DEFAULT_HYPERVISOR_ENDPOINT)
+            .trim();
+
+        if let Some(path) = endpoint.strip_prefix("unix://") {
+            let path = parse_absolute_path(ENV_HYPERVISOR_ENDPOINT, path)?;
+            return Ok(Self::Unix { path });
+        }
+
+        if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+            return Ok(Self::Http {
+                uri: PrivateValue::new(ENV_HYPERVISOR_ENDPOINT, endpoint)?,
+            });
+        }
+
+        Err(PrivateConfigError::InvalidEndpoint {
+            env: ENV_HYPERVISOR_ENDPOINT,
+        })
+    }
+
+    pub fn is_unix(&self) -> bool {
+        matches!(self, Self::Unix { .. })
+    }
+
+    fn add_to_sanitizer(&self, sanitizer: PublicSanitizer) -> PublicSanitizer {
+        match self {
+            Self::Unix { path } => sanitizer.with_private_root(path),
+            Self::Http { uri } => sanitizer.with_forbidden_literal(uri.as_str()),
+        }
+    }
+}
+
+impl fmt::Debug for HypervisorEndpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unix { .. } => formatter.write_str("HypervisorEndpoint::Unix([redacted])"),
+            Self::Http { .. } => formatter.write_str("HypervisorEndpoint::Http([redacted])"),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum RealStartSource {
+    Snapshot { snapshot_ref: PrivateValue },
+    CreateVm { config_ref: PrivateValue },
+}
+
+impl RealStartSource {
+    pub fn is_snapshot(&self) -> bool {
+        matches!(self, Self::Snapshot { .. })
+    }
+
+    pub fn is_create_vm(&self) -> bool {
+        matches!(self, Self::CreateVm { .. })
+    }
+}
+
+impl fmt::Debug for RealStartSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Snapshot { .. } => formatter.write_str("RealStartSource::Snapshot([redacted])"),
+            Self::CreateVm { .. } => formatter.write_str("RealStartSource::CreateVm([redacted])"),
+        }
     }
 }
 
@@ -382,6 +572,38 @@ impl SecretValue {
 impl fmt::Debug for SecretValue {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("SecretValue([redacted])")
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct PrivateValue(String);
+
+impl PrivateValue {
+    fn new(env: &'static str, value: &str) -> Result<Self, PrivateConfigError> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(PrivateConfigError::MissingEnv { env });
+        }
+
+        let lowered = value.to_ascii_lowercase();
+        if matches!(
+            lowered.as_str(),
+            "changeme" | "change-me" | "placeholder" | "replace-me" | "example"
+        ) {
+            return Err(PrivateConfigError::PlaceholderPrivateValue { env });
+        }
+
+        Ok(Self(value.to_string()))
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for PrivateValue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PrivateValue([redacted])")
     }
 }
 
@@ -474,6 +696,22 @@ fn required_path(
     parse_absolute_path(env, required_value(values, env)?)
 }
 
+fn required_path_any(
+    values: &BTreeMap<String, String>,
+    envs: &[&'static str],
+) -> Result<PathBuf, PrivateConfigError> {
+    for env in envs {
+        if values
+            .get(*env)
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            return parse_absolute_path(env, required_value(values, env)?);
+        }
+    }
+
+    Err(PrivateConfigError::MissingEnv { env: envs[0] })
+}
+
 fn optional_path(
     values: &BTreeMap<String, String>,
     env: &'static str,
@@ -482,6 +720,17 @@ fn optional_path(
         .get(env)
         .filter(|value| !value.trim().is_empty())
         .map(|value| parse_absolute_path(env, value))
+        .transpose()
+}
+
+fn optional_private_value(
+    values: &BTreeMap<String, String>,
+    env: &'static str,
+) -> Result<Option<PrivateValue>, PrivateConfigError> {
+    values
+        .get(env)
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| PrivateValue::new(env, value))
         .transpose()
 }
 
@@ -874,10 +1123,18 @@ fn io_error(operation: &'static str, path: &Path, error: io::Error) -> PrivateCo
 pub enum PrivateConfigError {
     #[error("{env} is required for complete private bridge config")]
     MissingEnv { env: &'static str },
+    #[error("one of {envs:?} is required for real backend startup")]
+    MissingAnyEnv { envs: &'static [&'static str] },
+    #[error("{envs:?} cannot both be configured for real backend startup")]
+    ConflictingRealStartRefs { envs: &'static [&'static str] },
     #[error("{env} must not use a placeholder value")]
     PlaceholderSecret { env: &'static str },
+    #[error("{env} must not use a placeholder value")]
+    PlaceholderPrivateValue { env: &'static str },
     #[error("session secret could not be used")]
     InvalidSessionSecret,
+    #[error("{env} must be unix://, http://, or https://")]
+    InvalidEndpoint { env: &'static str },
     #[error("{env} must be an absolute path")]
     PathNotAbsolute { env: &'static str, path: PathBuf },
     #[error("{env} must not contain parent directory segments")]

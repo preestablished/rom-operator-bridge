@@ -7,8 +7,8 @@ use crate::{
         validate_origin, validate_runtime_request,
     },
     backend::{
-        BackendCapabilities, BackendError, BackendMode, BridgeBackend, FramePreview,
-        RealBackendUnavailable, StopReason, SyntheticBackend,
+        BackendCapabilities, BackendError, BackendMode, BridgeBackend, FramePreview, RealBackend,
+        StopReason, SyntheticBackend,
     },
     config::ServiceConfig,
     input::{PAD_LAYOUT_ID, PAD_LAYOUT_VERSION},
@@ -76,7 +76,13 @@ impl AppState {
             BackendMode::Synthetic => Arc::new(SyntheticBackend::with_private_config(
                 config.private_config().clone(),
             )),
-            BackendMode::Real => Arc::new(RealBackendUnavailable),
+            BackendMode::Real => Arc::new(RealBackend::new(
+                config
+                    .private_config()
+                    .real_runtime_config()
+                    .expect("real backend config is validated before AppState construction")
+                    .clone(),
+            )),
         };
 
         Self {
