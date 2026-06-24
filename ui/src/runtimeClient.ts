@@ -592,7 +592,7 @@ export class RuntimeSocket {
   private socket: WebSocketLike | null = null;
   private closed = false;
   private reconnectAttempts = 0;
-  private lastServerSeq = 0;
+  private readonly lastServerSeqBySession = new Map<string, number>();
   private reconnectTimer: TimerHandle | null = null;
   private pendingSends: string[] = [];
 
@@ -670,10 +670,11 @@ export class RuntimeSocket {
     try {
       const message = parseWsMessage(JSON.parse(String(event.data)));
       if (message.server_seq !== null) {
-        if (message.server_seq <= this.lastServerSeq) {
+        const lastServerSeq = this.lastServerSeqBySession.get(message.session_id) ?? 0;
+        if (message.server_seq <= lastServerSeq) {
           return;
         }
-        this.lastServerSeq = message.server_seq;
+        this.lastServerSeqBySession.set(message.session_id, message.server_seq);
       }
       const accepted = this.acceptMessage(message);
       if (accepted !== null) {

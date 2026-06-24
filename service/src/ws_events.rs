@@ -229,7 +229,10 @@ pub async fn serve_event_socket(
                             break;
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let _ = socket.send(Message::Close(None)).await;
+                        break;
+                    }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
