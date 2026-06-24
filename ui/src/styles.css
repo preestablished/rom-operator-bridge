@@ -211,6 +211,46 @@ h2 {
   font-weight: 700;
 }
 
+.recovery-panel {
+  grid-column: 1;
+}
+
+.recovery-list {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.recovery-list li {
+  display: grid;
+  gap: 4px;
+  border: 1px solid #d8b8a8;
+  border-radius: 6px;
+  padding: 10px 12px;
+  color: #4d342d;
+  background: #fff8f3;
+  font-size: 0.84rem;
+}
+
+.recovery-list [data-recovery-severity="info"] {
+  border-color: #bfd0d8;
+  color: #243f4d;
+  background: #f2f8fb;
+}
+
+.recovery-list [data-recovery-severity="warning"] {
+  border-color: #d8c9a8;
+  color: #4d3f24;
+  background: #fffaf0;
+}
+
+.recovery-list strong {
+  color: #17211c;
+  font-size: 0.86rem;
+}
+
 .session-live {
   position: absolute;
   width: 1px;
