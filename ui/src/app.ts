@@ -142,6 +142,9 @@ type CaptureReviewState = {
   error: string | null;
   conflicts: RuntimeErrorDisplay[];
 };
+type DedupSelection =
+  | { updates: DedupUpdate[]; error: null }
+  | { updates: []; error: RuntimeErrorDisplay };
 type PadlogTailEntry = {
   frame: number;
   padWord: number;
@@ -1255,7 +1258,17 @@ export function mountOperatorApp(
     const currentRoles = detail.labels.filter(isLabelRole);
     const note = safePrivateNote(String(formData.get("private_note") ?? ""));
     const updates = labelUpdatesForSelection(detail.capture_id, currentRoles, selectedRoles, note);
-    const dedupUpdates = dedupUpdatesForSelection(detail.capture_id, formData);
+    const dedupSelection = dedupUpdatesForSelection(detail.capture_id, formData);
+    if (dedupSelection.error) {
+      captureReview = {
+        ...captureReview,
+        conflicts: [dedupSelection.error],
+        error: null
+      };
+      render();
+      return;
+    }
+    const dedupUpdates = dedupSelection.updates;
     if (updates.length === 0 && dedupUpdates.length === 0) {
       captureReview = {
         ...captureReview,
@@ -2246,32 +2259,51 @@ function labelUpdatesForSelection(
   return updates;
 }
 
-function dedupUpdatesForSelection(captureId: string, formData: FormData): DedupUpdate[] {
-  const compareCaptureId = safeContractInput(String(formData.get("dedup_capture_id") ?? ""));
-  const changedFeature = safePublicFeatureName(String(formData.get("dedup_changed_feature") ?? ""));
+function dedupUpdatesForSelection(captureId: string, formData: FormData): DedupSelection {
+  const rawCompareCaptureId = String(formData.get("dedup_capture_id") ?? "").trim();
+  const rawChangedFeature = String(formData.get("dedup_changed_feature") ?? "").trim();
+  if (!rawCompareCaptureId && !rawChangedFeature) {
+    return { updates: [], error: null };
+  }
+  const compareCaptureId = safeContractInput(rawCompareCaptureId);
+  const changedFeature = safePublicFeatureName(rawChangedFeature);
   const relation = String(formData.get("dedup_relation") ?? "");
   if (
     !compareCaptureId ||
     !changedFeature ||
-    compareCaptureId === captureId ||
-    (relation !== "same_canonical_state" && relation !== "distinct_stable_state")
+    compareCaptureId === captureId
   ) {
-    return [];
+    return {
+      updates: [],
+      error: safeValidationError("Enter a different capture id and a public changed feature.")
+    };
   }
-  return [
-    {
-      op: "upsert",
-      group_id: dedupGroupId(captureId, compareCaptureId),
-      expected_relation: relation,
-      capture_ids: [captureId, compareCaptureId],
-      changed_features: [changedFeature],
-      status: "candidate"
-    }
-  ];
+  if (relation !== "same_canonical_state" && relation !== "distinct_stable_state") {
+    return {
+      updates: [],
+      error: safeValidationError("Choose a dedup relation.")
+    };
+  }
+  return {
+    updates: [
+      {
+        op: "upsert",
+        group_id: dedupGroupId(captureId, compareCaptureId),
+        expected_relation: relation,
+        capture_ids: [captureId, compareCaptureId],
+        changed_features: [changedFeature],
+        status: "candidate"
+      }
+    ],
+    error: null
+  };
 }
 
 function dedupGroupId(captureId: string, compareCaptureId: string): string {
-  return `dedup-${captureId.slice(0, 48)}-${compareCaptureId.slice(0, 48)}`;
+  const pair = [captureId, compareCaptureId].sort();
+  const left = pair[0]!;
+  const right = pair[1]!;
+  return `dedup-${left.slice(0, 48)}-${right.slice(0, 48)}`;
 }
 
 function safeContractInput(value: string): string | null {
@@ -2281,7 +2313,16 @@ function safeContractInput(value: string): string | null {
 
 function safePublicFeatureName(value: string): string | null {
   const normalized = value.trim().replace(/\s+/g, " ");
-  return /^[A-Za-z0-9 _.-]{1,64}$/.test(normalized) ? normalized : null;
+  return /^[A-Za-z0-9 _.-]{1,128}$/.test(normalized) ? normalized : null;
+}
+
+function safeValidationError(message: string): RuntimeErrorDisplay {
+  return {
+    code: "bad_request",
+    message,
+    retryable: false,
+    details: {}
+  };
 }
 
 function safePrivateNote(value: string): string | null {

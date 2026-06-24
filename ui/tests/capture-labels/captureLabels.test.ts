@@ -103,7 +103,7 @@ describe("capture review and label drawer", () => {
     firstBoss!.checked = false;
     goalPositive!.checked = true;
     note!.value = "Private operator note for verifier context";
-    compareCapture!.value = "capture-004";
+    compareCapture!.value = "capture-000";
     changedFeature!.value = "stable door flag";
     root
       .querySelector<HTMLFormElement>("[data-label-drawer-form='capture']")
@@ -126,9 +126,9 @@ describe("capture review and label drawer", () => {
       dedupUpdates: [
         {
           op: "upsert",
-          group_id: "dedup-capture-001-capture-004",
+          group_id: "dedup-capture-000-capture-001",
           expected_relation: "same_canonical_state",
-          capture_ids: ["capture-001", "capture-004"],
+          capture_ids: ["capture-001", "capture-000"],
           changed_features: ["stable door flag"],
           status: "candidate"
         }
@@ -183,6 +183,35 @@ describe("capture review and label drawer", () => {
     expect(conflicts?.textContent).toContain("first boss is assigned to another capture");
     expect(conflicts?.textContent).toContain("Resolve the conflicting label role");
     expect(root.textContent ?? "").not.toMatch(/\/home\/|private\/captures|index\.jsonl/i);
+  });
+
+  it("surfaces invalid dedup drawer input without sending a write", async () => {
+    const updateLabels = vi.fn();
+    const client = mockClient({
+      sessionStatus: vi.fn().mockResolvedValue(activeSessionResponse()),
+      runStatus: vi.fn().mockResolvedValue(runStatusResponse()),
+      currentFrame: vi.fn().mockResolvedValue(frameCurrentResponse()),
+      recentCaptures: vi.fn().mockResolvedValue(captureRecentResponse()),
+      captureDetail: vi.fn().mockResolvedValue(captureDetailResponse()),
+      labelsSnapshot: vi.fn().mockResolvedValue(labelsSnapshotResponse()),
+      updateLabels
+    });
+    const root = document.createElement("div");
+
+    mountOperatorApp(root, config, client, null);
+    await flushPromises();
+    root.querySelector<HTMLInputElement>("input[name='dedup_capture_id']")!.value = "capture-001";
+    root.querySelector<HTMLInputElement>("input[name='dedup_changed_feature']")!.value =
+      "/home/operator/private-feature";
+    root
+      .querySelector<HTMLFormElement>("[data-label-drawer-form='capture']")
+      ?.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    await flushPromises();
+
+    expect(updateLabels).not.toHaveBeenCalled();
+    const conflicts = root.querySelector("[data-label-conflicts]");
+    expect(conflicts?.textContent).toContain("Enter a different capture id and a public changed feature.");
+    expect(root.textContent ?? "").not.toMatch(/\/home\/|private-feature/i);
   });
 
   it("keeps not-labelable drawers locked and exposes a retry affordance for failed captures", async () => {

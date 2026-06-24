@@ -620,7 +620,7 @@ fn validate_dedup_group(inner: &LabelInner, group: &DedupGroup) -> Result<(), La
     }
     let mut captures = BTreeSet::new();
     for capture_id in &group.capture_ids {
-        if !is_contract_id(capture_id) || !captures.insert(capture_id) {
+        if !is_contract_id(capture_id) || !captures.insert(capture_id.clone()) {
             conflicts.push(LabelConflict::bad_request(
                 "Dedup group capture ids are invalid.",
                 false,
@@ -631,6 +631,20 @@ fn validate_dedup_group(inner: &LabelInner, group: &DedupGroup) -> Result<(), La
                 "Rejected captures cannot be in dedup groups.",
                 false,
             ));
+        }
+    }
+    if !captures.is_empty() {
+        for existing in inner.dedup_groups.values() {
+            if existing.group_id == group.group_id {
+                continue;
+            }
+            let existing_captures: BTreeSet<_> = existing.capture_ids.iter().cloned().collect();
+            if existing_captures == captures {
+                conflicts.push(LabelConflict::label(
+                    "Dedup group already exists for these captures.",
+                    false,
+                ));
+            }
         }
     }
     if group.capture_ids.len() < 2 {

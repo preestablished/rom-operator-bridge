@@ -700,6 +700,13 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["schema_version", "session_id", "idempotency_key", "updates"],
+      "anyOf": [
+        { "properties": { "updates": { "minItems": 1 } } },
+        {
+          "required": ["dedup_updates"],
+          "properties": { "dedup_updates": { "minItems": 1 } }
+        }
+      ],
       "properties": {
         "schema_version": { "$ref": "#/$defs/schemaVersion" },
         "session_id": { "$ref": "#/$defs/id" },
