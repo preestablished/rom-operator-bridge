@@ -424,6 +424,38 @@ describe("runtime WebSocket clients", () => {
     expect(errors).toEqual([]);
   });
 
+  it("allows server sequence numbers to restart for a new session", () => {
+    const messages: RuntimeWsMessage[] = [];
+    const client = new RuntimeWebSocketClient(config, {
+      socketConstructor: FakeWebSocket,
+      location: { protocol: "http:", host: "localhost:5173" },
+      maxReconnects: 0
+    });
+
+    client.eventSocket({
+      onMessage: (message) => messages.push(message)
+    });
+    const socket = FakeWebSocket.instances[0]!;
+    socket.emitOpen();
+    socket.emitMessage(serverEventOf("run_updated", 12, {
+      state: "running",
+      current_frame: 12,
+      preview_stale: true,
+      active_capture_job_id: null
+    }));
+    socket.emitMessage({
+      ...serverEventOf("run_updated", 1, {
+        state: "running",
+        current_frame: 1,
+        preview_stale: false,
+        active_capture_job_id: null
+      }),
+      session_id: "session-002"
+    });
+
+    expect(messages.map((message) => message.session_id)).toEqual(["session-001", "session-002"]);
+  });
+
   it("rejects malformed WebSocket event payloads by message type", () => {
     const malformedEvents = [
       {

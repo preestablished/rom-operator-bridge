@@ -6,7 +6,13 @@ import {
   type AuthSessionState,
   type RuntimeSessionClient
 } from "./authSession";
-import { RuntimeApiClient } from "./runtimeClient";
+import {
+  RuntimeApiClient,
+  RuntimeWebSocketClient,
+  type RuntimeEventMessage,
+  type RuntimeWsMessage,
+  type ValidationUpdatedPayload
+} from "./runtimeClient";
 import {
   PAD_LAYOUT_ID,
   PAD_LAYOUT_VERSION,
@@ -25,6 +31,12 @@ type OperatorViewModel = {
   auth: AuthSessionState;
 };
 
+type OperatorRuntimeViewState = {
+  validationState: OperatorViewModel["validationState"];
+};
+
+export type RuntimeEventClient = Pick<RuntimeWebSocketClient, "eventSocket">;
+
 const INITIAL_VIEW_MODEL: Omit<OperatorViewModel, "config" | "auth"> = {
   backendMode: "synthetic",
   sessionState: "idle",
@@ -35,7 +47,8 @@ const INITIAL_VIEW_MODEL: Omit<OperatorViewModel, "config" | "auth"> = {
 
 export function renderOperatorApp(
   config: RuntimeConfig,
-  auth: AuthSessionState = initialAuthSessionState()
+  auth: AuthSessionState = initialAuthSessionState(),
+  runtimeView: OperatorRuntimeViewState = { validationState: INITIAL_VIEW_MODEL.validationState }
 ): string {
   const model: OperatorViewModel = {
     ...INITIAL_VIEW_MODEL,
@@ -43,6 +56,7 @@ export function renderOperatorApp(
     sessionState: auth.session.state,
     currentFrame: auth.session.current_frame,
     previewState: auth.session.active ? (auth.session.preview_stale ? "stale" : "fresh") : "waiting",
+    validationState: runtimeView.validationState,
     config,
     auth
   };
@@ -112,10 +126,15 @@ export function renderOperatorApp(
 export function mountOperatorApp(
   root: HTMLElement,
   config: RuntimeConfig,
-  client: RuntimeSessionClient = new RuntimeApiClient(config)
+  client: RuntimeSessionClient = new RuntimeApiClient(config),
+  eventClient: RuntimeEventClient | null =
+    typeof globalThis.WebSocket === "function" ? new RuntimeWebSocketClient(config) : null
 ): void {
   let auth = initialAuthSessionState();
   let authRequestSeq = 0;
+  let validationState: OperatorViewModel["validationState"] = INITIAL_VIEW_MODEL.validationState;
+  let eventSocket: ReturnType<RuntimeEventClient["eventSocket"]> | null = null;
+  let eventSessionId: string | null = null;
   root.innerHTML = '<div data-operator-app></div><p class="session-live" aria-live="polite"></p>';
   const appRegion = root.querySelector<HTMLElement>("[data-operator-app]");
   const liveRegion = root.querySelector<HTMLElement>(".session-live");
@@ -124,7 +143,7 @@ export function mountOperatorApp(
     if (!appRegion || !liveRegion) {
       return;
     }
-    appRegion.innerHTML = renderOperatorApp(config, auth);
+    appRegion.innerHTML = renderOperatorApp(config, auth, { validationState });
     liveRegion.textContent = sessionStatusLabel(auth);
     if (focusTarget) {
       focusSessionTarget(appRegion, focusTarget);
@@ -136,8 +155,92 @@ export function mountOperatorApp(
       return;
     }
     auth = next;
+    syncEventStream();
     render(focusTargetForAuth(auth));
   };
+
+  function closeEventStream() {
+    eventSocket?.close();
+    eventSocket = null;
+    eventSessionId = null;
+  }
+
+  function syncEventStream() {
+    if (!eventClient) {
+      return;
+    }
+    const nextSessionId =
+      (auth.status === "active" || auth.status === "stopping") && auth.session.session_id
+        ? auth.session.session_id
+        : null;
+    if (!nextSessionId) {
+      closeEventStream();
+      return;
+    }
+    if (eventSocket && eventSessionId === nextSessionId) {
+      return;
+    }
+
+    closeEventStream();
+    eventSessionId = nextSessionId;
+    eventSocket = eventClient.eventSocket({
+      onMessage: handleRuntimeEvent,
+      onError: () => undefined
+    });
+  }
+
+  function handleRuntimeEvent(message: RuntimeWsMessage) {
+    if (!isRuntimeEvent(message) || message.session_id !== auth.session.session_id) {
+      return;
+    }
+
+    if (message.type === "validation_updated") {
+      validationState = validationStateFromEvent(message.payload.status);
+      render();
+      return;
+    }
+
+    if (message.type === "session_updated") {
+      auth = {
+        ...auth,
+        status: message.payload.state === "stopped" ? "locked" : auth.status,
+        session: {
+          ...auth.session,
+          active: message.payload.state !== "stopped",
+          state: message.payload.state,
+          backend_mode: message.payload.backend_mode,
+          current_frame: message.payload.current_frame,
+          capabilities: message.payload.capabilities
+        },
+        error: null
+      };
+    }
+
+    if (message.type === "run_updated") {
+      auth = {
+        ...auth,
+        status: message.payload.state === "stopped" ? "locked" : auth.status,
+        session: {
+          ...auth.session,
+          active: message.payload.state !== "stopped",
+          state: message.payload.state,
+          current_frame: message.payload.current_frame,
+          preview_stale: message.payload.preview_stale
+        },
+        error: null
+      };
+    }
+
+    if (!auth.session.active) {
+      closeEventStream();
+      auth = initialAuthSessionState();
+      validationState = INITIAL_VIEW_MODEL.validationState;
+      render("credential");
+      return;
+    }
+
+    render();
+  }
 
   root.addEventListener("submit", (event) => {
     const form = event.target instanceof HTMLFormElement ? event.target : null;
@@ -154,6 +257,7 @@ export function mountOperatorApp(
     form.reset();
     const requestSeq = ++authRequestSeq;
     auth = { ...auth, status: "starting", error: null };
+    validationState = INITIAL_VIEW_MODEL.validationState;
     render();
     submitCredential(auth, client, credential).then((next) => {
       applyAuthResult(requestSeq, next);
@@ -170,6 +274,7 @@ export function mountOperatorApp(
     const stateToStop = auth;
     const requestSeq = ++authRequestSeq;
     auth = { ...auth, status: "stopping", error: null };
+    syncEventStream();
     render();
     logoutSession(stateToStop, client).then((next) => {
       applyAuthResult(requestSeq, next);
@@ -181,6 +286,31 @@ export function mountOperatorApp(
   refreshSession(auth, client).then((next) => {
     applyAuthResult(refreshSeq, next);
   });
+}
+
+function isRuntimeEvent(message: RuntimeWsMessage): message is RuntimeEventMessage {
+  return (
+    message.type === "session_updated" ||
+    message.type === "run_updated" ||
+    message.type === "capture_updated" ||
+    message.type === "label_updated" ||
+    message.type === "validation_updated"
+  );
+}
+
+function validationStateFromEvent(
+  status: ValidationUpdatedPayload["status"]
+): OperatorViewModel["validationState"] {
+  switch (status) {
+    case "running":
+      return "queued";
+    case "passed":
+      return "passed";
+    case "failed":
+      return "failed";
+    case "not_run":
+      return "idle";
+  }
 }
 
 function renderSessionPanel(auth: AuthSessionState, backendMode: BackendMode): string {

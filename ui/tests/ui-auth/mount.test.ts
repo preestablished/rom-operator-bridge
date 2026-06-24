@@ -2,8 +2,10 @@
 
 import { describe, expect, it, vi } from "vitest";
 import { mountOperatorApp } from "../../src/app";
+import type { RuntimeEventClient } from "../../src/app";
 import type { RuntimeSessionClient } from "../../src/authSession";
 import { RuntimeApiError } from "../../src/runtimeClient";
+import type { RuntimeWsMessage } from "../../src/runtimeClient";
 import type { RuntimeConfig } from "../../src/runtimeConfig";
 
 const config: RuntimeConfig = {
@@ -29,7 +31,7 @@ describe("mounted auth/session screen", () => {
     });
     const root = document.createElement("div");
 
-    mountOperatorApp(root, config, client);
+    mountOperatorApp(root, config, client, null);
     await flushPromises();
 
     expect(client.sessionStatus).toHaveBeenCalledTimes(1);
@@ -46,7 +48,7 @@ describe("mounted auth/session screen", () => {
     });
     const root = document.createElement("div");
 
-    mountOperatorApp(root, config, client);
+    mountOperatorApp(root, config, client, null);
     const input = root.querySelector<HTMLInputElement>("input[name='operator_credential']");
     const form = root.querySelector<HTMLFormElement>("form[data-session-form='start']");
     expect(input).not.toBeNull();
@@ -77,7 +79,7 @@ describe("mounted auth/session screen", () => {
     });
     const root = document.createElement("div");
 
-    mountOperatorApp(root, config, client);
+    mountOperatorApp(root, config, client, null);
     await flushPromises();
     root.querySelector<HTMLButtonElement>("[data-session-action='logout']")?.click();
 
@@ -109,7 +111,7 @@ describe("mounted auth/session screen", () => {
     document.body.appendChild(root);
 
     try {
-      mountOperatorApp(root, config, client);
+      mountOperatorApp(root, config, client, null);
       const liveRegion = root.querySelector(".session-live");
       const input = root.querySelector<HTMLInputElement>("input[name='operator_credential']");
       const form = root.querySelector<HTMLFormElement>("form[data-session-form='start']");
@@ -125,6 +127,37 @@ describe("mounted auth/session screen", () => {
       root.remove();
     }
   });
+
+  it("subscribes active sessions to runtime events and renders live run updates", async () => {
+    const eventClient = mockEventClient();
+    const client = mockClient({
+      sessionStatus: vi.fn().mockResolvedValue(activeSessionResponse())
+    });
+    const root = document.createElement("div");
+
+    mountOperatorApp(root, config, client, eventClient.client);
+    await flushPromises();
+
+    expect(eventClient.client.eventSocket).toHaveBeenCalledTimes(1);
+    eventClient.emit({
+      schema_version: 1,
+      type: "run_updated",
+      session_id: "session-001",
+      client_seq: null,
+      source_id: "server",
+      server_seq: 1,
+      payload: {
+        state: "paused",
+        current_frame: 18,
+        preview_stale: false,
+        active_capture_job_id: null
+      }
+    });
+
+    expect(root.textContent).toContain("paused");
+    expect(root.textContent).toContain("#18");
+    expect(root.textContent).toContain("fresh");
+  });
 });
 
 function mockClient(overrides: Partial<RuntimeSessionClient> = {}): RuntimeSessionClient {
@@ -134,6 +167,25 @@ function mockClient(overrides: Partial<RuntimeSessionClient> = {}): RuntimeSessi
     stopSession: vi.fn().mockResolvedValue(stopSessionResponse()),
     ...overrides
   } as RuntimeSessionClient;
+}
+
+function mockEventClient(): {
+  client: RuntimeEventClient;
+  close: ReturnType<typeof vi.fn>;
+  emit: (message: RuntimeWsMessage) => void;
+} {
+  let onMessage: ((message: RuntimeWsMessage) => void) | undefined;
+  const close = vi.fn();
+  return {
+    client: {
+      eventSocket: vi.fn((handlers = {}) => {
+        onMessage = handlers.onMessage;
+        return { close } as unknown as ReturnType<RuntimeEventClient["eventSocket"]>;
+      })
+    },
+    close,
+    emit: (message) => onMessage?.(message)
+  };
 }
 
 function deferred<T>(defaultValue: T): {
