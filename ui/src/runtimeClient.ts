@@ -20,7 +20,7 @@ type Fetcher = (input: RequestInfo | URL, init?: RequestInit) => Promise<Respons
 
 const STOP_REASONS = ["operator_stop", "fault_cleanup", "session_replaced"] as const;
 const PRIVATE_ERROR_PATTERN =
-  /credential|password|secret|token|private|\/home\/|\/run\/|\.env|[A-Za-z]:\\/i;
+  /credential|password|secret|token|private|(?:^|\s)\/[A-Za-z0-9._~/-]+|(?:^|\s)~\/|\.env|[A-Za-z]:\\/i;
 const ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
 const UUID_PATTERN =
   /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
