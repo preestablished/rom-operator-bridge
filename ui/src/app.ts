@@ -11,12 +11,18 @@ import {
   RuntimeApiError,
   RuntimeWebSocketClient,
   applyRunStatus,
+  type CaptureDetailResponse,
   type CaptureJobResponse,
+  type CaptureSummary,
   type CaptureStatus,
   type CaptureTriggerResponse,
+  type DedupUpdate,
   type FrameCurrentResponse,
   type InputAckMessage,
   type InputRejectMessage,
+  type LabelRole,
+  type LabelsSnapshotResponse,
+  type LabelUpdate,
   type PadButton,
   type RuntimeErrorCode,
   type RuntimeErrorDisplay,
@@ -51,6 +57,7 @@ type OperatorViewModel = {
   previewState: "waiting" | "fresh" | "stale";
   validationState: "idle" | "queued" | "passed" | "failed";
   validationStatus: ValidationStatusView;
+  captureReview: CaptureReviewState;
   focusState: FocusState;
   recoveryNotices: RecoveryNotice[];
   captureJob: CaptureJobView | null;
@@ -70,6 +77,7 @@ type OperatorViewModel = {
 type OperatorRuntimeViewState = {
   validationState: OperatorViewModel["validationState"];
   validationStatus: ValidationStatusView;
+  captureReview: CaptureReviewState;
   preview: FrameCurrentResponse | null;
   focusState: FocusState;
   recoveryEvents: RecoveryEvent[];
@@ -91,8 +99,12 @@ export type RuntimeRunClient = Pick<
   "runStatus" | "pauseRun" | "resumeRun" | "triggerCapture" | "captureJob"
 >;
 type RuntimeValidationClient = Pick<RuntimeApiClient, "validationStatus">;
+type RuntimeCaptureReviewClient = Pick<
+  RuntimeApiClient,
+  "recentCaptures" | "captureDetail" | "updateLabels" | "labelsSnapshot"
+>;
 type OperatorRuntimeClient = RuntimeSessionClient &
-  Partial<RuntimePreviewClient & RuntimeRunClient & RuntimeValidationClient>;
+  Partial<RuntimePreviewClient & RuntimeRunClient & RuntimeValidationClient & RuntimeCaptureReviewClient>;
 type OperatorSocketClient = RuntimeEventClient & Partial<RuntimeInputClient>;
 
 type FocusState = "focused" | "blurred" | "hidden";
@@ -120,6 +132,19 @@ type CaptureJobView = Pick<
   | "has_preview"
   | "error"
 >;
+type CaptureReviewState = {
+  captures: CaptureSummary[];
+  selectedCaptureId: string | null;
+  detail: CaptureDetailResponse | null;
+  labels: LabelsSnapshotResponse | null;
+  loading: boolean;
+  labelSaving: boolean;
+  error: string | null;
+  conflicts: RuntimeErrorDisplay[];
+};
+type DedupSelection =
+  | { updates: DedupUpdate[]; error: null }
+  | { updates: []; error: RuntimeErrorDisplay };
 type PadlogTailEntry = {
   frame: number;
   padWord: number;
@@ -137,6 +162,17 @@ const INITIAL_VALIDATION_STATUS: ValidationStatusView = {
   issue_summaries: []
 };
 
+const EMPTY_CAPTURE_REVIEW: CaptureReviewState = {
+  captures: [],
+  selectedCaptureId: null,
+  detail: null,
+  labels: null,
+  loading: false,
+  labelSaving: false,
+  error: null,
+  conflicts: []
+};
+
 const INITIAL_VIEW_MODEL: Omit<OperatorViewModel, "config" | "auth"> = {
   backendMode: "synthetic",
   sessionState: "idle",
@@ -147,6 +183,7 @@ const INITIAL_VIEW_MODEL: Omit<OperatorViewModel, "config" | "auth"> = {
   previewState: "waiting",
   validationState: "idle",
   validationStatus: INITIAL_VALIDATION_STATUS,
+  captureReview: EMPTY_CAPTURE_REVIEW,
   focusState: "focused",
   recoveryNotices: [],
   captureJob: null,
@@ -164,6 +201,7 @@ const INITIAL_VIEW_MODEL: Omit<OperatorViewModel, "config" | "auth"> = {
 const EMPTY_RUNTIME_VIEW: OperatorRuntimeViewState = {
   validationState: INITIAL_VIEW_MODEL.validationState,
   validationStatus: INITIAL_VALIDATION_STATUS,
+  captureReview: EMPTY_CAPTURE_REVIEW,
   preview: null,
   focusState: INITIAL_VIEW_MODEL.focusState,
   recoveryEvents: [],
@@ -207,6 +245,7 @@ export function renderOperatorApp(
       : "waiting",
     validationState: validationStateToViewState(validationStatus.status),
     validationStatus,
+    captureReview: captureReviewForView(view.captureReview),
     focusState: view.focusState,
     recoveryNotices: [],
     captureJob: view.captureJob,
@@ -322,7 +361,7 @@ export function renderOperatorApp(
               type="button"
               data-run-action="capture"
               ${captureButtonDisabled(model) ? "disabled" : ""}
-            >Trigger</button>
+            >${captureActionLabel(model)}</button>
           </div>
           ${
             model.captureError
@@ -331,6 +370,8 @@ export function renderOperatorApp(
           }
           ${renderCaptureJob(model)}
         </article>
+
+        ${renderCaptureReviewPanel(model)}
       </section>
     </main>
   `;
@@ -348,8 +389,10 @@ export function mountOperatorApp(
   let previewRequestSeq = 0;
   let runStatusRequestSeq = 0;
   let validationRequestSeq = 0;
+  let captureReviewRequestSeq = 0;
   let sessionAction: SessionActionState = "idle";
   let validationStatus = INITIAL_VALIDATION_STATUS;
+  let captureReview = EMPTY_CAPTURE_REVIEW;
   let preview: FrameCurrentResponse | null = null;
   let focusState: FocusState = currentFocusState();
   let recoveryEvents: RecoveryEvent[] = [];
@@ -386,6 +429,7 @@ export function mountOperatorApp(
     appRegion.innerHTML = renderOperatorApp(config, auth, {
       validationState: validationStateToViewState(validationStatus.status),
       validationStatus,
+      captureReview,
       preview,
       focusState,
       recoveryEvents,
@@ -420,6 +464,7 @@ export function mountOperatorApp(
       preview = null;
       previewRequestSeq += 1;
       validationRequestSeq += 1;
+      captureReviewRequestSeq += 1;
       captureJob = null;
       captureError = null;
       captureErrorCode = null;
@@ -434,6 +479,7 @@ export function mountOperatorApp(
       neutralizedDirections = [];
       padlogTail = [];
       validationStatus = INITIAL_VALIDATION_STATUS;
+      captureReview = EMPTY_CAPTURE_REVIEW;
     }
     sessionAction = "idle";
     syncEventStream();
@@ -441,6 +487,7 @@ export function mountOperatorApp(
     render(focusTargetForAuth(auth));
     refreshRunStatus();
     refreshValidationStatus();
+    refreshCaptureReview();
     refreshPreview();
   };
 
@@ -486,6 +533,7 @@ export function mountOperatorApp(
         recordRecoveryEvent({ code: "websocket_reconnect" });
         refreshRunStatus();
         refreshValidationStatus();
+        refreshCaptureReview();
         refreshPreview();
         render();
       }
@@ -517,6 +565,7 @@ export function mountOperatorApp(
         clearDisconnectedInputState();
         syncInputCaptureLifecycle();
         refreshRunStatus();
+        refreshCaptureReview();
         refreshPreview();
         render();
       }
@@ -605,6 +654,18 @@ export function mountOperatorApp(
       captureError = null;
       captureErrorCode = null;
       void refreshCaptureJob(message.payload.job_id);
+      if (!isActiveCaptureStatus(message.payload.status)) {
+        void refreshCaptureReview(message.payload.capture_id ?? captureReview.selectedCaptureId);
+      }
+    }
+
+    if (message.type === "label_updated") {
+      captureReview = {
+        ...captureReview,
+        conflicts: [],
+        error: null
+      };
+      void refreshCaptureReview();
     }
 
     if (!auth.session.active) {
@@ -613,6 +674,8 @@ export function mountOperatorApp(
       auth = initialAuthSessionState();
       validationStatus = INITIAL_VALIDATION_STATUS;
       validationRequestSeq += 1;
+      captureReview = EMPTY_CAPTURE_REVIEW;
+      captureReviewRequestSeq += 1;
       preview = null;
       previewRequestSeq += 1;
       sessionAction = "idle";
@@ -729,6 +792,81 @@ export function mountOperatorApp(
       });
   }
 
+  async function refreshCaptureReview(preferredCaptureId = captureReview.selectedCaptureId) {
+    const recentCaptures = client.recentCaptures?.bind(client);
+    const captureDetail = client.captureDetail?.bind(client);
+    const labelsSnapshot = client.labelsSnapshot?.bind(client);
+    if (
+      !recentCaptures ||
+      !captureDetail ||
+      !labelsSnapshot ||
+      auth.status !== "active" ||
+      !auth.session.session_id
+    ) {
+      return;
+    }
+
+    const requestSeq = ++captureReviewRequestSeq;
+    const sessionId = auth.session.session_id;
+    captureReview = { ...captureReview, loading: true, error: null };
+    render();
+    try {
+      const [recent, labels] = await Promise.all([
+        recentCaptures({ limit: 8 }),
+        labelsSnapshot()
+      ]);
+      if (
+        requestSeq !== captureReviewRequestSeq ||
+        auth.status !== "active" ||
+        auth.session.session_id !== sessionId
+      ) {
+        return;
+      }
+      const selectedCaptureId = selectCaptureIdForReview(
+        recent.captures,
+        preferredCaptureId ?? captureReview.selectedCaptureId
+      );
+      const detail = selectedCaptureId ? await captureDetail(selectedCaptureId) : null;
+      if (
+        requestSeq !== captureReviewRequestSeq ||
+        auth.status !== "active" ||
+        auth.session.session_id !== sessionId
+      ) {
+        return;
+      }
+      captureReview = captureReviewForView({
+        captures: recent.captures,
+        selectedCaptureId,
+        detail,
+        labels,
+        loading: false,
+        labelSaving: false,
+        error: null,
+        conflicts: captureReview.conflicts
+      });
+      clearRecoveryEvents("backend_unavailable");
+      render();
+    } catch (error) {
+      if (
+        requestSeq !== captureReviewRequestSeq ||
+        auth.status !== "active" ||
+        auth.session.session_id !== sessionId
+      ) {
+        return;
+      }
+      const display = runtimeDisplayError(error, "backend_unavailable");
+      captureReview = {
+        ...captureReview,
+        loading: false,
+        labelSaving: false,
+        error: display.message,
+        conflicts: []
+      };
+      recordRecoveryEvent({ code: display.code, message: display.message });
+      render();
+    }
+  }
+
   function syncCaptureFromActiveJob(jobId: string | null) {
     if (!jobId) {
       if (captureJob && isActiveCaptureStatus(captureJob.status)) {
@@ -815,6 +953,9 @@ export function mountOperatorApp(
             active_capture_job_id: isActiveCaptureStatus(nextJob.status) ? nextJob.job_id : null
           }
         };
+        if (!isActiveCaptureStatus(nextJob.status)) {
+          void refreshCaptureReview(nextJob.capture_id ?? captureReview.selectedCaptureId);
+        }
         render();
       })
       .catch((error) => {
@@ -846,6 +987,8 @@ export function mountOperatorApp(
     auth = { ...auth, status: "starting", error: null };
     validationStatus = INITIAL_VALIDATION_STATUS;
     validationRequestSeq += 1;
+    captureReview = EMPTY_CAPTURE_REVIEW;
+    captureReviewRequestSeq += 1;
     recoveryEvents = [];
     preview = null;
     previewRequestSeq += 1;
@@ -853,6 +996,15 @@ export function mountOperatorApp(
     submitCredential(auth, client, credential).then((next) => {
       applyAuthResult(requestSeq, next);
     });
+  });
+
+  root.addEventListener("submit", (event) => {
+    const form = event.target instanceof HTMLFormElement ? event.target : null;
+    if (!form || form.dataset.labelDrawerForm !== "capture") {
+      return;
+    }
+    event.preventDefault();
+    void submitCaptureLabels(form);
   });
 
   root.addEventListener("click", (event) => {
@@ -878,6 +1030,33 @@ export function mountOperatorApp(
 
   root.addEventListener("click", (event) => {
     const target = event.target instanceof Element ? event.target : null;
+    const reviewButton = target?.closest<HTMLButtonElement>("[data-capture-review-action]");
+    if (!reviewButton || reviewButton.disabled) {
+      return;
+    }
+    const action = reviewButton.dataset.captureReviewAction;
+    if (action === "refresh") {
+      void refreshCaptureReview();
+      return;
+    }
+    if (action === "select") {
+      const captureId = reviewButton.dataset.captureId;
+      if (captureId) {
+        captureReview = {
+          ...captureReview,
+          selectedCaptureId: captureId,
+          detail: null,
+          conflicts: [],
+          error: null
+        };
+        render();
+        void refreshCaptureReview(captureId);
+      }
+    }
+  });
+
+  root.addEventListener("click", (event) => {
+    const target = event.target instanceof Element ? event.target : null;
     const action = target?.closest<HTMLButtonElement>("[data-run-action]")?.dataset.runAction;
     if (!action || auth.status !== "active" || !auth.session.session_id) {
       return;
@@ -892,6 +1071,8 @@ export function mountOperatorApp(
       return;
     }
     if (action === "capture") {
+      captureError = null;
+      captureErrorCode = null;
       void triggerCapture();
     }
   });
@@ -1055,6 +1236,96 @@ export function mountOperatorApp(
         error: displayError
       };
       render("alert");
+    }
+  }
+
+  async function submitCaptureLabels(form: HTMLFormElement) {
+    const updateLabels = client.updateLabels?.bind(client);
+    const detail = captureReview.detail;
+    if (
+      !updateLabels ||
+      auth.status !== "active" ||
+      !auth.session.session_id ||
+      !detail ||
+      !captureIsLabelable(detail)
+    ) {
+      return;
+    }
+    const formData = new FormData(form);
+    const selectedRoles = LABEL_DRAWER_ROLES.filter(
+      (role) => formData.get(`label_${role}`) === "on"
+    );
+    const currentRoles = detail.labels.filter(isLabelRole);
+    const note = safePrivateNote(String(formData.get("private_note") ?? ""));
+    const updates = labelUpdatesForSelection(detail.capture_id, currentRoles, selectedRoles, note);
+    const dedupSelection = dedupUpdatesForSelection(detail.capture_id, formData);
+    if (dedupSelection.error) {
+      captureReview = {
+        ...captureReview,
+        conflicts: [dedupSelection.error],
+        error: null
+      };
+      render();
+      return;
+    }
+    const dedupUpdates = dedupSelection.updates;
+    if (updates.length === 0 && dedupUpdates.length === 0) {
+      captureReview = {
+        ...captureReview,
+        conflicts: [],
+        error: null
+      };
+      render();
+      return;
+    }
+
+    const requestSeq = ++captureReviewRequestSeq;
+    const sessionId = auth.session.session_id;
+    captureReview = { ...captureReview, labelSaving: true, conflicts: [], error: null };
+    render();
+    try {
+      const response = await updateLabels({
+        sessionId,
+        idempotencyKey: createIdempotencyKey(),
+        updates,
+        dedupUpdates
+      });
+      if (
+        requestSeq !== captureReviewRequestSeq ||
+        auth.status !== "active" ||
+        auth.session.session_id !== sessionId
+      ) {
+        return;
+      }
+      const conflicts = response.conflicts.map(sanitizeRuntimeDisplayError);
+      captureReview = {
+        ...captureReview,
+        labelSaving: false,
+        conflicts,
+        error: null
+      };
+      if (response.applied) {
+        form.reset();
+        void refreshCaptureReview(detail.capture_id);
+      } else {
+        if (conflicts.some((conflict) => conflict.code === "label_conflict")) {
+          recordRecoveryEvent({ code: "label_conflict", message: "Resolve the conflicting label role before saving the draft." });
+        }
+        render();
+      }
+    } catch (error) {
+      if (requestSeq !== captureReviewRequestSeq) {
+        return;
+      }
+      const display = runtimeDisplayError(error, "label_conflict");
+      captureReview = {
+        ...captureReview,
+        labelSaving: false,
+        conflicts: [display],
+        error: display.message
+      };
+      recordRecoveryEvent({ code: display.code, message: display.message });
+      render();
     }
   }
 
@@ -1549,6 +1820,267 @@ function applyInputRejectToState(
   return [...currentTail, entry].slice(-5);
 }
 
+function captureReviewForView(state: CaptureReviewState): CaptureReviewState {
+  return {
+    captures: state.captures,
+    selectedCaptureId: state.selectedCaptureId,
+    detail: state.detail,
+    labels: state.labels,
+    loading: state.loading,
+    labelSaving: state.labelSaving,
+    error: state.error ? safeBrowserMessage(state.error) : null,
+    conflicts: state.conflicts.map(sanitizeRuntimeDisplayError)
+  };
+}
+
+function selectCaptureIdForReview(
+  captures: CaptureSummary[],
+  preferredCaptureId: string | null
+): string | null {
+  if (preferredCaptureId && captures.some((capture) => capture.capture_id === preferredCaptureId)) {
+    return preferredCaptureId;
+  }
+  return captures[0]?.capture_id ?? null;
+}
+
+function renderCaptureReviewPanel(model: OperatorViewModel): string {
+  const review = model.captureReview;
+  const revision = review.labels ? `r${review.labels.label_revision}` : "no draft";
+  return `
+    <article class="panel capture-review-panel" aria-busy="${review.loading || review.labelSaving}" data-capture-review>
+      <div class="panel-header">
+        <div>
+          <p class="eyebrow">Capture Review</p>
+          <h2>${review.detail ? statusLabel(review.detail.status) : "recent"}</h2>
+        </div>
+        <div class="panel-actions">
+          <span class="status-pill">${escapeHtml(review.loading ? "loading" : revision)}</span>
+          <button
+            type="button"
+            data-capture-review-action="refresh"
+            ${model.auth.status !== "active" || review.loading ? "disabled" : ""}
+          >Refresh</button>
+        </div>
+      </div>
+      ${
+        review.error
+          ? `<p class="session-alert" role="alert" data-capture-review-alert>${escapeHtml(review.error)}</p>`
+          : ""
+      }
+      ${renderRecentCaptures(review)}
+      ${renderCaptureDetail(model)}
+    </article>
+  `;
+}
+
+function renderRecentCaptures(review: CaptureReviewState): string {
+  if (review.captures.length === 0) {
+    return `
+      <div class="empty-state" data-capture-empty>
+        <strong>No captures</strong>
+        <span>Waiting for completed captures.</span>
+      </div>
+    `;
+  }
+  return `
+    <ol class="capture-list" aria-label="Recent captures">
+      ${review.captures.map((capture) => renderCaptureRow(capture, review.selectedCaptureId)).join("")}
+    </ol>
+  `;
+}
+
+function renderCaptureRow(capture: CaptureSummary, selectedCaptureId: string | null): string {
+  const selected = capture.capture_id === selectedCaptureId;
+  return `
+    <li data-capture-status="${escapeHtml(capture.status)}">
+      <button
+        type="button"
+        data-capture-review-action="select"
+        data-capture-id="${escapeHtml(capture.capture_id)}"
+        aria-pressed="${selected}"
+      >
+        <span>#${capture.frame} ${escapeHtml(statusLabel(capture.status))}</span>
+        <strong>${escapeHtml(capture.capture_id)}</strong>
+        <em>${capture.labelable ? "labelable" : "not labelable"}</em>
+      </button>
+    </li>
+  `;
+}
+
+function renderCaptureDetail(model: OperatorViewModel): string {
+  const review = model.captureReview;
+  const detail = review.detail;
+  if (!detail) {
+    return "";
+  }
+  return `
+    <section class="capture-detail" data-capture-detail>
+      <div class="capture-detail-header">
+        <div>
+          <p class="eyebrow">Detail</p>
+          <h3>${escapeHtml(detail.capture_id)}</h3>
+        </div>
+        <span class="status-pill">${escapeHtml(captureLabelableStatus(detail))}</span>
+      </div>
+      <div class="capture-detail-grid">
+        <figure class="capture-preview">
+          <img
+            src="${escapeHtml(detail.preview_image_url)}"
+            alt="Capture preview"
+            width="256"
+            height="224"
+            loading="lazy"
+            data-capture-preview
+          />
+        </figure>
+        <dl class="provenance-list" aria-label="Sanitized provenance">
+          <div><dt>Source</dt><dd>${escapeHtml(detail.sanitized_provenance.capture_source)}</dd></div>
+          <div><dt>Layout</dt><dd>${escapeHtml(detail.sanitized_provenance.layout_hash)}</dd></div>
+          <div><dt>Spec</dt><dd>${escapeHtml(detail.sanitized_provenance.capture_spec_hash)}</dd></div>
+          <div><dt>Map</dt><dd>${escapeHtml(detail.sanitized_provenance.map_hash)}</dd></div>
+        </dl>
+      </div>
+      ${renderPrivilegedFeatureShell(detail)}
+      ${renderLabelDrawer(model)}
+    </section>
+  `;
+}
+
+function renderPrivilegedFeatureShell(detail: CaptureDetailResponse): string {
+  return `
+    <section class="feature-shell" data-feature-panel>
+      <div>
+        <p class="eyebrow">Privileged Features</p>
+        <h3>${detail.privileged_features_available ? "host available" : "unavailable"}</h3>
+      </div>
+      <span>${detail.privileged_features_available ? "withheld" : "none"}</span>
+    </section>
+  `;
+}
+
+function renderLabelDrawer(model: OperatorViewModel): string {
+  const review = model.captureReview;
+  const detail = review.detail;
+  if (!detail) {
+    return "";
+  }
+  const disabled = !captureIsLabelable(detail) || !model.auth.session.capabilities?.labels || review.labelSaving;
+  const conflictHints = labelConflictHints(detail, review.labels);
+  return `
+    <form class="label-drawer" data-label-drawer-form="capture" autocomplete="off">
+      <div class="capture-detail-header">
+        <div>
+          <p class="eyebrow">Label Drawer</p>
+          <h3>${disabled ? "locked" : "draft"}</h3>
+        </div>
+        <button type="submit" ${disabled ? "disabled" : ""}>${review.labelSaving ? "Saving" : "Save"}</button>
+      </div>
+      ${renderLabelConflictList([...conflictHints, ...review.conflicts.map((conflict) => conflict.message)])}
+      <fieldset class="label-options" ${disabled ? "disabled" : ""}>
+        <legend>Roles</legend>
+        ${LABEL_DRAWER_ROLES.map((role) => renderLabelOption(role, detail.labels.includes(role))).join("")}
+      </fieldset>
+      ${renderDedupEditorShell(review, detail)}
+      <label class="private-note-field">
+        Private note
+        <textarea
+          name="private_note"
+          maxlength="512"
+          rows="3"
+          autocomplete="off"
+          autocapitalize="none"
+          spellcheck="false"
+          data-private-note
+          ${disabled ? "disabled" : ""}
+        ></textarea>
+      </label>
+    </form>
+  `;
+}
+
+function renderLabelOption(role: LabelRole, checked: boolean): string {
+  return `
+    <label>
+      <input type="checkbox" name="label_${escapeHtml(role)}" ${checked ? "checked" : ""} />
+      <span>${escapeHtml(labelRoleLabel(role))}</span>
+    </label>
+  `;
+}
+
+function renderLabelConflictList(messages: string[]): string {
+  const safeMessages = messages.map((message) => safeBrowserMessage(message)).filter(Boolean);
+  if (safeMessages.length === 0) {
+    return "";
+  }
+  return `
+    <ul class="label-conflicts" data-label-conflicts>
+      ${safeMessages.map((message) => `<li>${escapeHtml(message)}</li>`).join("")}
+    </ul>
+  `;
+}
+
+function renderDedupEditorShell(
+  review: CaptureReviewState,
+  detail: CaptureDetailResponse
+): string {
+  const groups =
+    review.labels?.dedup_groups.filter((group) => group.capture_ids.includes(detail.capture_id)) ?? [];
+  return `
+    <section class="dedup-editor" data-dedup-editor>
+      <div class="capture-detail-header">
+        <div>
+          <p class="eyebrow">Dedup</p>
+          <h3>${groups.length > 0 ? "candidate" : "new draft"}</h3>
+        </div>
+        <span class="status-pill">${groups.length}</span>
+      </div>
+      ${
+        groups.length > 0
+          ? `<ul class="dedup-list">${groups.map(renderDedupGroupSummary).join("")}</ul>`
+          : ""
+      }
+      <div class="dedup-fields">
+        <label>
+          Relation
+          <select name="dedup_relation" ${captureIsLabelable(detail) ? "" : "disabled"}>
+            <option value="same_canonical_state">Same canonical state</option>
+            <option value="distinct_stable_state">Distinct stable state</option>
+          </select>
+        </label>
+        <label>
+          Compare capture
+          <input
+            type="text"
+            name="dedup_capture_id"
+            autocomplete="off"
+            spellcheck="false"
+            ${captureIsLabelable(detail) ? "" : "disabled"}
+          />
+        </label>
+        <label>
+          Changed feature
+          <input
+            type="text"
+            name="dedup_changed_feature"
+            autocomplete="off"
+            spellcheck="false"
+            ${captureIsLabelable(detail) ? "" : "disabled"}
+          />
+        </label>
+      </div>
+    </section>
+  `;
+}
+
+function renderDedupGroupSummary(group: LabelsSnapshotResponse["dedup_groups"][number]): string {
+  return `
+    <li>
+      <strong>${escapeHtml(dedupRelationLabel(group.expected_relation))}</strong>
+      <span>${group.capture_ids.length} captures, ${escapeHtml(group.status ?? "candidate")}</span>
+    </li>
+  `;
+}
+
 function renderPreviewImage(model: OperatorViewModel): string {
   if (!model.auth.session.active || !model.preview) {
     return "";
@@ -1671,6 +2203,197 @@ function validationStatusFromViewState(
     case "idle":
       return "not_run";
   }
+}
+
+const LABEL_DRAWER_ROLES: LabelRole[] = [
+  "first_boss",
+  "goal_positive",
+  "goal_negative",
+  "needs_review",
+  "rejected"
+];
+
+function captureIsLabelable(detail: CaptureDetailResponse): boolean {
+  return detail.labelable && detail.status !== "not_labelable" && detail.status !== "failed";
+}
+
+function captureLabelableStatus(detail: CaptureDetailResponse): string {
+  if (detail.status === "not_labelable") {
+    return "not labelable";
+  }
+  if (detail.status === "failed") {
+    return "failed";
+  }
+  return detail.labelable ? "labelable" : "locked";
+}
+
+function labelUpdatesForSelection(
+  captureId: string,
+  currentRoles: LabelRole[],
+  selectedRoles: LabelRole[],
+  note: string | null
+): LabelUpdate[] {
+  const updates: LabelUpdate[] = [];
+  for (const role of LABEL_DRAWER_ROLES) {
+    const wasSelected = currentRoles.includes(role);
+    const isSelected = selectedRoles.includes(role);
+    if (isSelected && !wasSelected) {
+      updates.push({ op: "upsert", capture_id: captureId, role, confidence: "candidate" });
+    }
+    if (!isSelected && wasSelected) {
+      updates.push({ op: "delete", capture_id: captureId, role });
+    }
+  }
+  if (note && selectedRoles.length > 0) {
+    const noteTarget = updates.find((update) => update.op === "upsert") ?? {
+      op: "upsert" as const,
+      capture_id: captureId,
+      role: selectedRoles[0]!,
+      confidence: "candidate" as const
+    };
+    noteTarget.note = note;
+    if (!updates.includes(noteTarget)) {
+      updates.push(noteTarget);
+    }
+  }
+  return updates;
+}
+
+function dedupUpdatesForSelection(captureId: string, formData: FormData): DedupSelection {
+  const rawCompareCaptureId = String(formData.get("dedup_capture_id") ?? "").trim();
+  const rawChangedFeature = String(formData.get("dedup_changed_feature") ?? "").trim();
+  if (!rawCompareCaptureId && !rawChangedFeature) {
+    return { updates: [], error: null };
+  }
+  const compareCaptureId = safeContractInput(rawCompareCaptureId);
+  const changedFeature = safePublicFeatureName(rawChangedFeature);
+  const relation = String(formData.get("dedup_relation") ?? "");
+  if (
+    !compareCaptureId ||
+    !changedFeature ||
+    compareCaptureId === captureId
+  ) {
+    return {
+      updates: [],
+      error: safeValidationError("Enter a different capture id and a public changed feature.")
+    };
+  }
+  if (relation !== "same_canonical_state" && relation !== "distinct_stable_state") {
+    return {
+      updates: [],
+      error: safeValidationError("Choose a dedup relation.")
+    };
+  }
+  return {
+    updates: [
+      {
+        op: "upsert",
+        group_id: dedupGroupId(captureId, compareCaptureId),
+        expected_relation: relation,
+        capture_ids: [captureId, compareCaptureId],
+        changed_features: [changedFeature],
+        status: "candidate"
+      }
+    ],
+    error: null
+  };
+}
+
+function dedupGroupId(captureId: string, compareCaptureId: string): string {
+  const pair = [captureId, compareCaptureId].sort();
+  const left = pair[0]!;
+  const right = pair[1]!;
+  return `dedup-${left.slice(0, 48)}-${right.slice(0, 48)}`;
+}
+
+function safeContractInput(value: string): string | null {
+  const normalized = value.trim();
+  return /^[A-Za-z0-9._:-]{1,128}$/.test(normalized) ? normalized : null;
+}
+
+function safePublicFeatureName(value: string): string | null {
+  const normalized = value.trim().replace(/\s+/g, " ");
+  return /^[A-Za-z0-9 _.-]{1,128}$/.test(normalized) ? normalized : null;
+}
+
+function safeValidationError(message: string): RuntimeErrorDisplay {
+  return {
+    code: "bad_request",
+    message,
+    retryable: false,
+    details: {}
+  };
+}
+
+function safePrivateNote(value: string): string | null {
+  const normalized = value.trim().replace(/\s+/g, " ");
+  if (!normalized || normalized.length > 512 || /[\u0000-\u001f\u007f]/.test(normalized)) {
+    return null;
+  }
+  return normalized;
+}
+
+function labelConflictHints(
+  detail: CaptureDetailResponse,
+  labels: LabelsSnapshotResponse | null
+): string[] {
+  if (!labels) {
+    return [];
+  }
+  const hints: string[] = [];
+  for (const role of ["first_boss", "goal_positive", "goal_negative"] as const) {
+    const assignedCapture = labels.target_labels[role];
+    if (assignedCapture && assignedCapture !== detail.capture_id && detail.labels.includes(role)) {
+      hints.push(`${labelRoleLabel(role)} is assigned to another capture.`);
+    }
+  }
+  const rejected = labels.status_labels.some(
+    (status) => status.capture_id === detail.capture_id && status.status === "rejected"
+  );
+  const hasTarget = detail.labels.some((role) =>
+    ["first_boss", "goal_positive", "goal_negative"].includes(role)
+  );
+  if (rejected && hasTarget) {
+    hints.push("Rejected captures cannot also be target labels.");
+  }
+  return hints;
+}
+
+function isLabelRole(value: string): value is LabelRole {
+  return (LABEL_DRAWER_ROLES as readonly string[]).includes(value);
+}
+
+function labelRoleLabel(role: LabelRole): string {
+  switch (role) {
+    case "first_boss":
+      return "first boss";
+    case "goal_positive":
+      return "goal positive";
+    case "goal_negative":
+      return "goal negative";
+    case "needs_review":
+      return "needs review";
+    case "rejected":
+      return "rejected";
+  }
+}
+
+function dedupRelationLabel(relation: "same_canonical_state" | "distinct_stable_state"): string {
+  switch (relation) {
+    case "same_canonical_state":
+      return "same state";
+    case "distinct_stable_state":
+      return "distinct state";
+  }
+}
+
+function sanitizeRuntimeDisplayError(error: RuntimeErrorDisplay): RuntimeErrorDisplay {
+  return {
+    code: error.code,
+    message: safeBrowserMessage(error.message, recoveryDefaultMessage(error.code)),
+    retryable: error.retryable,
+    details: {}
+  };
 }
 
 function captureJobFromTrigger(response: CaptureTriggerResponse): CaptureJobView {
@@ -1981,6 +2704,10 @@ function captureButtonDisabled(model: OperatorViewModel): boolean {
     !model.preview ||
     !model.auth.session.capabilities?.capture
   );
+}
+
+function captureActionLabel(model: OperatorViewModel): string {
+  return model.captureError || model.captureJob?.status === "failed" ? "Retry" : "Trigger";
 }
 
 function captureStatusSummary(model: OperatorViewModel): string {

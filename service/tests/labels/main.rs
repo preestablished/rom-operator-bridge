@@ -18,7 +18,8 @@ use rom_operator_bridge_service::{
     config::ServiceConfig,
     framebuffer::{SYNTHETIC_FRAME_HEIGHT, SYNTHETIC_FRAME_WIDTH, synthetic_frame_png},
     labels::{
-        ChangedOffsetRange, DedupGroup, DedupRelation, DedupStatus, LabelState, LabelStoreError,
+        ChangedOffsetRange, DedupGroup, DedupOp, DedupRelation, DedupStatus, DedupUpdate,
+        LabelState, LabelStoreError,
     },
     private_config::{ENV_OPERATOR_CREDENTIAL, ENV_PRIVATE_ROOT, ENV_SESSION_SECRET},
 };
@@ -313,6 +314,103 @@ async fn notes_schema_and_active_capture_validation_reject_bad_updates() {
 }
 
 #[tokio::test]
+async fn dedup_only_label_requests_validate_and_apply_public_groups() {
+    let (_workspace, app, _private_root) = labels_app(LabelBackend::new([16, 17]));
+    let cookie = login_cookie(app.clone()).await;
+    let first = complete_capture(
+        app.clone(),
+        &cookie,
+        16,
+        "00000000-0000-4000-8000-000000003201",
+    )
+    .await;
+    let second = complete_capture(
+        app.clone(),
+        &cookie,
+        17,
+        "00000000-0000-4000-8000-000000003202",
+    )
+    .await;
+    let first_id = first["capture_id"].as_str().expect("capture id");
+    let second_id = second["capture_id"].as_str().expect("capture id");
+
+    let dedup_only = request_json(
+        app.clone(),
+        runtime_json_request(
+            Method::POST,
+            "/api/labels",
+            &cookie,
+            json!({
+                "schema_version": 1,
+                "session_id": SESSION_ID,
+                "idempotency_key": "00000000-0000-4000-8000-000000003203",
+                "updates": [],
+                "dedup_updates": [{
+                    "op": "upsert",
+                    "group_id": "dedup-http-public",
+                    "expected_relation": "same_canonical_state",
+                    "capture_ids": [first_id, second_id],
+                    "changed_features": ["safe feature"],
+                    "status": "candidate"
+                }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(dedup_only["applied"], true);
+
+    let snapshot = request_json(app.clone(), runtime_get("/api/labels", &cookie)).await;
+    assert_eq!(snapshot["dedup_groups"][0]["group_id"], "dedup-http-public");
+    assert_eq!(
+        snapshot["dedup_groups"][0]["changed_features"],
+        json!(["safe feature"])
+    );
+
+    let private_feature = request_json(
+        app.clone(),
+        runtime_json_request(
+            Method::POST,
+            "/api/labels",
+            &cookie,
+            json!({
+                "schema_version": 1,
+                "session_id": SESSION_ID,
+                "idempotency_key": "00000000-0000-4000-8000-000000003204",
+                "updates": [],
+                "dedup_updates": [{
+                    "op": "upsert",
+                    "group_id": "dedup-http-public",
+                    "expected_relation": "distinct_stable_state",
+                    "capture_ids": [first_id, second_id],
+                    "changed_features": ["/home/operator/private-feature"],
+                    "status": "candidate"
+                }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(private_feature["applied"], false);
+    assert_eq!(private_feature["conflicts"][0]["code"], "bad_request");
+
+    let empty = app
+        .oneshot(runtime_json_request(
+            Method::POST,
+            "/api/labels",
+            &cookie,
+            json!({
+                "schema_version": 1,
+                "session_id": SESSION_ID,
+                "idempotency_key": "00000000-0000-4000-8000-000000003205",
+                "updates": [],
+                "dedup_updates": []
+            }),
+        ))
+        .await
+        .expect("empty dedup request runs");
+    assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn session_boundaries_clear_labels_and_old_captures() {
     let (_workspace, app, _private_root) = labels_app(LabelBackend::new([5]));
     let cookie = login_cookie(app.clone()).await;
@@ -463,6 +561,64 @@ fn dedup_groups_update_delete_and_validate_shape() {
         }),
         Err(LabelStoreError::Conflict(_))
     ));
+    let public_apply = labels
+        .apply(
+            rom_operator_bridge_service::labels::LabelApplyRequest {
+                session_id: SESSION_ID.to_string(),
+                idempotency_key: "00000000-0000-4000-8000-000000006000".to_string(),
+                updates: Vec::new(),
+                dedup_updates: vec![DedupUpdate {
+                    op: DedupOp::Upsert,
+                    group_id: "dedup-public".to_string(),
+                    expected_relation: Some(DedupRelation::DistinctStableState),
+                    capture_ids: Some(vec!["capture-c".to_string(), "capture-d".to_string()]),
+                    changed_features: Some(vec!["safe feature".to_string()]),
+                    changed_offset_ranges: None,
+                    status: Some(DedupStatus::Candidate),
+                }],
+            },
+            |_| true,
+            None,
+        )
+        .expect("public dedup update applies");
+    assert_eq!(public_apply.label_revision, 2);
+    assert_eq!(
+        labels.snapshot().dedup_groups[1].expected_relation,
+        DedupRelation::DistinctStableState
+    );
+    assert!(matches!(
+        labels.upsert_dedup_group(DedupGroup {
+            group_id: "dedup-public-reverse".to_string(),
+            expected_relation: DedupRelation::SameCanonicalState,
+            capture_ids: vec!["capture-d".to_string(), "capture-c".to_string()],
+            changed_features: vec!["safe feature".to_string()],
+            changed_offset_ranges: Vec::new(),
+            status: Some(DedupStatus::Candidate),
+        }),
+        Err(LabelStoreError::Conflict(_))
+    ));
+    let private_feature = labels
+        .apply(
+            rom_operator_bridge_service::labels::LabelApplyRequest {
+                session_id: SESSION_ID.to_string(),
+                idempotency_key: "00000000-0000-4000-8000-000000006002".to_string(),
+                updates: Vec::new(),
+                dedup_updates: vec![DedupUpdate {
+                    op: DedupOp::Upsert,
+                    group_id: "dedup-private-feature".to_string(),
+                    expected_relation: Some(DedupRelation::SameCanonicalState),
+                    capture_ids: Some(vec!["capture-e".to_string(), "capture-f".to_string()]),
+                    changed_features: Some(vec!["/home/operator/private-feature".to_string()]),
+                    changed_offset_ranges: None,
+                    status: Some(DedupStatus::Candidate),
+                }],
+            },
+            |_| true,
+            None,
+        )
+        .expect("private feature path is reported as conflict");
+    assert!(!private_feature.applied);
+    assert_eq!(private_feature.label_revision, 2);
 
     let rejected = labels
         .apply(
@@ -476,12 +632,13 @@ fn dedup_groups_update_delete_and_validate_shape() {
                     confidence: None,
                     note: None,
                 }],
+                dedup_updates: Vec::new(),
             },
             |_| true,
             None,
         )
         .expect("rejected label applies");
-    assert_eq!(rejected.label_revision, 2);
+    assert_eq!(rejected.label_revision, 3);
     assert!(matches!(
         labels.upsert_dedup_group(DedupGroup {
             group_id: "dedup-rejected".to_string(),
@@ -497,8 +654,8 @@ fn dedup_groups_update_delete_and_validate_shape() {
     let revision = labels
         .delete_dedup_group("dedup-001")
         .expect("dedup group deletes");
-    assert_eq!(revision, 3);
-    assert!(labels.snapshot().dedup_groups.is_empty());
+    assert_eq!(revision, 4);
+    assert_eq!(labels.snapshot().dedup_groups.len(), 1);
 }
 
 async fn complete_capture(

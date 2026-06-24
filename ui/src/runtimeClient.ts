@@ -222,6 +222,16 @@ export type LabelUpdate = {
   note?: string;
 };
 
+export type DedupUpdate = {
+  op: "upsert" | "delete";
+  group_id: string;
+  expected_relation?: "same_canonical_state" | "distinct_stable_state";
+  capture_ids?: string[];
+  changed_features?: string[];
+  changed_offset_ranges?: ChangedOffsetRange[];
+  status?: "candidate" | "confirmed" | "conflict";
+};
+
 export type LabelsResponse = {
   schema_version: 1;
   applied: boolean;
@@ -421,15 +431,26 @@ export class RuntimeApiClient {
     sessionId: string;
     idempotencyKey: string;
     updates: LabelUpdate[];
+    dedupUpdates?: DedupUpdate[];
   }): Promise<LabelsResponse> {
+    const body: {
+      schema_version: 1;
+      session_id: string;
+      idempotency_key: string;
+      updates: LabelUpdate[];
+      dedup_updates?: DedupUpdate[];
+    } = {
+      schema_version: RUNTIME_API_SCHEMA_VERSION,
+      session_id: input.sessionId,
+      idempotency_key: input.idempotencyKey,
+      updates: input.updates
+    };
+    if (input.dedupUpdates?.length) {
+      body.dedup_updates = input.dedupUpdates;
+    }
     return this.request("/labels", parseLabelsResponse, {
       method: "POST",
-      body: {
-        schema_version: RUNTIME_API_SCHEMA_VERSION,
-        session_id: input.sessionId,
-        idempotency_key: input.idempotencyKey,
-        updates: input.updates
-      }
+      body
     });
   }
 

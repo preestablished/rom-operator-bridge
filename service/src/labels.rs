@@ -51,6 +51,18 @@ impl LabelState {
                 conflicts.push(LabelConflict::bad_request("Label note is invalid.", false));
             }
         }
+        for update in &request.dedup_updates {
+            if let Some(group) = update.group() {
+                for capture_id in &group.capture_ids {
+                    if !can_label_capture(capture_id) {
+                        conflicts.push(LabelConflict::label(
+                            "Dedup captures must be labelable in the active run.",
+                            false,
+                        ));
+                    }
+                }
+            }
+        }
         if !conflicts.is_empty() {
             let outcome = LabelApplyOutcome {
                 applied: false,
@@ -73,6 +85,43 @@ impl LabelState {
                 },
                 LabelOp::Delete => {
                     changed_captures.extend(next.delete(update));
+                }
+            }
+        }
+        for update in &request.dedup_updates {
+            match update.op {
+                DedupOp::Upsert => {
+                    let Some(group) = update.group() else {
+                        conflicts.push(LabelConflict::bad_request(
+                            "Dedup update is invalid.",
+                            false,
+                        ));
+                        continue;
+                    };
+                    match validate_dedup_group(&next, &group) {
+                        Ok(()) => {
+                            changed_captures.extend(group.capture_ids.iter().cloned());
+                            next.dedup_groups.insert(group.group_id.clone(), group);
+                        }
+                        Err(LabelStoreError::Conflict(next_conflicts)) => {
+                            conflicts.extend(next_conflicts)
+                        }
+                        Err(LabelStoreError::BackendUnavailable) => {
+                            return Err(LabelStoreError::BackendUnavailable);
+                        }
+                    }
+                }
+                DedupOp::Delete => {
+                    if !is_contract_id(&update.group_id) {
+                        conflicts.push(LabelConflict::bad_request(
+                            "Dedup group id is invalid.",
+                            false,
+                        ));
+                        continue;
+                    }
+                    if let Some(group) = next.dedup_groups.remove(&update.group_id) {
+                        changed_captures.extend(group.capture_ids);
+                    }
                 }
             }
         }
@@ -331,6 +380,7 @@ pub struct LabelApplyRequest {
     pub session_id: String,
     pub idempotency_key: String,
     pub updates: Vec<LabelUpdate>,
+    pub dedup_updates: Vec<DedupUpdate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -387,9 +437,41 @@ pub struct LabelUpdate {
     pub note: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DedupUpdate {
+    pub op: DedupOp,
+    pub group_id: String,
+    pub expected_relation: Option<DedupRelation>,
+    pub capture_ids: Option<Vec<String>>,
+    pub changed_features: Option<Vec<String>>,
+    pub changed_offset_ranges: Option<Vec<ChangedOffsetRange>>,
+    pub status: Option<DedupStatus>,
+}
+
+impl DedupUpdate {
+    fn group(&self) -> Option<DedupGroup> {
+        Some(DedupGroup {
+            group_id: self.group_id.clone(),
+            expected_relation: self.expected_relation?,
+            capture_ids: self.capture_ids.clone()?,
+            changed_features: self.changed_features.clone().unwrap_or_default(),
+            changed_offset_ranges: self.changed_offset_ranges.clone().unwrap_or_default(),
+            status: self.status,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LabelOp {
+    Upsert,
+    Delete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DedupOp {
     Upsert,
     Delete,
 }
@@ -507,14 +589,14 @@ pub struct DedupGroup {
     pub status: Option<DedupStatus>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DedupRelation {
     SameCanonicalState,
     DistinctStableState,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DedupStatus {
     Candidate,
@@ -522,7 +604,7 @@ pub enum DedupStatus {
     Conflict,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangedOffsetRange {
     pub start: u64,
     pub len: u64,
@@ -538,7 +620,7 @@ fn validate_dedup_group(inner: &LabelInner, group: &DedupGroup) -> Result<(), La
     }
     let mut captures = BTreeSet::new();
     for capture_id in &group.capture_ids {
-        if !is_contract_id(capture_id) || !captures.insert(capture_id) {
+        if !is_contract_id(capture_id) || !captures.insert(capture_id.clone()) {
             conflicts.push(LabelConflict::bad_request(
                 "Dedup group capture ids are invalid.",
                 false,
@@ -549,6 +631,20 @@ fn validate_dedup_group(inner: &LabelInner, group: &DedupGroup) -> Result<(), La
                 "Rejected captures cannot be in dedup groups.",
                 false,
             ));
+        }
+    }
+    if !captures.is_empty() {
+        for existing in inner.dedup_groups.values() {
+            if existing.group_id == group.group_id {
+                continue;
+            }
+            let existing_captures: BTreeSet<_> = existing.capture_ids.iter().cloned().collect();
+            if existing_captures == captures {
+                conflicts.push(LabelConflict::label(
+                    "Dedup group already exists for these captures.",
+                    false,
+                ));
+            }
         }
     }
     if group.capture_ids.len() < 2 {
@@ -565,11 +661,7 @@ fn validate_dedup_group(inner: &LabelInner, group: &DedupGroup) -> Result<(), La
     }
     let mut features = BTreeSet::new();
     for feature in &group.changed_features {
-        if feature.is_empty()
-            || feature.len() > 128
-            || !valid_note(feature)
-            || !features.insert(feature)
-        {
+        if !valid_public_feature_name(feature) || !features.insert(feature) {
             conflicts.push(LabelConflict::bad_request(
                 "Dedup changed feature is invalid.",
                 false,
@@ -593,6 +685,14 @@ fn validate_dedup_group(inner: &LabelInner, group: &DedupGroup) -> Result<(), La
 
 fn valid_note(note: &str) -> bool {
     note.len() <= 512 && !note.chars().any(char::is_control)
+}
+
+fn valid_public_feature_name(feature: &str) -> bool {
+    !feature.is_empty()
+        && feature.len() <= 128
+        && feature.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, ' ' | '_' | '-' | '.')
+        })
 }
 
 fn is_contract_id(candidate: &str) -> bool {
