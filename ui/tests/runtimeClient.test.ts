@@ -29,6 +29,7 @@ const capabilities = {
 describe("runtime API client", () => {
   it("covers typed session, run, frame, capture, and labels requests without URL credentials", async () => {
     const fetcher = queuedFetch([
+      healthResponse(),
       startSessionResponse(),
       runStatusResponse(),
       sessionResponse(),
@@ -45,6 +46,7 @@ describe("runtime API client", () => {
     ]);
     const client = new RuntimeApiClient(config, { fetcher });
 
+    const health = await client.health();
     const started = await client.startSession({
       operatorCredential: "operator-secret",
       requestedCapabilities: ["input", "preview"]
@@ -62,15 +64,16 @@ describe("runtime API client", () => {
       observedPreviewFrame: 42
     });
     await client.captureJob("job-001");
-    await client.recentCaptures("cursor-001");
+    await client.recentCaptures({ cursor: "cursor-001", limit: 25 });
     await client.captureDetail("capture-001");
     await client.updateLabels({
       sessionId: "session-001",
       idempotencyKey: "00000000-0000-0000-0000-000000000002",
       updates: [{ op: "upsert", capture_id: "capture-001", role: "first_boss" }]
     });
-    const labelSnapshot = await client.labelsSnapshot("session-001");
+    const labelSnapshot = await client.labelsSnapshot();
 
+    expect(health).toMatchObject({ ok: true, backend_mode: "synthetic", runtime_api: 1 });
     expect(model).toMatchObject({
       active: true,
       session_id: "session-001",
@@ -90,6 +93,7 @@ describe("runtime API client", () => {
       }
     ]);
     expect(fetcher.calls.map((call) => call.url)).toEqual([
+      "/health",
       "/api/session/start",
       "/api/run/status",
       "/api/session",
@@ -99,15 +103,35 @@ describe("runtime API client", () => {
       "/api/frame/current",
       "/api/capture/trigger",
       "/api/capture/jobs/job-001",
-      "/api/capture/recent?cursor=cursor-001",
+      "/api/capture/recent?cursor=cursor-001&limit=25",
       "/api/capture/capture-001",
       "/api/labels",
-      "/api/labels?session_id=session-001"
+      "/api/labels"
     ]);
-    expect(fetcher.calls[0]?.url).not.toContain("operator-secret");
-    expect(JSON.parse(String(fetcher.calls[0]?.init.body))).toMatchObject({
+    expect(fetcher.calls[1]?.url).not.toContain("operator-secret");
+    expect(bodyAt(fetcher, 1)).toMatchObject({
       schema_version: 1,
       operator_credential: "operator-secret"
+    });
+    expect(bodyAt(fetcher, 4)).toEqual({
+      schema_version: 1,
+      session_id: "session-001",
+      reason: "operator_stop"
+    });
+    expect(bodyAt(fetcher, 5)).toEqual({ schema_version: 1, session_id: "session-001" });
+    expect(bodyAt(fetcher, 6)).toEqual({ schema_version: 1, session_id: "session-001" });
+    expect(bodyAt(fetcher, 8)).toEqual({
+      schema_version: 1,
+      session_id: "session-001",
+      idempotency_key: "00000000-0000-0000-0000-000000000001",
+      observed_preview_frame: 42,
+      reason: "operator_mark"
+    });
+    expect(bodyAt(fetcher, 12)).toEqual({
+      schema_version: 1,
+      session_id: "session-001",
+      idempotency_key: "00000000-0000-0000-0000-000000000002",
+      updates: [{ op: "upsert", capture_id: "capture-001", role: "first_boss" }]
     });
     for (const call of fetcher.calls) {
       expect(call.init.credentials).toBe("same-origin");
@@ -128,6 +152,93 @@ describe("runtime API client", () => {
         retryable: false
       }
     });
+  });
+
+  it("rejects wrong-version and malformed non-2xx error envelopes", async () => {
+    const wrongVersion = new RuntimeApiClient(config, {
+      fetcher: queuedFetch(
+        [
+          {
+            schema_version: 2,
+            error: {
+              code: "backend_unavailable",
+              message: "Backend unavailable.",
+              retryable: true,
+              details: {}
+            }
+          }
+        ],
+        503
+      )
+    });
+
+    await expect(wrongVersion.sessionStatus()).rejects.toMatchObject({
+      status: 503,
+      display: {
+        code: "bad_request",
+        message: "Runtime schema mismatch.",
+        retryable: false,
+        details: {}
+      }
+    });
+
+    const malformed = new RuntimeApiClient(config, {
+      fetcher: queuedFetch([{ schema_version: 1, error: { code: "auth_rejected" } }], 403)
+    });
+
+    await expect(malformed.sessionStatus()).rejects.toMatchObject({
+      status: 403,
+      display: {
+        code: "bad_request",
+        message: "Runtime schema mismatch.",
+        retryable: false,
+        details: {}
+      }
+    });
+  });
+
+  it("rejects malformed v1 HTTP payloads before exposing typed data", async () => {
+    const cases: Array<{
+      payload: unknown;
+      request: (client: RuntimeApiClient) => Promise<unknown>;
+    }> = [
+      {
+        payload: { ...startSessionResponse(), session_id: "../private" },
+        request: (client) => client.startSession({ operatorCredential: "operator-secret" })
+      },
+      {
+        payload: { ...frameCurrentResponse(), image_url: "https://example.test/private.png" },
+        request: (client) => client.currentFrame()
+      },
+      {
+        payload: { ...captureDetailResponse(), private_path: "/home/operator/private.bin" },
+        request: (client) => client.captureDetail("capture-001")
+      },
+      {
+        payload: {
+          ...labelsSnapshotResponse(),
+          dedup_groups: [
+            {
+              group_id: "dedup-001",
+              expected_relation: "same_canonical_state",
+              capture_ids: ["capture-001", "capture-002"]
+            }
+          ]
+        },
+        request: (client) => client.labelsSnapshot()
+      }
+    ];
+
+    for (const testCase of cases) {
+      const client = new RuntimeApiClient(config, { fetcher: queuedFetch([testCase.payload]) });
+      await expect(testCase.request(client)).rejects.toMatchObject({
+        display: {
+          code: "bad_request",
+          message: "Runtime schema mismatch.",
+          retryable: false
+        }
+      });
+    }
   });
 
   it("turns auth and origin error envelopes into sanitized display data", async () => {
@@ -201,6 +312,8 @@ describe("runtime WebSocket clients", () => {
       location: { protocol: "https:", host: "rombridge.test" },
       maxReconnects: 1,
       reconnectDelayMs: 5,
+      createClientEventId: () => "00000000-0000-0000-0000-000000000003",
+      nowMs: () => 30,
       setTimer: (callback) => {
         timers.push(callback);
         return timers.length as unknown as ReturnType<typeof setTimeout>;
@@ -223,6 +336,8 @@ describe("runtime WebSocket clients", () => {
     expect(firstSocket.url).toBe("wss://rombridge.test/ws/input");
     expect(firstSocket.url).not.toContain("credential");
     expect(seq).toBe(1);
+    expect(firstSocket.sent).toEqual([]);
+    firstSocket.emitOpen();
     expect(JSON.parse(firstSocket.sent[0]!)).toEqual({
       schema_version: 1,
       type: "input_state",
@@ -256,29 +371,141 @@ describe("runtime WebSocket clients", () => {
 
     firstSocket.emitClose();
     expect(reconnects).toEqual([1]);
+    expect(
+      input.sendInput({
+        clientEventId: "00000000-0000-0000-0000-000000000002",
+        clientTimeMs: 20,
+        source: "keyboard",
+        buttons: ["B"]
+      })
+    ).toBe(2);
     timers[0]?.();
     expect(FakeWebSocket.instances).toHaveLength(2);
+    const secondSocket = FakeWebSocket.instances[1]!;
+    secondSocket.emitOpen();
+    expect(secondSocket.sent).toHaveLength(1);
+    expect(JSON.parse(secondSocket.sent[0]!)).toMatchObject({
+      schema_version: 1,
+      type: "input_state",
+      session_id: "session-001",
+      client_seq: 3,
+      source_id: "keyboard",
+      server_seq: null,
+      payload: {
+        client_event_id: "00000000-0000-0000-0000-000000000003",
+        client_time_ms: 30,
+        source: "keyboard",
+        buttons: []
+      }
+    });
     input.close();
   });
 
-  it("checks server event ordering and reports stale event streams", () => {
+  it("checks server event ordering and ignores stale event streams", () => {
     const errors: RuntimeApiError[] = [];
+    const messages: RuntimeWsMessage[] = [];
     const client = new RuntimeWebSocketClient(config, {
       socketConstructor: FakeWebSocket,
       location: { protocol: "http:", host: "localhost:5173" },
       maxReconnects: 0
     });
 
-    client.eventSocket({ onError: (error) => errors.push(error) });
+    client.eventSocket({
+      onMessage: (message) => messages.push(message),
+      onError: (error) => errors.push(error)
+    });
     const socket = FakeWebSocket.instances[0]!;
+    socket.emitOpen();
     socket.emitMessage(serverEvent(2));
     socket.emitMessage(serverEvent(2));
 
     expect(socket.url).toBe("ws://localhost:5173/ws/events");
-    expect(errors[0]?.display).toMatchObject({
-      code: "bad_request",
-      message: "Runtime event ordering error."
+    expect(messages).toHaveLength(1);
+    expect(errors).toEqual([]);
+  });
+
+  it("rejects malformed WebSocket event payloads by message type", () => {
+    const malformedEvents = [
+      {
+        ...serverEventOf("session_updated", 1, {
+          state: "running",
+          backend_mode: "synthetic",
+          current_frame: 2
+        })
+      },
+      {
+        ...serverEvent(1),
+        payload: {
+          state: "running",
+          current_frame: 2,
+          preview_stale: false,
+          active_capture_job_id: null,
+          private_path: "/home/operator/private.bin"
+        }
+      },
+      serverEventOf("capture_updated", 1, {
+        job_id: "job-001",
+        status: "completed",
+        capture_id: "../private"
+      }),
+      serverEventOf("label_updated", 1, {
+        label_revision: -1,
+        applied: true
+      }),
+      serverEventOf("validation_updated", 1, {
+        status: "passed",
+        summary: 42
+      })
+    ];
+
+    for (const event of malformedEvents) {
+      FakeWebSocket.instances = [];
+      const errors: RuntimeApiError[] = [];
+      const client = new RuntimeWebSocketClient(config, {
+        socketConstructor: FakeWebSocket,
+        location: { protocol: "http:", host: "localhost:5173" },
+        maxReconnects: 0
+      });
+      client.eventSocket({ onError: (error) => errors.push(error) });
+      const socket = FakeWebSocket.instances[0]!;
+      socket.emitOpen();
+      socket.emitMessage(event);
+
+      expect(errors[0]?.display).toMatchObject({
+        code: "bad_request",
+        message: "Runtime schema mismatch.",
+        retryable: false
+      });
+    }
+  });
+
+  it("rejects input acknowledgements for the wrong session or invalid pad words", () => {
+    const errors: RuntimeApiError[] = [];
+    const messages: RuntimeWsMessage[] = [];
+    const client = new RuntimeWebSocketClient(config, {
+      socketConstructor: FakeWebSocket,
+      location: { protocol: "https:", host: "rombridge.test" },
+      maxReconnects: 0
     });
+    client.inputSocket("session-001", "keyboard", {
+      onMessage: (message) => messages.push(message),
+      onError: (error) => errors.push(error)
+    });
+    const socket = FakeWebSocket.instances[0]!;
+    socket.emitOpen();
+
+    socket.emitMessage(inputAck({ session_id: "session-002" }));
+    socket.emitMessage(inputAck({ payload: { ...inputAckPayload(), pad_word: 4096 } }));
+
+    expect(messages).toEqual([]);
+    expect(errors).toHaveLength(2);
+    for (const error of errors) {
+      expect(error.display).toMatchObject({
+        code: "bad_request",
+        message: "Runtime schema mismatch.",
+        retryable: false
+      });
+    }
   });
 });
 
@@ -297,6 +524,20 @@ function queuedFetch(payloads: unknown[], status = 200): ((input: RequestInfo | 
     });
   };
   return Object.assign(fetcher, { calls });
+}
+
+function bodyAt(fetcher: { calls: FetchCall[] }, index: number): unknown {
+  return JSON.parse(String(fetcher.calls[index]?.init.body));
+}
+
+function healthResponse() {
+  return {
+    schema_version: 1,
+    ok: true,
+    service_version: "0.1.0",
+    backend_mode: "synthetic",
+    runtime_api: 1
+  };
 }
 
 function startSessionResponse() {
@@ -450,24 +691,51 @@ function labelsSnapshotResponse() {
 }
 
 function serverEvent(serverSeq: number) {
+  return serverEventOf("run_updated", serverSeq, {
+    state: "running",
+    current_frame: 2,
+    preview_stale: false,
+    active_capture_job_id: null
+  });
+}
+
+function serverEventOf(type: string, serverSeq: number, payload: unknown) {
   return {
     schema_version: 1,
-    type: "run_updated",
+    type,
     session_id: "session-001",
     client_seq: null,
     source_id: "server",
     server_seq: serverSeq,
-    payload: {
-      state: "running",
-      current_frame: 2,
-      preview_stale: false,
-      active_capture_job_id: null
-    }
+    payload
+  };
+}
+
+function inputAck(overrides: Record<string, unknown> = {}) {
+  return {
+    schema_version: 1,
+    type: "input_ack",
+    session_id: "session-001",
+    client_seq: 1,
+    source_id: "keyboard",
+    server_seq: 1,
+    payload: inputAckPayload(),
+    ...overrides
+  };
+}
+
+function inputAckPayload() {
+  return {
+    client_event_id: "00000000-0000-0000-0000-000000000001",
+    assigned_frame: 12,
+    pad_word: 1025,
+    status: "applied"
   };
 }
 
 class FakeWebSocket {
   static instances: FakeWebSocket[] = [];
+  readyState = 0;
   onopen: ((event: Event) => void) | null = null;
   onmessage: ((event: MessageEvent) => void) | null = null;
   onclose: ((event: CloseEvent) => void) | null = null;
@@ -479,11 +747,20 @@ class FakeWebSocket {
   }
 
   send(data: string): void {
+    if (this.readyState !== 1) {
+      throw new Error("socket is not open");
+    }
     this.sent.push(data);
   }
 
   close(): void {
+    this.readyState = 3;
     this.onclose?.({} as CloseEvent);
+  }
+
+  emitOpen(): void {
+    this.readyState = 1;
+    this.onopen?.({} as Event);
   }
 
   emitMessage(payload: unknown): void {
@@ -491,6 +768,7 @@ class FakeWebSocket {
   }
 
   emitClose(): void {
+    this.readyState = 3;
     this.onclose?.({} as CloseEvent);
   }
 }
