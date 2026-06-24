@@ -94,10 +94,38 @@ describe("browser-safe recovery states", () => {
     );
     expect(labelConflict.querySelector<HTMLButtonElement>("[data-pad-button='A']")?.disabled).toBe(false);
 
-    const validationFailed = render(activeState(), { validationState: "failed" });
+    const validationFailed = render(activeState(), {
+      validationStatus: {
+        status: "failed",
+        command_class: "phase4_score_plan",
+        started_at: "2026-06-24T09:00:00Z",
+        completed_at: "2026-06-24T09:00:03Z",
+        summary: "Validation failed.",
+        issue_summaries: [unsafeText, "Goal route mismatch."]
+      }
+    });
     expect(recovery(validationFailed, "validation_failed")?.textContent).toContain(
       "private server-side report"
     );
+    expect(validationFailed.textContent ?? "").toContain("score plan");
+    expect(validationFailed.textContent ?? "").toContain("Validation failed.");
+    expect(validationFailed.textContent ?? "").toContain("Goal route mismatch.");
+    expectSafe(validationFailed);
+
+    const validationPassed = render(activeState(), {
+      validationStatus: {
+        status: "passed",
+        command_class: "redaction_scan",
+        started_at: "2026-06-24T09:05:00Z",
+        completed_at: "2026-06-24T09:05:01Z",
+        summary: "Validation passed.",
+        issue_summaries: []
+      }
+    });
+    expect(validationPassed.textContent ?? "").toContain("redaction scan");
+    expect(validationPassed.textContent ?? "").toContain("Validation passed.");
+    expect(recovery(validationPassed, "validation_failed")).toBeNull();
+    expectSafe(validationPassed);
   });
 
   it("renders gamepad disconnect and WebSocket reconnect recovery without disabling keyboard input", async () => {

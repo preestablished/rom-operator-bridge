@@ -10,6 +10,7 @@ import {
   PAD_LAYOUT_VERSION,
   RUNTIME_API_SCHEMA_VERSION,
   SESSION_STATES,
+  VALIDATION_STATUSES,
   type BackendMode,
   type SessionState
 } from "./runtimeContract";
@@ -40,8 +41,6 @@ const INBOUND_WS_MESSAGE_TYPES = [
   "label_updated",
   "validation_updated"
 ] as const;
-const VALIDATION_STATUSES = ["not_run", "running", "passed", "failed"] as const;
-
 export type CapabilityName = (typeof CAPABILITY_NAMES)[number];
 export type StopReason = (typeof STOP_REASONS)[number];
 export type CaptureStatus = (typeof CAPTURE_STATUSES)[number];
@@ -49,6 +48,7 @@ export type LabelRole = (typeof LABEL_ROLES)[number];
 export type InputSource = (typeof INPUT_SOURCES)[number];
 export type PadButton = (typeof PAD_BUTTONS)[number];
 export type RuntimeErrorCode = (typeof ERROR_CODES)[number];
+export type ValidationStatus = (typeof VALIDATION_STATUSES)[number];
 
 export type RuntimeCapabilities = Record<CapabilityName, boolean>;
 
@@ -134,6 +134,19 @@ export type RunStateResponse = {
   state: SessionState;
   current_frame: number;
 };
+
+export type ValidationStatusView = {
+  status: ValidationStatus;
+  command_class: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  summary: string;
+  issue_summaries: string[];
+};
+
+export type ValidationStatusResponse = {
+  schema_version: 1;
+} & ValidationStatusView;
 
 export type FrameCurrentResponse = {
   schema_version: 1;
@@ -350,6 +363,10 @@ export class RuntimeApiClient {
     return this.request("/run/status", parseRunStatusResponse);
   }
 
+  validationStatus(): Promise<ValidationStatusResponse> {
+    return this.request("/validation/status", parseValidationStatusResponse);
+  }
+
   pauseRun(sessionId: string): Promise<RunStateResponse> {
     return this.sessionTransition("/run/pause", sessionId);
   }
@@ -551,10 +568,7 @@ export type LabelUpdatedPayload = {
   applied: boolean;
 };
 
-export type ValidationUpdatedPayload = {
-  status: "not_run" | "running" | "passed" | "failed";
-  summary: string;
-};
+export type ValidationUpdatedPayload = ValidationStatusView;
 
 type RuntimeEventBase<TType extends string> = {
   schema_version: 1;
@@ -961,6 +975,14 @@ function parseRunStatusResponse(value: unknown): RunStatusResponse {
   };
 }
 
+function parseValidationStatusResponse(value: unknown): ValidationStatusResponse {
+  const record = schemaRecord(value);
+  return {
+    schema_version: RUNTIME_API_SCHEMA_VERSION,
+    ...parseValidationStatusFields(record, true)
+  };
+}
+
 function parseRunStateResponse(value: unknown): RunStateResponse {
   const record = schemaRecord(value);
   assertOnlyFields(record, ["schema_version", "state", "current_frame"]);
@@ -1324,10 +1346,32 @@ function parseLabelUpdatedPayload(value: unknown): LabelUpdatedPayload {
 
 function parseValidationUpdatedPayload(value: unknown): ValidationUpdatedPayload {
   const payload = recordValue(value);
-  assertOnlyFields(payload, ["status", "summary"]);
+  return parseValidationStatusFields(payload, false);
+}
+
+function parseValidationStatusFields(
+  record: JsonRecord,
+  allowSchemaVersion: boolean
+): ValidationStatusView {
+  const fields = [
+    "status",
+    "command_class",
+    "started_at",
+    "completed_at",
+    "summary",
+    "issue_summaries"
+  ];
+  assertOnlyFields(record, allowSchemaVersion ? ["schema_version", ...fields] : fields);
   return {
-    status: enumField(payload, "status", VALIDATION_STATUSES),
-    summary: boundedStringField(payload, "summary", 0, 240)
+    status: enumField(record, "status", VALIDATION_STATUSES),
+    command_class: nullableIdField(record, "command_class"),
+    started_at: nullableRfc3339Field(record, "started_at"),
+    completed_at: nullableRfc3339Field(record, "completed_at"),
+    summary: boundedStringField(record, "summary", 0, 240),
+    issue_summaries: maxLengthArray(
+      arrayField(record, "issue_summaries").map((issue) => boundedStringValue(issue, 1, 240)),
+      8
+    )
   };
 }
 
@@ -1457,6 +1501,10 @@ function rfc3339Field(record: JsonRecord, key: string): string {
   return candidate;
 }
 
+function nullableRfc3339Field(record: JsonRecord, key: string): string | null {
+  return record[key] === null ? null : rfc3339Field(record, key);
+}
+
 function patternStringField(record: JsonRecord, key: string, pattern: RegExp): string {
   const candidate = stringField(record, key);
   if (!pattern.test(candidate)) {
@@ -1559,6 +1607,13 @@ function uniqueArray<T extends string>(values: T[]): T[] {
 function minLengthArray<T>(values: T[], minLength: number): T[] {
   if (values.length < minLength) {
     throw new Error("array too short");
+  }
+  return values;
+}
+
+function maxLengthArray<T>(values: T[], maxLength: number): T[] {
+  if (values.length > maxLength) {
+    throw new Error("array too long");
   }
   return values;
 }

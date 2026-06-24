@@ -6,6 +6,7 @@ const defs = (runtimeApiSchema as JsonObject)["$defs"] as JsonObject;
 const schemaVersion = defs["schemaVersion"] as JsonObject;
 const backendMode = defs["backendMode"] as JsonObject;
 const sessionState = defs["sessionState"] as JsonObject;
+const validationStatus = defs["validationStatus"] as JsonObject;
 const capabilityName = defs["capabilityName"] as JsonObject;
 const captureStatus = defs["captureStatus"] as JsonObject;
 const labelRole = defs["labelRole"] as JsonObject;
@@ -23,6 +24,12 @@ export const PAD_LAYOUT_ID = padLayoutId["const"] as "console16-12btn-v1";
 export const PAD_LAYOUT_VERSION = padLayoutVersion["const"] as 1;
 export const BACKEND_MODES = enumValues(backendMode, "backendMode");
 export const SESSION_STATES = enumValues(sessionState, "sessionState");
+export const VALIDATION_STATUSES = enumValues(validationStatus, "validationStatus") as readonly [
+  "not_run",
+  "running",
+  "passed",
+  "failed"
+];
 export const CAPABILITY_NAMES = enumValues(capabilityName, "capabilityName") as readonly [
   "input",
   "preview",

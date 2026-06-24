@@ -11,6 +11,7 @@ import {
   PAD_BUTTONS,
   RUNTIME_API_SCHEMA_VERSION,
   SESSION_STATES,
+  VALIDATION_STATUSES,
   WS_MESSAGE_TYPES
 } from "../src/runtimeContract";
 
@@ -30,6 +31,7 @@ describe("runtime contract constants", () => {
       "stopped",
       "faulted"
     ]);
+    expect(VALIDATION_STATUSES).toEqual(["not_run", "running", "passed", "failed"]);
     expect(CAPABILITY_NAMES).toEqual([
       "input",
       "preview",

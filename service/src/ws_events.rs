@@ -4,6 +4,7 @@ use crate::{
         BackendCapabilities, BackendMode, RunBoundary, RunStatus, SessionState, StoppedSession,
     },
     sanitization::{PublicSanitizer, SanitizationError},
+    validation_status::PublicValidationStatus,
 };
 use axum::extract::ws::{Message, WebSocket};
 use serde::Serialize;
@@ -170,19 +171,39 @@ impl WsEventState {
         Ok(())
     }
 
+    pub(crate) fn publish_validation(
+        &self,
+        session_id: &str,
+        status: PublicValidationStatus,
+        sanitizer: &PublicSanitizer,
+    ) -> Result<(), WsEventError> {
+        let mut inner = self.inner.lock().expect("ws event mutex poisoned");
+        let message = inner.message(
+            session_id,
+            "validation_updated",
+            serde_json::to_value(status).expect("validation status serializes"),
+            sanitizer,
+        )?;
+        drop(inner);
+        self.publish(vec![message]);
+        Ok(())
+    }
+
     fn snapshot_messages(
         &self,
         status: &RunStatus,
         label_revision: u64,
+        validation_status: PublicValidationStatus,
         sanitizer: &PublicSanitizer,
     ) -> Result<Vec<String>, WsEventError> {
-        self.status_messages(status, label_revision, sanitizer)
+        self.status_messages(status, label_revision, validation_status, sanitizer)
     }
 
     fn status_messages(
         &self,
         status: &RunStatus,
         label_revision: u64,
+        validation_status: PublicValidationStatus,
         sanitizer: &PublicSanitizer,
     ) -> Result<Vec<String>, WsEventError> {
         ensure_json_safe(status.current_frame)?;
@@ -236,10 +257,7 @@ impl WsEventState {
         messages.push(inner.message(
             &status.session_id,
             "validation_updated",
-            json!(ValidationUpdatedPayload {
-                status: "not_run",
-                summary: "",
-            }),
+            serde_json::to_value(validation_status).expect("validation status serializes"),
             sanitizer,
         )?);
 
@@ -259,9 +277,12 @@ pub async fn serve_event_socket(
     sanitizer: PublicSanitizer,
     status: RunStatus,
     label_revision: u64,
+    validation_status: PublicValidationStatus,
 ) {
     let mut events = event_state.subscribe();
-    let Ok(messages) = event_state.snapshot_messages(&status, label_revision, &sanitizer) else {
+    let Ok(messages) =
+        event_state.snapshot_messages(&status, label_revision, validation_status, &sanitizer)
+    else {
         let _ = socket.send(Message::Close(None)).await;
         return;
     };
@@ -391,12 +412,6 @@ struct CaptureUpdatedPayload {
 struct LabelUpdatedPayload {
     label_revision: u64,
     applied: bool,
-}
-
-#[derive(Debug, Clone, Copy, Serialize)]
-struct ValidationUpdatedPayload {
-    status: &'static str,
-    summary: &'static str,
 }
 
 #[derive(Debug)]

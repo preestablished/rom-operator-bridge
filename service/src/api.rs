@@ -16,6 +16,10 @@ use crate::{
         LabelApplyOutcome, LabelApplyRequest, LabelConflict, LabelConflictKind, LabelSnapshot,
         LabelState, LabelStoreError, LabelUpdate,
     },
+    sanitization::PublicSanitizer,
+    validation_status::{
+        PublicValidationStatus, ValidationRunUpdate, ValidationStatusError, ValidationStatusState,
+    },
     ws_events::{WsEventState, serve_event_socket},
     ws_input::{WsInputState, serve_input_socket},
 };
@@ -54,6 +58,7 @@ pub struct AppState {
     runtime_session: Arc<Mutex<Option<String>>>,
     captures: CaptureState,
     labels: LabelState,
+    validation: ValidationStatusState,
     frame_previews: FramePreviewState,
     ws_events: WsEventState,
     ws_input: WsInputState,
@@ -75,6 +80,7 @@ impl AppState {
             runtime_session: Arc::new(Mutex::new(None)),
             captures: CaptureState::new(),
             labels: LabelState::new(),
+            validation: ValidationStatusState::new(),
             frame_previews: FramePreviewState::new(),
             ws_events: WsEventState::new(),
             ws_input: WsInputState::new(),
@@ -94,6 +100,7 @@ impl AppState {
             runtime_session: Arc::new(Mutex::new(None)),
             captures: CaptureState::new(),
             labels: LabelState::new(),
+            validation: ValidationStatusState::new(),
             frame_previews: FramePreviewState::new(),
             ws_events: WsEventState::new(),
             ws_input: WsInputState::new(),
@@ -112,10 +119,32 @@ impl AppState {
             runtime_session: Arc::new(Mutex::new(None)),
             captures: CaptureState::new(),
             labels: LabelState::new(),
+            validation: ValidationStatusState::new(),
             frame_previews: FramePreviewState::new(),
             ws_events: WsEventState::new(),
             ws_input: WsInputState::new(),
         }
+    }
+
+    pub fn validation_status_snapshot(&self) -> PublicValidationStatus {
+        self.validation.snapshot()
+    }
+
+    pub fn record_validation_run(
+        &self,
+        update: ValidationRunUpdate,
+    ) -> Result<PublicValidationStatus, ValidationStatusError> {
+        let active_session_id =
+            active_session_id(self).map_err(|_| ValidationStatusError::StaleSession)?;
+        if !update.matches_session(&active_session_id) {
+            return Err(ValidationStatusError::StaleSession);
+        }
+        let sanitizer = state_sanitizer(self);
+        let public =
+            self.validation
+                .record_run(self.config.private_config(), &sanitizer, update)?;
+        publish_validation_event(self, public.clone());
+        Ok(public)
     }
 }
 
@@ -612,6 +641,10 @@ pub fn router(state: AppState) -> Router {
             get(run_status).fallback(method_not_allowed),
         )
         .route(
+            "/api/validation/status",
+            get(validation_status).fallback(method_not_allowed),
+        )
+        .route(
             "/api/run/pause",
             post(pause_run).fallback(method_not_allowed),
         )
@@ -749,6 +782,7 @@ async fn start_session(
         .reset_session(&backend_session.session_id);
     state.captures.reset_session(&backend_session.session_id);
     state.labels.reset();
+    state.validation.reset();
     state.ws_events.reset_session(&backend_session.session_id);
     state.ws_input.reset_session(&backend_session.session_id);
 
@@ -847,6 +881,7 @@ async fn stop_session(
     state.frame_previews.reset_session(&stopped.session_id);
     state.captures.reset_session(&stopped.session_id);
     state.labels.reset();
+    state.validation.reset();
     state.ws_events.reset_session(&stopped.session_id);
     state.ws_input.reset_session(&stopped.session_id);
     if let Err(error) = state.auth.clear_session_headers(&headers) {
@@ -888,6 +923,26 @@ async fn run_status(State(state): State<AppState>, headers: HeaderMap, uri: Uri)
     let status = project_active_capture(&state, status);
 
     let mut response = Json(RunStatusResponse::from(status)).into_response();
+    apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
+    response
+}
+
+async fn validation_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    if let Err(response) = authenticate_runtime_request(&state, &headers, &uri) {
+        return response;
+    }
+    if let Err(response) = active_session_id(&state) {
+        return response;
+    }
+
+    let mut response = Json(ValidationStatusResponse::from(
+        state.validation_status_snapshot(),
+    ))
+    .into_response();
     apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
     response
 }
@@ -1332,9 +1387,17 @@ async fn events_ws_handshake(
     let ws_events = state.ws_events.clone();
     let sanitizer = state.config.private_config().public_sanitizer();
     let label_revision = state.labels.snapshot().label_revision;
+    let validation_status = state.validation_status_snapshot();
     let mut response = ws
         .on_upgrade(move |socket| {
-            serve_event_socket(socket, ws_events, sanitizer, status, label_revision)
+            serve_event_socket(
+                socket,
+                ws_events,
+                sanitizer,
+                status,
+                label_revision,
+                validation_status,
+            )
         })
         .into_response();
     apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
@@ -1560,6 +1623,7 @@ fn cleanup_runtime_session(state: &AppState, reason: StopReason) -> Result<(), B
     state.frame_previews.reset_session(&stopped.session_id);
     state.captures.reset_session(&stopped.session_id);
     state.labels.reset();
+    state.validation.reset();
     state.ws_events.reset_session(&stopped.session_id);
     state.ws_input.reset_session(&stopped.session_id);
     Ok(())
@@ -1601,10 +1665,24 @@ fn publish_label_event(state: &AppState, label_revision: u64, applied: bool) {
     let Ok(session_id) = active_session_id(state) else {
         return;
     };
-    let sanitizer = state.config.private_config().public_sanitizer();
+    let sanitizer = state_sanitizer(state);
     let _ = state
         .ws_events
         .publish_label(&session_id, label_revision, applied, &sanitizer);
+}
+
+fn publish_validation_event(state: &AppState, status: PublicValidationStatus) {
+    let Ok(session_id) = active_session_id(state) else {
+        return;
+    };
+    let sanitizer = state_sanitizer(state);
+    let _ = state
+        .ws_events
+        .publish_validation(&session_id, status, &sanitizer);
+}
+
+fn state_sanitizer(state: &AppState) -> PublicSanitizer {
+    state.config.private_config().public_sanitizer()
 }
 
 fn project_active_capture(
@@ -1731,6 +1809,17 @@ pub struct RunStatusResponse {
     pub preview_stale: bool,
     pub active_capture_job_id: Option<String>,
     pub capabilities: crate::backend::BackendCapabilities,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ValidationStatusResponse {
+    pub schema_version: u16,
+    pub status: crate::validation_status::ValidationRunStatus,
+    pub command_class: Option<String>,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub summary: String,
+    pub issue_summaries: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1965,6 +2054,20 @@ impl From<crate::backend::RunStatus> for RunStatusResponse {
             preview_stale: status.last_preview_frame < status.current_frame,
             active_capture_job_id: status.active_capture_job_id,
             capabilities: status.capabilities,
+        }
+    }
+}
+
+impl From<PublicValidationStatus> for ValidationStatusResponse {
+    fn from(status: PublicValidationStatus) -> Self {
+        Self {
+            schema_version: RUNTIME_API_SCHEMA_VERSION,
+            status: status.status,
+            command_class: status.command_class,
+            started_at: status.started_at,
+            completed_at: status.completed_at,
+            summary: status.summary,
+            issue_summaries: status.issue_summaries,
         }
     }
 }
