@@ -42,6 +42,7 @@ describe("runtime API client", () => {
       captureJobResponse(),
       captureRecentResponse(),
       captureDetailResponse(),
+      captureFeaturesResponse(),
       labelsResponse(),
       labelsSnapshotResponse()
     ]);
@@ -68,6 +69,7 @@ describe("runtime API client", () => {
     await client.captureJob("job-001");
     await client.recentCaptures({ cursor: "cursor-001", limit: 25 });
     await client.captureDetail("capture-001");
+    const features = await client.captureFeatures("capture-001");
     await client.updateLabels({
       sessionId: "session-001",
       idempotencyKey: "00000000-0000-0000-0000-000000000002",
@@ -100,6 +102,7 @@ describe("runtime API client", () => {
         status: "candidate"
       }
     ]);
+    expect(features.features).toEqual([{ name: "screen.room_id", value: 1 }]);
     expect(fetcher.calls.map((call) => call.url)).toEqual([
       "/health",
       "/api/session/start",
@@ -114,6 +117,7 @@ describe("runtime API client", () => {
       "/api/capture/jobs/job-001",
       "/api/capture/recent?cursor=cursor-001&limit=25",
       "/api/capture/capture-001",
+      "/api/capture/capture-001/features",
       "/api/labels",
       "/api/labels"
     ]);
@@ -136,7 +140,7 @@ describe("runtime API client", () => {
       observed_preview_frame: 42,
       reason: "operator_mark"
     });
-    expect(bodyAt(fetcher, 13)).toEqual({
+    expect(bodyAt(fetcher, 14)).toEqual({
       schema_version: 1,
       session_id: "session-001",
       idempotency_key: "00000000-0000-0000-0000-000000000002",
@@ -222,6 +226,13 @@ describe("runtime API client", () => {
       {
         payload: { ...captureDetailResponse(), private_path: "/home/operator/private.bin" },
         request: (client) => client.captureDetail("capture-001")
+      },
+      {
+        payload: {
+          ...captureFeaturesResponse(),
+          features: [{ name: "/home/operator/private-feature", value: 1 }]
+        },
+        request: (client) => client.captureFeatures("capture-001")
       },
       {
         payload: {
@@ -767,6 +778,15 @@ function captureDetailResponse() {
       capture_spec_hash: "capture-spec-hash",
       map_hash: "map-hash"
     }
+  };
+}
+
+function captureFeaturesResponse() {
+  return {
+    schema_version: 1,
+    capture_id: "capture-001",
+    available: true,
+    features: [{ name: "screen.room_id", value: 1 }]
   };
 }
 

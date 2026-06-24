@@ -21,6 +21,7 @@
     { "$ref": "#/$defs/captureJobResponse" },
     { "$ref": "#/$defs/captureRecentResponse" },
     { "$ref": "#/$defs/captureDetailResponse" },
+    { "$ref": "#/$defs/captureFeaturesResponse" },
     { "$ref": "#/$defs/labelsRequest" },
     { "$ref": "#/$defs/labelsResponse" },
     { "$ref": "#/$defs/labelsSnapshotResponse" },
@@ -575,6 +576,35 @@
             "capture_spec_hash": { "$ref": "#/$defs/hashRef" },
             "map_hash": { "$ref": "#/$defs/hashRef" }
           }
+        }
+      }
+    },
+    "captureFeature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "value"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9 ._:-]*$"
+        },
+        "value": { "type": "number" }
+      }
+    },
+    "captureFeaturesResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "capture_id", "available", "features"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "capture_id": { "$ref": "#/$defs/id" },
+        "available": { "type": "boolean" },
+        "features": {
+          "type": "array",
+          "maxItems": 256,
+          "items": { "$ref": "#/$defs/captureFeature" }
         }
       }
     },

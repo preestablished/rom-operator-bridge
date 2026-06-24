@@ -48,7 +48,7 @@ describe("UI auth and session flow", () => {
     expect(bodyAt(fetcher, 0)).toMatchObject({
       schema_version: 1,
       operator_credential: "operator-secret",
-      requested_capabilities: ["input", "preview", "capture", "labels"]
+      requested_capabilities: ["input", "preview", "capture", "labels", "privileged_features"]
     });
     expect(html).toContain("Stop");
     expect(html).not.toContain("operator-secret");

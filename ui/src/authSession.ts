@@ -59,7 +59,7 @@ export async function submitCredential(
   try {
     const response = await client.startSession({
       operatorCredential,
-      requestedCapabilities: ["input", "preview", "capture", "labels"]
+      requestedCapabilities: ["input", "preview", "capture", "labels", "privileged_features"]
     });
     return {
       status: "active",

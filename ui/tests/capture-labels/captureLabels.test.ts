@@ -10,6 +10,7 @@ import type {
 import type { RuntimeSessionClient } from "../../src/authSession";
 import type {
   CaptureDetailResponse,
+  CaptureFeaturesResponse,
   CaptureRecentResponse,
   LabelsSnapshotResponse,
   RuntimeWsMessage
@@ -62,14 +63,62 @@ describe("capture review and label drawer", () => {
     expect(root.textContent).toContain("failed");
     expect(root.textContent).toContain("not labelable");
     expect(root.textContent).toContain("sha256:layout-public");
-    expect(root.textContent).toContain("host available");
-    expect(root.textContent).toContain("withheld");
+    expect(root.textContent).toContain("screen.room_id");
+    expect(root.textContent).toContain("player.health");
+    expect(root.textContent).toContain("0.75");
     expect(root.textContent ?? "").not.toMatch(
       /\/home\/|private\.env|feature bytes|decoded_features|raw capture|screenshot/i
     );
     expect(root.querySelector("[data-capture-preview]")?.getAttribute("src")).toBe(
       "/api/capture/capture-001/preview"
     );
+  });
+
+  it("renders unavailable privileged feature maps without calling the privileged route", async () => {
+    const captureFeatures = vi.fn().mockResolvedValue(captureFeaturesResponse());
+    const client = mockClient({
+      sessionStatus: vi.fn().mockResolvedValue(activeSessionResponse()),
+      runStatus: vi.fn().mockResolvedValue(runStatusResponse()),
+      currentFrame: vi.fn().mockResolvedValue(frameCurrentResponse()),
+      captureDetail: vi.fn().mockResolvedValue(
+        captureDetailResponse({
+          privileged_features_available: false
+        })
+      ),
+      captureFeatures
+    });
+    const root = document.createElement("div");
+
+    mountOperatorApp(root, config, client, null);
+    await flushPromises();
+
+    expect(captureFeatures).not.toHaveBeenCalled();
+    expect(root.textContent).toContain("Privileged Features");
+    expect(root.textContent).toContain("none");
+    expect(root.textContent).toContain("No decoded feature map is available for this capture.");
+  });
+
+  it("does not call privileged feature route without a session grant", async () => {
+    const captureFeatures = vi.fn().mockResolvedValue(captureFeaturesResponse());
+    const client = mockClient({
+      sessionStatus: vi.fn().mockResolvedValue(activeSessionResponse()),
+      runStatus: vi.fn().mockResolvedValue(
+        runStatusResponse({
+          capabilities: { ...capabilities, privileged_features: false }
+        })
+      ),
+      currentFrame: vi.fn().mockResolvedValue(frameCurrentResponse()),
+      captureDetail: vi.fn().mockResolvedValue(captureDetailResponse()),
+      captureFeatures
+    });
+    const root = document.createElement("div");
+
+    mountOperatorApp(root, config, client, null);
+    await flushPromises();
+
+    expect(captureFeatures).not.toHaveBeenCalled();
+    expect(root.textContent).toContain("unavailable");
+    expect(root.textContent).toContain("The active session does not grant privileged feature access.");
   });
 
   it("writes and deletes labels from the drawer without browser persistence", async () => {
@@ -417,7 +466,7 @@ type MockRuntimeClient = RuntimeSessionClient &
   Partial<
     RuntimePreviewClient &
       RuntimeRunClient &
-      Pick<RuntimeApiClient, "recentCaptures" | "captureDetail" | "labelsSnapshot" | "updateLabels">
+      Pick<RuntimeApiClient, "recentCaptures" | "captureDetail" | "captureFeatures" | "labelsSnapshot" | "updateLabels">
   >;
 
 function mockClient(overrides: Partial<MockRuntimeClient> = {}): MockRuntimeClient {
@@ -433,6 +482,7 @@ function mockClient(overrides: Partial<MockRuntimeClient> = {}): MockRuntimeClie
     captureJob: vi.fn(),
     recentCaptures: vi.fn().mockResolvedValue(captureRecentResponse()),
     captureDetail: vi.fn().mockResolvedValue(captureDetailResponse()),
+    captureFeatures: vi.fn().mockResolvedValue(captureFeaturesResponse()),
     labelsSnapshot: vi.fn().mockResolvedValue(labelsSnapshotResponse()),
     updateLabels: vi.fn(),
     ...overrides
@@ -574,6 +624,20 @@ function captureDetailResponse(overrides: Partial<CaptureDetailResponse> = {}): 
       capture_spec_hash: "sha256:capture-spec-public",
       map_hash: "sha256:map-public"
     },
+    ...overrides
+  };
+}
+
+function captureFeaturesResponse(overrides: Partial<CaptureFeaturesResponse> = {}): CaptureFeaturesResponse {
+  return {
+    schema_version: 1,
+    capture_id: "capture-001",
+    available: true,
+    features: [
+      { name: "screen.room_id", value: 1 },
+      { name: "player.health", value: 0.75 },
+      { name: "encounter.phase", value: 2 }
+    ],
     ...overrides
   };
 }

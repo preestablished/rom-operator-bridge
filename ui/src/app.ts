@@ -12,6 +12,7 @@ import {
   RuntimeWebSocketClient,
   applyRunStatus,
   type CaptureDetailResponse,
+  type CaptureFeaturesResponse,
   type CaptureJobResponse,
   type CaptureSummary,
   type CaptureStatus,
@@ -101,7 +102,7 @@ export type RuntimeRunClient = Pick<
 type RuntimeValidationClient = Pick<RuntimeApiClient, "validationStatus">;
 type RuntimeCaptureReviewClient = Pick<
   RuntimeApiClient,
-  "recentCaptures" | "captureDetail" | "updateLabels" | "labelsSnapshot"
+  "recentCaptures" | "captureDetail" | "captureFeatures" | "updateLabels" | "labelsSnapshot"
 >;
 type OperatorRuntimeClient = RuntimeSessionClient &
   Partial<RuntimePreviewClient & RuntimeRunClient & RuntimeValidationClient & RuntimeCaptureReviewClient>;
@@ -136,6 +137,8 @@ type CaptureReviewState = {
   captures: CaptureSummary[];
   selectedCaptureId: string | null;
   detail: CaptureDetailResponse | null;
+  features: CaptureFeaturesResponse | null;
+  featureError: string | null;
   labels: LabelsSnapshotResponse | null;
   loading: boolean;
   labelSaving: boolean;
@@ -166,6 +169,8 @@ const EMPTY_CAPTURE_REVIEW: CaptureReviewState = {
   captures: [],
   selectedCaptureId: null,
   detail: null,
+  features: null,
+  featureError: null,
   labels: null,
   loading: false,
   labelSaving: false,
@@ -795,6 +800,7 @@ export function mountOperatorApp(
   async function refreshCaptureReview(preferredCaptureId = captureReview.selectedCaptureId) {
     const recentCaptures = client.recentCaptures?.bind(client);
     const captureDetail = client.captureDetail?.bind(client);
+    const captureFeatures = client.captureFeatures?.bind(client);
     const labelsSnapshot = client.labelsSnapshot?.bind(client);
     if (
       !recentCaptures ||
@@ -808,7 +814,7 @@ export function mountOperatorApp(
 
     const requestSeq = ++captureReviewRequestSeq;
     const sessionId = auth.session.session_id;
-    captureReview = { ...captureReview, loading: true, error: null };
+    captureReview = { ...captureReview, loading: true, error: null, featureError: null };
     render();
     try {
       const [recent, labels] = await Promise.all([
@@ -834,10 +840,38 @@ export function mountOperatorApp(
       ) {
         return;
       }
+      let features: CaptureFeaturesResponse | null = null;
+      let featureError: string | null = null;
+      if (detail?.privileged_features_available) {
+        if (!auth.session.capabilities?.privileged_features) {
+          features = null;
+        } else if (!captureFeatures) {
+          featureError = "Privileged feature map unavailable.";
+        } else {
+          try {
+            features = await captureFeatures(detail.capture_id);
+            if (features.capture_id !== detail.capture_id) {
+              featureError = "Privileged feature map unavailable.";
+              features = null;
+            }
+          } catch (error) {
+            featureError = runtimeDisplayError(error, "backend_unavailable").message;
+          }
+        }
+      }
+      if (
+        requestSeq !== captureReviewRequestSeq ||
+        auth.status !== "active" ||
+        auth.session.session_id !== sessionId
+      ) {
+        return;
+      }
       captureReview = captureReviewForView({
         captures: recent.captures,
         selectedCaptureId,
         detail,
+        features,
+        featureError,
         labels,
         loading: false,
         labelSaving: false,
@@ -1046,6 +1080,8 @@ export function mountOperatorApp(
           ...captureReview,
           selectedCaptureId: captureId,
           detail: null,
+          features: null,
+          featureError: null,
           conflicts: [],
           error: null
         };
@@ -1825,6 +1861,8 @@ function captureReviewForView(state: CaptureReviewState): CaptureReviewState {
     captures: state.captures,
     selectedCaptureId: state.selectedCaptureId,
     detail: state.detail,
+    features: state.features,
+    featureError: state.featureError ? safeBrowserMessage(state.featureError) : null,
     labels: state.labels,
     loading: state.loading,
     labelSaving: state.labelSaving,
@@ -1940,22 +1978,65 @@ function renderCaptureDetail(model: OperatorViewModel): string {
           <div><dt>Map</dt><dd>${escapeHtml(detail.sanitized_provenance.map_hash)}</dd></div>
         </dl>
       </div>
-      ${renderPrivilegedFeatureShell(detail)}
+      ${renderPrivilegedFeatureShell(model)}
       ${renderLabelDrawer(model)}
     </section>
   `;
 }
 
-function renderPrivilegedFeatureShell(detail: CaptureDetailResponse): string {
+function renderPrivilegedFeatureShell(model: OperatorViewModel): string {
+  const detail = model.captureReview.detail;
+  if (!detail) {
+    return "";
+  }
+  const features = model.captureReview.features;
+  const available =
+    detail.privileged_features_available &&
+    Boolean(model.auth.session.capabilities?.privileged_features) &&
+    features?.available;
+  const status = available ? "available" : detail.privileged_features_available ? "unavailable" : "none";
+  const body = model.captureReview.featureError
+    ? `<p class="session-alert" role="alert" data-feature-alert>${escapeHtml(model.captureReview.featureError)}</p>`
+    : available && features.features.length > 0
+      ? `<dl class="feature-list" aria-label="Privileged feature values">
+          ${features.features.map(renderPrivilegedFeature).join("")}
+        </dl>`
+      : `<p class="feature-empty">${featureUnavailableMessage(detail, model)}</p>`;
   return `
     <section class="feature-shell" data-feature-panel>
-      <div>
-        <p class="eyebrow">Privileged Features</p>
-        <h3>${detail.privileged_features_available ? "host available" : "unavailable"}</h3>
+      <div class="feature-shell-header">
+        <div>
+          <p class="eyebrow">Privileged Features</p>
+          <h3>${escapeHtml(status)}</h3>
+        </div>
+        <span>${features?.features.length ?? 0}</span>
       </div>
-      <span>${detail.privileged_features_available ? "withheld" : "none"}</span>
+      ${body}
     </section>
   `;
+}
+
+function renderPrivilegedFeature(feature: { name: string; value: number }): string {
+  return `
+    <div>
+      <dt>${escapeHtml(feature.name)}</dt>
+      <dd>${formatFeatureValue(feature.value)}</dd>
+    </div>
+  `;
+}
+
+function featureUnavailableMessage(detail: CaptureDetailResponse, model: OperatorViewModel): string {
+  if (!detail.privileged_features_available) {
+    return "No decoded feature map is available for this capture.";
+  }
+  if (!model.auth.session.capabilities?.privileged_features) {
+    return "The active session does not grant privileged feature access.";
+  }
+  return "Decoded feature map returned no values.";
+}
+
+function formatFeatureValue(value: number): string {
+  return Number.isInteger(value) ? String(value) : value.toFixed(3).replace(/0+$/, "").replace(/\.$/, "");
 }
 
 function renderLabelDrawer(model: OperatorViewModel): string {
