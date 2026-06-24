@@ -1,0 +1,641 @@
+use axum::{
+    body::{Body, to_bytes},
+    http::{
+        Method, Request, StatusCode,
+        header::{
+            ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, CONTENT_TYPE, COOKIE, ORIGIN, PRAGMA,
+            SET_COOKIE, VARY,
+        },
+    },
+};
+use rom_operator_bridge_service::{
+    api::{AppState, router},
+    artifacts::RecentCapturesFile,
+    auth::ALLOWED_ORIGIN,
+    backend::{
+        BackendCapabilities, BackendMode, BackendResult, BackendSession, BridgeBackend, CaptureJob,
+        CaptureJobStatus, CaptureRequest, FramePreview, InputScheduleReceipt, InputScheduleRequest,
+        RunBoundary, RunStatus, SessionId, SessionState, StartBackendSession, StopReason,
+        StoppedSession,
+    },
+    config::ServiceConfig,
+    framebuffer::{SYNTHETIC_FRAME_HEIGHT, SYNTHETIC_FRAME_WIDTH, synthetic_frame_png},
+    private_config::{ENV_OPERATOR_CREDENTIAL, ENV_PRIVATE_ROOT, ENV_SESSION_SECRET},
+    sanitization::PublicSanitizer,
+};
+use serde_json::{Value, json};
+use std::{
+    collections::VecDeque,
+    fs,
+    path::{Path, PathBuf},
+    sync::Mutex,
+};
+use tower::ServiceExt;
+
+const GOOD_CREDENTIAL: &str = "operator-credential-from-test-source";
+const SESSION_SECRET: &str = "session-secret-from-test-source-32-bytes";
+const SESSION_ID: &str = "synthetic-session-capture";
+const RUN_ID: &str = "synthetic-run-capture";
+
+#[tokio::test]
+async fn trigger_is_idempotent_and_rejects_parallel_active_capture() {
+    let (_workspace, app, _private_root) = capture_app(CaptureBackend::new([7]));
+    let cookie = login_cookie(app.clone()).await;
+
+    let first = trigger_capture(
+        app.clone(),
+        &cookie,
+        SESSION_ID,
+        "00000000-0000-4000-8000-000000000001",
+        7,
+    )
+    .await;
+    assert_eq!(first["status"], "requested");
+    assert_eq!(first["requested_frame"], 7);
+    assert_eq!(first["scheduled_frame"], 8);
+
+    let same = trigger_capture(
+        app.clone(),
+        &cookie,
+        SESSION_ID,
+        "00000000-0000-4000-8000-000000000001",
+        7,
+    )
+    .await;
+    assert_eq!(same["job_id"], first["job_id"]);
+    assert_eq!(same["status"], "requested");
+
+    let active_conflict = app
+        .oneshot(runtime_json_request(
+            Method::POST,
+            "/api/capture/trigger",
+            &cookie,
+            json!({
+                "schema_version": 1,
+                "session_id": SESSION_ID,
+                "idempotency_key": "00000000-0000-4000-8000-000000000002",
+                "observed_preview_frame": 7,
+                "reason": "operator_mark"
+            }),
+        ))
+        .await
+        .expect("conflicting capture trigger runs");
+    assert_eq!(active_conflict.status(), StatusCode::CONFLICT);
+    let error = json_body(active_conflict).await;
+    assert_eq!(error["error"]["code"], "capture_in_progress");
+}
+
+#[tokio::test]
+async fn stopping_session_clears_active_capture_for_reused_session_id() {
+    let (_workspace, app, _private_root) = capture_app(CaptureBackend::new([7]));
+    let cookie = login_cookie(app.clone()).await;
+
+    let first = trigger_capture(
+        app.clone(),
+        &cookie,
+        SESSION_ID,
+        "00000000-0000-4000-8000-000000000003",
+        7,
+    )
+    .await;
+    assert_eq!(first["status"], "requested");
+
+    let stop = app
+        .clone()
+        .oneshot(runtime_json_request(
+            Method::POST,
+            "/api/session/stop",
+            &cookie,
+            json!({
+                "schema_version": 1,
+                "session_id": SESSION_ID,
+                "reason": "operator_stop"
+            }),
+        ))
+        .await
+        .expect("stop request runs");
+    assert_eq!(stop.status(), StatusCode::OK);
+
+    let next_cookie = login_cookie(app.clone()).await;
+    let next = trigger_capture(
+        app,
+        &next_cookie,
+        SESSION_ID,
+        "00000000-0000-4000-8000-000000000004",
+        7,
+    )
+    .await;
+    assert_eq!(next["status"], "requested");
+}
+
+#[tokio::test]
+async fn capture_completes_to_recent_detail_and_preview_after_durable_private_index() {
+    let (_workspace, app, private_root) = capture_app(CaptureBackend::new([3, 4]));
+    let cookie = login_cookie(app.clone()).await;
+
+    let first = complete_capture(
+        app.clone(),
+        &cookie,
+        3,
+        "00000000-0000-4000-8000-000000000010",
+    )
+    .await;
+    assert_eq!(first["status"], "completed");
+    assert_eq!(first["labelable"], true);
+    let first_capture_id = first["capture_id"]
+        .as_str()
+        .expect("capture id")
+        .to_string();
+
+    let second = complete_capture(
+        app.clone(),
+        &cookie,
+        4,
+        "00000000-0000-4000-8000-000000000011",
+    )
+    .await;
+    assert_eq!(second["status"], "completed");
+    let second_capture_id = second["capture_id"]
+        .as_str()
+        .expect("capture id")
+        .to_string();
+
+    let recent = request_json(
+        app.clone(),
+        runtime_get("/api/capture/recent?limit=1", &cookie),
+    )
+    .await;
+    assert_matches_runtime_schema(&recent);
+    assert_eq!(recent["captures"].as_array().expect("captures").len(), 1);
+    assert_eq!(recent["captures"][0]["capture_id"], second_capture_id);
+    assert_eq!(recent["captures"][0]["status"], "completed");
+    assert_eq!(recent["captures"][0]["has_preview"], true);
+    assert_eq!(recent["next_cursor"], "1");
+
+    let next = request_json(
+        app.clone(),
+        runtime_get(
+            recent["next_cursor"]
+                .as_str()
+                .map(|cursor| format!("/api/capture/recent?cursor={cursor}&limit=1"))
+                .as_deref()
+                .expect("next cursor exists"),
+            &cookie,
+        ),
+    )
+    .await;
+    assert_eq!(next["captures"][0]["capture_id"], first_capture_id);
+    assert_eq!(next["next_cursor"], Value::Null);
+
+    let detail = request_json(
+        app.clone(),
+        runtime_get(&format!("/api/capture/{second_capture_id}"), &cookie),
+    )
+    .await;
+    assert_matches_runtime_schema(&detail);
+    assert_eq!(detail["capture_id"], second_capture_id);
+    assert_eq!(detail["privileged_features_available"], false);
+    assert_eq!(
+        detail["sanitized_provenance"]["capture_source"],
+        "synthetic"
+    );
+    PublicSanitizer::new()
+        .with_private_root(&private_root)
+        .with_forbidden_literal(GOOD_CREDENTIAL)
+        .with_forbidden_literal(SESSION_SECRET)
+        .inspect_json(&detail)
+        .expect("capture detail is public-safe");
+
+    let preview_url = detail["preview_image_url"]
+        .as_str()
+        .expect("preview image url");
+    let preview = app
+        .oneshot(runtime_get(preview_url, &cookie))
+        .await
+        .expect("capture preview request runs");
+    assert_eq!(preview.status(), StatusCode::OK);
+    assert_no_store_headers(preview.headers());
+    assert_eq!(
+        preview
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("image/png")
+    );
+    let png = to_bytes(preview.into_body(), 512 * 1024)
+        .await
+        .expect("preview body reads");
+    assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+
+    let recent_file = fs::read_to_string(private_root.join("captures/recent-captures.json"))
+        .expect("recent captures file is durable");
+    let persisted: RecentCapturesFile =
+        serde_json::from_str(&recent_file).expect("recent captures file parses");
+    assert_eq!(persisted.captures[0].capture_id, second_capture_id);
+    assert_eq!(persisted.captures[1].capture_id, first_capture_id);
+}
+
+#[tokio::test]
+async fn failed_stale_capture_is_retryable_with_a_new_idempotency_key() {
+    let (_workspace, app, _private_root) = capture_app(CaptureBackend::new([10]));
+    let cookie = login_cookie(app.clone()).await;
+
+    let failed = trigger_capture(
+        app.clone(),
+        &cookie,
+        SESSION_ID,
+        "00000000-0000-4000-8000-000000000020",
+        9,
+    )
+    .await;
+    assert_eq!(failed["status"], "failed");
+
+    let failed_job = request_json(
+        app.clone(),
+        runtime_get(
+            &format!(
+                "/api/capture/jobs/{}",
+                failed["job_id"].as_str().expect("failed job id route")
+            ),
+            &cookie,
+        ),
+    )
+    .await;
+    assert_eq!(failed_job["status"], "failed");
+    assert_eq!(failed_job["error"]["code"], "frame_stale");
+    assert_eq!(failed_job["error"]["retryable"], true);
+
+    let retry = complete_capture(
+        app.clone(),
+        &cookie,
+        10,
+        "00000000-0000-4000-8000-000000000021",
+    )
+    .await;
+    assert_eq!(retry["status"], "completed");
+    assert_eq!(retry["requested_frame"], 10);
+}
+
+#[tokio::test]
+async fn not_labelable_capture_is_indexed_newest_first() {
+    let (_workspace, app, _private_root) = capture_app(CaptureBackend::new([0]));
+    let cookie = login_cookie(app.clone()).await;
+
+    let job = complete_capture(
+        app.clone(),
+        &cookie,
+        0,
+        "00000000-0000-4000-8000-000000000030",
+    )
+    .await;
+    assert_eq!(job["status"], "not_labelable");
+    assert_eq!(job["labelable"], false);
+    assert_eq!(job["capture_id"].is_string(), true);
+
+    let recent = request_json(app, runtime_get("/api/capture/recent", &cookie)).await;
+    assert_eq!(recent["captures"][0]["status"], "not_labelable");
+    assert_eq!(recent["captures"][0]["labelable"], false);
+    assert_eq!(recent["captures"][0]["capture_id"], job["capture_id"]);
+}
+
+#[tokio::test]
+async fn completed_status_is_not_returned_until_private_index_is_durable() {
+    let (_workspace, app, private_root) = capture_app(CaptureBackend::new([12]));
+    let cookie = login_cookie(app.clone()).await;
+
+    let trigger = trigger_capture(
+        app.clone(),
+        &cookie,
+        SESSION_ID,
+        "00000000-0000-4000-8000-000000000040",
+        12,
+    )
+    .await;
+    let job_uri = format!(
+        "/api/capture/jobs/{}",
+        trigger["job_id"].as_str().expect("job id")
+    );
+    let capturing = request_json(app.clone(), runtime_get(&job_uri, &cookie)).await;
+    assert_eq!(capturing["status"], "capturing");
+
+    fs::remove_dir_all(private_root.join("captures")).expect("captures dir removed");
+    fs::write(private_root.join("captures"), b"not a directory")
+        .expect("blocking captures file written");
+
+    let failed_completion = app
+        .clone()
+        .oneshot(runtime_get(&job_uri, &cookie))
+        .await
+        .expect("job completion poll runs");
+    assert_eq!(failed_completion.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let error = json_body(failed_completion).await;
+    assert_eq!(error["error"]["code"], "backend_unavailable");
+
+    fs::remove_file(private_root.join("captures")).expect("blocking captures file removed");
+
+    let completed = request_json(app, runtime_get(&job_uri, &cookie)).await;
+    assert_eq!(completed["status"], "completed");
+    assert!(private_root.join("captures/recent-captures.json").exists());
+}
+
+async fn complete_capture(
+    app: axum::Router,
+    cookie: &str,
+    frame: u64,
+    idempotency_key: &str,
+) -> Value {
+    let trigger = trigger_capture(app.clone(), cookie, SESSION_ID, idempotency_key, frame).await;
+    let job_uri = format!(
+        "/api/capture/jobs/{}",
+        trigger["job_id"].as_str().expect("job id")
+    );
+
+    let capturing = request_json(app.clone(), runtime_get(&job_uri, cookie)).await;
+    assert_eq!(capturing["status"], "capturing");
+    request_json(app, runtime_get(&job_uri, cookie)).await
+}
+
+async fn trigger_capture(
+    app: axum::Router,
+    cookie: &str,
+    session_id: &str,
+    idempotency_key: &str,
+    observed_preview_frame: u64,
+) -> Value {
+    request_json(
+        app,
+        runtime_json_request(
+            Method::POST,
+            "/api/capture/trigger",
+            cookie,
+            json!({
+                "schema_version": 1,
+                "session_id": session_id,
+                "idempotency_key": idempotency_key,
+                "observed_preview_frame": observed_preview_frame,
+                "reason": "operator_mark"
+            }),
+        ),
+    )
+    .await
+}
+
+async fn login_cookie(app: axum::Router) -> String {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/session/start")
+                .header(ORIGIN, ALLOWED_ORIGIN)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "schema_version": 1,
+                        "operator_credential": GOOD_CREDENTIAL,
+                        "backend_mode": "synthetic",
+                        "requested_capabilities": ["capture", "preview"]
+                    })
+                    .to_string(),
+                ))
+                .expect("login request builds"),
+        )
+        .await
+        .expect("login request runs");
+    assert_eq!(response.status(), StatusCode::OK);
+    response
+        .headers()
+        .get(SET_COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|cookie| cookie.split(';').next())
+        .expect("session cookie pair exists")
+        .to_string()
+}
+
+async fn request_json(app: axum::Router, request: Request<Body>) -> Value {
+    let response = app.oneshot(request).await.expect("request runs");
+    assert_eq!(response.status(), StatusCode::OK);
+    json_body(response).await
+}
+
+async fn json_body(response: axum::response::Response) -> Value {
+    let body = to_bytes(response.into_body(), 8192)
+        .await
+        .expect("body reads");
+    serde_json::from_slice(&body).expect("json parses")
+}
+
+fn runtime_get(uri: &str, cookie: &str) -> Request<Body> {
+    Request::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .header(ORIGIN, ALLOWED_ORIGIN)
+        .header(COOKIE, cookie)
+        .body(Body::empty())
+        .expect("runtime request builds")
+}
+
+fn runtime_json_request(method: Method, uri: &str, cookie: &str, body: Value) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(ORIGIN, ALLOWED_ORIGIN)
+        .header(COOKIE, cookie)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("runtime json request builds")
+}
+
+fn assert_no_store_headers(headers: &axum::http::HeaderMap) {
+    assert_eq!(
+        headers
+            .get(CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+    assert_eq!(
+        headers.get(PRAGMA).and_then(|value| value.to_str().ok()),
+        Some("no-cache")
+    );
+    assert_eq!(
+        headers
+            .get("x-content-type-options")
+            .and_then(|value| value.to_str().ok()),
+        Some("nosniff")
+    );
+    assert_eq!(
+        headers
+            .get(ACCESS_CONTROL_ALLOW_ORIGIN)
+            .and_then(|value| value.to_str().ok()),
+        Some(ALLOWED_ORIGIN)
+    );
+    assert_eq!(
+        headers.get(VARY).and_then(|value| value.to_str().ok()),
+        Some("Origin")
+    );
+}
+
+fn assert_matches_runtime_schema(json: &Value) {
+    let schema: Value =
+        serde_json::from_str(include_str!("../../../contracts/runtime-api.schema.json"))
+            .expect("runtime schema parses");
+    let validator = jsonschema::validator_for(&schema).expect("runtime schema compiles");
+    validator.validate(json).unwrap_or_else(|error| {
+        panic!("runtime schema validation failed: {error}");
+    });
+}
+
+fn capture_app(backend: CaptureBackend) -> (tempfile::TempDir, axum::Router, PathBuf) {
+    let workspace = tempfile::tempdir().expect("tempdir creates");
+    let private_root = workspace.path().join("bridge-private");
+    let app = router(AppState::for_tests_with_backend(
+        config(&private_root),
+        rom_operator_bridge_service::auth::AuthState::new(),
+        std::sync::Arc::new(backend),
+    ));
+    (workspace, app, private_root)
+}
+
+fn config(private_root: &Path) -> ServiceConfig {
+    ServiceConfig::from_pairs([
+        (
+            ENV_PRIVATE_ROOT.to_string(),
+            private_root.display().to_string(),
+        ),
+        (
+            ENV_OPERATOR_CREDENTIAL.to_string(),
+            GOOD_CREDENTIAL.to_string(),
+        ),
+        (ENV_SESSION_SECRET.to_string(), SESSION_SECRET.to_string()),
+    ])
+    .expect("private config loads")
+}
+
+#[derive(Debug)]
+struct CaptureBackend {
+    preview_frames: Mutex<VecDeque<u64>>,
+    state: Mutex<SessionState>,
+}
+
+impl CaptureBackend {
+    fn new<const N: usize>(frames: [u64; N]) -> Self {
+        Self {
+            preview_frames: Mutex::new(VecDeque::from(frames)),
+            state: Mutex::new(SessionState::Running),
+        }
+    }
+
+    fn preview_frame(&self) -> u64 {
+        let mut frames = self.preview_frames.lock().expect("preview mutex poisoned");
+        if frames.len() > 1 {
+            frames.pop_front().expect("preview frame exists")
+        } else {
+            *frames.front().expect("preview frame exists")
+        }
+    }
+
+    fn current_frame(&self) -> u64 {
+        *self
+            .preview_frames
+            .lock()
+            .expect("preview mutex poisoned")
+            .front()
+            .expect("preview frame exists")
+    }
+}
+
+impl BridgeBackend for CaptureBackend {
+    fn mode(&self) -> BackendMode {
+        BackendMode::Synthetic
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities::synthetic_mvp()
+    }
+
+    fn start_session(&self, _request: StartBackendSession) -> BackendResult<BackendSession> {
+        Ok(BackendSession {
+            session_id: SESSION_ID.to_string(),
+            run_id: RUN_ID.to_string(),
+            state: *self.state.lock().expect("state mutex poisoned"),
+            current_frame: self.current_frame(),
+            capabilities: self.capabilities(),
+        })
+    }
+
+    fn stop_session(
+        &self,
+        session_id: SessionId,
+        _reason: StopReason,
+    ) -> BackendResult<StoppedSession> {
+        Ok(StoppedSession {
+            session_id,
+            state: SessionState::Stopped,
+            final_frame: self.current_frame(),
+        })
+    }
+
+    fn status(&self, _session_id: SessionId) -> BackendResult<RunStatus> {
+        Ok(RunStatus {
+            session_id: SESSION_ID.to_string(),
+            run_id: RUN_ID.to_string(),
+            state: *self.state.lock().expect("state mutex poisoned"),
+            backend_mode: self.mode(),
+            current_frame: self.current_frame(),
+            capabilities: self.capabilities(),
+            last_applied_input_frame: 0,
+            last_preview_frame: self.current_frame(),
+            active_capture_job_id: None,
+        })
+    }
+
+    fn pause(&self, session_id: SessionId) -> BackendResult<RunBoundary> {
+        Ok(RunBoundary {
+            session_id,
+            state: SessionState::Paused,
+            current_frame: self.current_frame(),
+        })
+    }
+
+    fn resume(&self, session_id: SessionId) -> BackendResult<RunBoundary> {
+        Ok(RunBoundary {
+            session_id,
+            state: SessionState::Running,
+            current_frame: self.current_frame(),
+        })
+    }
+
+    fn inject_input(&self, request: InputScheduleRequest) -> BackendResult<InputScheduleReceipt> {
+        Ok(InputScheduleReceipt {
+            session_id: request.session_id,
+            assigned_frame: request.target_frame,
+            pad_word: request.pad_word,
+        })
+    }
+
+    fn framebuffer(&self, _session_id: SessionId) -> BackendResult<FramePreview> {
+        let frame = self.preview_frame();
+        Ok(FramePreview {
+            session_id: SESSION_ID.to_string(),
+            frame,
+            width: SYNTHETIC_FRAME_WIDTH,
+            height: SYNTHETIC_FRAME_HEIGHT,
+            png_bytes: synthetic_frame_png(frame),
+        })
+    }
+
+    fn trigger_capture(&self, _request: CaptureRequest) -> BackendResult<CaptureJob> {
+        Ok(CaptureJob {
+            job_id: "backend-capture-job".to_string(),
+            status: CaptureJobStatus::Running,
+            capture_id: None,
+        })
+    }
+
+    fn capture_job(&self, job_id: String) -> BackendResult<CaptureJob> {
+        Ok(CaptureJob {
+            job_id,
+            status: CaptureJobStatus::Running,
+            capture_id: None,
+        })
+    }
+}
