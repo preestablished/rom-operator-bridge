@@ -8,9 +8,9 @@ const SOURCE_ROOT = join(UI_ROOT, "src");
 const PUBLIC_ROOT = join(UI_ROOT, "public");
 const DIST_ROOT = join(UI_ROOT, "dist");
 const PERSISTENCE_AND_DOWNLOAD_API_PATTERN =
-  /\b(serviceWorker|caches|CacheStorage|localStorage|sessionStorage|indexedDB|navigator\.storage|document\.cookie|openDatabase|requestFileSystem|webkitRequestFileSystem|showSaveFilePicker|showDirectoryPicker|createObjectURL|revokeObjectURL|FileReader)\b|\.download\b|\sdownload\s*=/i;
+  /\b(serviceWorker|caches|CacheStorage|localStorage|sessionStorage|indexedDB|navigator\.storage|document\.cookie|cookieStore|openDatabase|requestFileSystem|webkitRequestFileSystem|showSaveFilePicker|showDirectoryPicker|createObjectURL|revokeObjectURL|FileReader)\b|\.download\b|\sdownload\s*=/i;
 const SOURCE_TEXT_EXTENSIONS = /\.(css|html|js|json|ts)$/;
-const FORBIDDEN_DEPLOYABLE_BINARY_EXTENSIONS = /\.(png|jpe?g|webp|gif|bmp|ico|avif|wasm|zip|gz|br|tar|bin)$/i;
+const DEPLOYABLE_TEXT_EXTENSIONS = /\.(css|html|js|mjs|cjs|json|txt|svg|xml|webmanifest)$/i;
 const FORBIDDEN_STATIC_PAYLOADS = [
   {
     label: "private absolute path",
@@ -77,7 +77,7 @@ describe("browser privacy boundaries", () => {
     const deployablePaths = [...readAllFiles(PUBLIC_ROOT), ...readAllFiles(DIST_ROOT)];
     expect(
       deployablePaths
-        .filter((path) => FORBIDDEN_DEPLOYABLE_BINARY_EXTENSIONS.test(path))
+        .filter((path) => !DEPLOYABLE_TEXT_EXTENSIONS.test(path))
         .map((path) => path.replace(UI_ROOT, "ui/"))
     ).toEqual([]);
   });
@@ -114,9 +114,12 @@ describe("browser privacy boundaries", () => {
       expect(matchesFor(sampleFiles, payload.pattern), payload.label).not.toEqual([]);
     }
     expect(PERSISTENCE_AND_DOWNLOAD_API_PATTERN.test("document.cookie = 'token=abc'")).toBe(true);
+    expect(PERSISTENCE_AND_DOWNLOAD_API_PATTERN.test("cookieStore.set('token', 'abc')")).toBe(true);
     expect(PERSISTENCE_AND_DOWNLOAD_API_PATTERN.test("openDatabase('bridge')")).toBe(true);
     expect(PERSISTENCE_AND_DOWNLOAD_API_PATTERN.test("webkitRequestFileSystem")).toBe(true);
-    expect(FORBIDDEN_DEPLOYABLE_BINARY_EXTENSIONS.test("capture-preview.png")).toBe(true);
+    expect(DEPLOYABLE_TEXT_EXTENSIONS.test("capture-preview.png")).toBe(false);
+    expect(DEPLOYABLE_TEXT_EXTENSIONS.test("private-report.pdf")).toBe(false);
+    expect(DEPLOYABLE_TEXT_EXTENSIONS.test("font-cache.woff2")).toBe(false);
   });
 });
 
@@ -144,7 +147,7 @@ function readTextFiles(root: string, textExtensions: RegExp): TextFile[] {
 
 function readDeployableTextFiles(root: string): TextFile[] {
   return readAllFiles(root)
-    .filter((path) => !FORBIDDEN_DEPLOYABLE_BINARY_EXTENSIONS.test(path))
+    .filter((path) => DEPLOYABLE_TEXT_EXTENSIONS.test(path))
     .flatMap((path) => {
       const text = readFileSync(path, "utf8");
       return text.includes("\u0000") ? [] : [{ path, text }];
