@@ -1265,7 +1265,7 @@ async fn labels_apply(
     if !is_contract_id(&request.session_id) || !is_contract_uuid(&request.idempotency_key) {
         return bad_request("Invalid labels request.").into_response();
     }
-    if request.updates.is_empty() {
+    if request.updates.is_empty() && request.dedup_updates.is_empty() {
         return bad_request("Invalid labels request.").into_response();
     }
     if let Err(response) = ensure_active_session(&state, &request.session_id) {
@@ -1278,6 +1278,7 @@ async fn labels_apply(
         session_id: request.session_id.clone(),
         idempotency_key: request.idempotency_key,
         updates: request.updates,
+        dedup_updates: request.dedup_updates,
     };
     let outcome = match state.labels.apply(
         apply,
@@ -1979,6 +1980,8 @@ pub struct LabelsRequest {
     pub session_id: String,
     pub idempotency_key: String,
     pub updates: Vec<LabelUpdate>,
+    #[serde(default)]
+    pub dedup_updates: Vec<crate::labels::DedupUpdate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

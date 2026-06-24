@@ -18,7 +18,8 @@ use rom_operator_bridge_service::{
     config::ServiceConfig,
     framebuffer::{SYNTHETIC_FRAME_HEIGHT, SYNTHETIC_FRAME_WIDTH, synthetic_frame_png},
     labels::{
-        ChangedOffsetRange, DedupGroup, DedupRelation, DedupStatus, LabelState, LabelStoreError,
+        ChangedOffsetRange, DedupGroup, DedupOp, DedupRelation, DedupStatus, DedupUpdate,
+        LabelState, LabelStoreError,
     },
     private_config::{ENV_OPERATOR_CREDENTIAL, ENV_PRIVATE_ROOT, ENV_SESSION_SECRET},
 };
@@ -463,6 +464,53 @@ fn dedup_groups_update_delete_and_validate_shape() {
         }),
         Err(LabelStoreError::Conflict(_))
     ));
+    let public_apply = labels
+        .apply(
+            rom_operator_bridge_service::labels::LabelApplyRequest {
+                session_id: SESSION_ID.to_string(),
+                idempotency_key: "00000000-0000-4000-8000-000000006000".to_string(),
+                updates: Vec::new(),
+                dedup_updates: vec![DedupUpdate {
+                    op: DedupOp::Upsert,
+                    group_id: "dedup-public".to_string(),
+                    expected_relation: Some(DedupRelation::DistinctStableState),
+                    capture_ids: Some(vec!["capture-c".to_string(), "capture-d".to_string()]),
+                    changed_features: Some(vec!["safe feature".to_string()]),
+                    changed_offset_ranges: None,
+                    status: Some(DedupStatus::Candidate),
+                }],
+            },
+            |_| true,
+            None,
+        )
+        .expect("public dedup update applies");
+    assert_eq!(public_apply.label_revision, 2);
+    assert_eq!(
+        labels.snapshot().dedup_groups[1].expected_relation,
+        DedupRelation::DistinctStableState
+    );
+    let private_feature = labels
+        .apply(
+            rom_operator_bridge_service::labels::LabelApplyRequest {
+                session_id: SESSION_ID.to_string(),
+                idempotency_key: "00000000-0000-4000-8000-000000006002".to_string(),
+                updates: Vec::new(),
+                dedup_updates: vec![DedupUpdate {
+                    op: DedupOp::Upsert,
+                    group_id: "dedup-private-feature".to_string(),
+                    expected_relation: Some(DedupRelation::SameCanonicalState),
+                    capture_ids: Some(vec!["capture-e".to_string(), "capture-f".to_string()]),
+                    changed_features: Some(vec!["/home/operator/private-feature".to_string()]),
+                    changed_offset_ranges: None,
+                    status: Some(DedupStatus::Candidate),
+                }],
+            },
+            |_| true,
+            None,
+        )
+        .expect("private feature path is reported as conflict");
+    assert!(!private_feature.applied);
+    assert_eq!(private_feature.label_revision, 2);
 
     let rejected = labels
         .apply(
@@ -476,12 +524,13 @@ fn dedup_groups_update_delete_and_validate_shape() {
                     confidence: None,
                     note: None,
                 }],
+                dedup_updates: Vec::new(),
             },
             |_| true,
             None,
         )
         .expect("rejected label applies");
-    assert_eq!(rejected.label_revision, 2);
+    assert_eq!(rejected.label_revision, 3);
     assert!(matches!(
         labels.upsert_dedup_group(DedupGroup {
             group_id: "dedup-rejected".to_string(),
@@ -497,8 +546,8 @@ fn dedup_groups_update_delete_and_validate_shape() {
     let revision = labels
         .delete_dedup_group("dedup-001")
         .expect("dedup group deletes");
-    assert_eq!(revision, 3);
-    assert!(labels.snapshot().dedup_groups.is_empty());
+    assert_eq!(revision, 4);
+    assert_eq!(labels.snapshot().dedup_groups.len(), 1);
 }
 
 async fn complete_capture(

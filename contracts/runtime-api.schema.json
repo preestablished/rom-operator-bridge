@@ -661,6 +661,41 @@
         "note": { "type": "string", "maxLength": 512 }
       }
     },
+    "dedupUpdate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "group_id"],
+      "properties": {
+        "op": { "enum": ["upsert", "delete"] },
+        "group_id": { "$ref": "#/$defs/id" },
+        "expected_relation": { "$ref": "#/$defs/dedupRelation" },
+        "capture_ids": {
+          "type": "array",
+          "minItems": 2,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/id" }
+        },
+        "changed_features": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9 _.-]+$"
+          }
+        },
+        "changed_offset_ranges": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/changedOffsetRange" }
+        },
+        "status": {
+          "type": "string",
+          "enum": ["candidate", "confirmed", "conflict"]
+        }
+      }
+    },
     "labelsRequest": {
       "type": "object",
       "additionalProperties": false,
@@ -671,8 +706,11 @@
         "idempotency_key": { "$ref": "#/$defs/uuid" },
         "updates": {
           "type": "array",
-          "minItems": 1,
           "items": { "$ref": "#/$defs/labelUpdate" }
+        },
+        "dedup_updates": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/dedupUpdate" }
         }
       }
     },
