@@ -443,7 +443,10 @@ export function mountOperatorApp(
       onMessage: handleRuntimeEvent,
       onError: () => undefined,
       onClose: clearDisconnectedInputState,
-      onReconnect: clearDisconnectedInputState
+      onReconnect: () => {
+        clearDisconnectedInputState();
+        syncInputCaptureLifecycle();
+      }
     });
     startGamepadPolling();
   }

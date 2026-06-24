@@ -151,6 +151,26 @@ describe("mounted input UX", () => {
     expect(root.textContent).toContain("Pressed: none");
   });
 
+  it("restarts focused gamepad polling after an idle input socket reconnect", async () => {
+    const raf = installAnimationFrame();
+    let currentGamepads: Array<Gamepad | null> = [standardGamepad({ pressed: [] })];
+    Object.defineProperty(navigator, "getGamepads", {
+      configurable: true,
+      value: vi.fn(() => currentGamepads)
+    });
+    const { root, socketClient } = await mountActiveInput();
+
+    focusInputSurface(root);
+    socketClient.triggerClose();
+    currentGamepads = [standardGamepad({ pressed: [1] })];
+    socketClient.triggerReconnect();
+    raf.runNext();
+
+    expect(socketClient.sendInput).toHaveBeenLastCalledWith(
+      expect.objectContaining({ source: "combined", buttons: ["A"] })
+    );
+  });
+
   it("polls Standard Gamepad state, applies analog release, and clears on disconnect", async () => {
     const raf = installAnimationFrame();
     let currentGamepads: Array<Gamepad | null> = [standardGamepad({ pressed: [0] })];
