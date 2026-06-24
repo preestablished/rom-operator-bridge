@@ -257,7 +257,11 @@ export function renderOperatorApp(
               ${captureButtonDisabled(model) ? "disabled" : ""}
             >Trigger</button>
           </div>
-          ${model.captureError ? `<p class="session-alert">${escapeHtml(model.captureError)}</p>` : ""}
+          ${
+            model.captureError
+              ? `<p class="session-alert" role="alert" tabindex="-1" data-capture-alert>${escapeHtml(model.captureError)}</p>`
+              : ""
+          }
           ${renderCaptureJob(model)}
         </article>
       </section>
@@ -285,6 +289,7 @@ export function mountOperatorApp(
   let capturePending = false;
   let captureRequestSeq = 0;
   let pressedButtons: PadButton[] = [];
+  let keyboardPadButtons: PadButton[] = [];
   let padlogTail: PadlogTailEntry[] = [];
   let eventSocket: ReturnType<RuntimeEventClient["eventSocket"]> | null = null;
   let eventSessionId: string | null = null;
@@ -333,6 +338,7 @@ export function mountOperatorApp(
       capturePending = false;
       captureRequestSeq += 1;
       pressedButtons = [];
+      keyboardPadButtons = [];
       padlogTail = [];
     }
     sessionAction = "idle";
@@ -495,6 +501,7 @@ export function mountOperatorApp(
       capturePending = false;
       captureRequestSeq += 1;
       pressedButtons = [];
+      keyboardPadButtons = [];
       padlogTail = [];
       render("credential");
       return;
@@ -722,11 +729,47 @@ export function mountOperatorApp(
     render();
   });
 
+  root.addEventListener("keydown", (event) => {
+    const target = event.target instanceof Element ? event.target : null;
+    const button = target?.closest<HTMLButtonElement>("[data-pad-button]");
+    const padButton = button?.dataset.padButton;
+    if (
+      !button ||
+      button.disabled ||
+      event.repeat ||
+      !isPadActivationKey(event.key) ||
+      !isPadButton(padButton) ||
+      inputControlsDisabled()
+    ) {
+      return;
+    }
+
+    event.preventDefault();
+    pressedButtons = appendPadButton(pressedButtons, padButton);
+    keyboardPadButtons = appendPadButton(keyboardPadButtons, padButton);
+    sendInputState(pressedButtons);
+    render();
+  });
+
+  const releaseKeyboardPadButtons = (event: KeyboardEvent) => {
+    if (!isPadActivationKey(event.key) || keyboardPadButtons.length === 0) {
+      return;
+    }
+
+    event.preventDefault();
+    pressedButtons = removePadButtons(pressedButtons, keyboardPadButtons);
+    keyboardPadButtons = [];
+    sendInputState(pressedButtons);
+    render();
+  };
+  globalThis.addEventListener?.("keyup", releaseKeyboardPadButtons);
+
   const releasePadButtons = () => {
     if (pressedButtons.length === 0) {
       return;
     }
     pressedButtons = [];
+    keyboardPadButtons = [];
     sendInputState([]);
     render();
   };
@@ -889,6 +932,7 @@ export function mountOperatorApp(
     if (focusState === "hidden") {
       sendInputState([]);
       pressedButtons = [];
+      keyboardPadButtons = [];
     }
     render();
   };
@@ -1041,6 +1085,18 @@ function isPadButton(value: string | undefined): value is PadButton {
 
 function appendPadButton(buttons: PadButton[], button: PadButton): PadButton[] {
   return buttons.includes(button) ? buttons : [...buttons, button];
+}
+
+function removePadButton(buttons: PadButton[], button: PadButton): PadButton[] {
+  return buttons.filter((pressed) => pressed !== button);
+}
+
+function removePadButtons(buttons: PadButton[], releasedButtons: PadButton[]): PadButton[] {
+  return releasedButtons.reduce(removePadButton, buttons);
+}
+
+function isPadActivationKey(key: string): boolean {
+  return key === " " || key === "Enter";
 }
 
 function padWordHex(padWord: number): string {

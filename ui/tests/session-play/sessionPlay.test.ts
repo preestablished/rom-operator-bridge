@@ -9,7 +9,7 @@ import type {
   RuntimeRunClient
 } from "../../src/app";
 import type { RuntimeSessionClient } from "../../src/authSession";
-import type { RunStatusResponse, RuntimeWsMessage } from "../../src/runtimeClient";
+import { RuntimeApiError, type RunStatusResponse, type RuntimeWsMessage } from "../../src/runtimeClient";
 import type { RuntimeConfig } from "../../src/runtimeConfig";
 
 const config: RuntimeConfig = {
@@ -163,6 +163,31 @@ describe("session and play surface", () => {
     expect(root.textContent).not.toMatch(/localStorage|sessionStorage|indexedDB/i);
   });
 
+  it("supports keyboard activation for visible pad buttons without enabling global key mapping", async () => {
+    const socketClient = mockSocketClient();
+    const client = mockClient({
+      sessionStatus: vi.fn().mockResolvedValue(activeSessionResponse()),
+      runStatus: vi.fn().mockResolvedValue(runStatusResponse({ preview_stale: false })),
+      currentFrame: vi.fn().mockResolvedValue(frameCurrentResponse(12, false))
+    });
+    const root = document.createElement("div");
+
+    mountOperatorApp(root, config, client, socketClient.client);
+    await flushPromises();
+    const button = root.querySelector<HTMLButtonElement>("[data-pad-button='Start']");
+    button?.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    window.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter" }));
+
+    expect(socketClient.sendInput).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ source: "combined", buttons: ["Start"] })
+    );
+    expect(socketClient.sendInput).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ source: "combined", buttons: [] })
+    );
+  });
+
   it("hydrates active capture jobs from run status and blocks duplicate triggers", async () => {
     const client = mockClient({
       sessionStatus: vi.fn().mockResolvedValue(activeSessionResponse()),
@@ -192,6 +217,33 @@ describe("session and play surface", () => {
     );
     root.querySelector<HTMLButtonElement>("[data-run-action='capture']")?.click();
     expect(client.triggerCapture).not.toHaveBeenCalled();
+  });
+
+  it("announces capture failures without leaking private details", async () => {
+    const client = mockClient({
+      sessionStatus: vi.fn().mockResolvedValue(activeSessionResponse()),
+      runStatus: vi.fn().mockResolvedValue(runStatusResponse({ preview_stale: false })),
+      currentFrame: vi.fn().mockResolvedValue(frameCurrentResponse(42, false)),
+      triggerCapture: vi.fn().mockRejectedValue(
+        new RuntimeApiError({
+          code: "capture_failed",
+          message: "Capture failed.",
+          retryable: true,
+          details: {}
+        })
+      )
+    });
+    const root = document.createElement("div");
+
+    mountOperatorApp(root, config, client, null);
+    await flushPromises();
+    root.querySelector<HTMLButtonElement>("[data-run-action='capture']")?.click();
+    await flushPromises();
+
+    const alert = root.querySelector<HTMLElement>("[data-capture-alert]");
+    expect(alert?.getAttribute("role")).toBe("alert");
+    expect(alert?.textContent).toBe("Capture failed.");
+    expect(root.textContent).not.toMatch(/\/home\/|private\.env|operator-secret/i);
   });
 });
 
