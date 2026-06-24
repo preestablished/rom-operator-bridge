@@ -5,10 +5,12 @@ ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 BASE_BRANCH="main"
 
 if [[ -f "$ROOT_DIR/.ralph" ]]; then
-  configured_base=$(grep -oP '(?<=^main_branch=).*' "$ROOT_DIR/.ralph" 2>/dev/null | head -1 || true)
-  if [[ -n "$configured_base" ]]; then
-    BASE_BRANCH="$configured_base"
-  fi
+  while IFS='=' read -r key value; do
+    if [[ "$key" == "main_branch" && -n "${value:-}" ]]; then
+      BASE_BRANCH="$value"
+      break
+    fi
+  done < "$ROOT_DIR/.ralph"
 fi
 
 run_step() {
@@ -39,7 +41,19 @@ printf 'Base branch: %s\n' "$BASE_BRANCH"
 
 run_step "git unstaged whitespace check" git diff --check
 run_step "git staged whitespace check" git diff --cached --check
-run_step "git branch whitespace check against ${BASE_BRANCH}...HEAD" git diff --check "${BASE_BRANCH}...HEAD"
+
+if ! git -C "$ROOT_DIR" rev-parse --verify --quiet "${BASE_BRANCH}^{commit}" >/dev/null; then
+  printf 'ERROR: base branch `%s` was not found locally; fetch or check out the configured Ralph main branch before running this gate.\n' "$BASE_BRANCH" >&2
+  exit 1
+fi
+
+CURRENT_BRANCH=$(git -C "$ROOT_DIR" branch --show-current 2>/dev/null || true)
+if [[ "$CURRENT_BRANCH" == "$BASE_BRANCH" ]]; then
+  skip_step "currently on base branch ${BASE_BRANCH}; branch diff whitespace check is empty after merge"
+else
+  run_step "git branch whitespace check against ${BASE_BRANCH}...HEAD" git diff --check "${BASE_BRANCH}...HEAD"
+fi
+
 run_step "git commit whitespace/stat check for HEAD" git show --check --stat --oneline HEAD
 
 if [[ -f "$ROOT_DIR/service/Cargo.toml" ]]; then

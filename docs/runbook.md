@@ -28,21 +28,16 @@ credentials, tokens, ROM paths, or real private root paths.
 
 ## Bridge Stack Commands
 
-Run the frozen Phase 0 bridge-stack command family before handoff:
+Run the root Ralph VERIFY command before handoff:
 
 ```sh
-cargo fmt --manifest-path service/Cargo.toml -- --check
-cargo test --manifest-path service/Cargo.toml --all-targets
-npm --prefix ui ci
-npm --prefix ui run typecheck
-npm --prefix ui test -- --run
-npm --prefix ui run build
 scripts/quality-gate.sh
 ```
 
 Ralph agents should use `scripts/quality-gate.sh` as the root VERIFY command.
 The command is documented in `docs/quality-gate.md` and is the extension point
-for later static redaction and synthetic integration gates.
+for the frozen Phase 0 service/UI checks plus later static redaction and
+synthetic integration gates.
 
 Run a service-only compile smoke when iterating on Rust service changes:
 

@@ -18,7 +18,7 @@ The gate currently runs:
 ```sh
 git diff --check
 git diff --cached --check
-git diff --check <base-branch>...HEAD
+git diff --check <base-branch>...HEAD  # skipped with an explicit message on the base branch
 git show --check --stat --oneline HEAD
 cargo fmt --manifest-path service/Cargo.toml -- --check
 cargo test --manifest-path service/Cargo.toml --all-targets
@@ -29,7 +29,9 @@ npm --prefix ui run build
 ```
 
 The base branch defaults to `main`. If `.ralph` defines `main_branch=<branch>`,
-the script uses that branch for the branch diff whitespace check.
+the script uses that branch for the branch diff whitespace check. The configured
+base branch must exist locally so a Ralph branch is compared against the same
+base it will merge into.
 
 ## Degradation Rules
 
