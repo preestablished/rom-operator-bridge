@@ -28,6 +28,7 @@ Use these files in order:
 5. `05-tests-and-quality-gates.md`
 6. `06-acceptance-and-beads-handoff.md`
 7. `07-subagent-review-summary.md`
+8. `08-current-execution-state.md`
 
 ## Non-Goals
 
