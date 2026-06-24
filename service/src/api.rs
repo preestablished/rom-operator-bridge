@@ -9,6 +9,7 @@ use crate::{
     },
     config::ServiceConfig,
     input::{PAD_LAYOUT_ID, PAD_LAYOUT_VERSION},
+    ws_events::{WsEventState, serve_event_socket},
     ws_input::{WsInputState, serve_input_socket},
 };
 use axum::{
@@ -33,6 +34,7 @@ pub struct AppState {
     backend: Arc<dyn BridgeBackend>,
     auth: AuthState,
     runtime_session: Arc<Mutex<Option<String>>>,
+    ws_events: WsEventState,
     ws_input: WsInputState,
 }
 
@@ -50,6 +52,7 @@ impl AppState {
             backend,
             auth: AuthState::new(),
             runtime_session: Arc::new(Mutex::new(None)),
+            ws_events: WsEventState::new(),
             ws_input: WsInputState::new(),
         }
     }
@@ -65,6 +68,7 @@ impl AppState {
             backend: Arc::new(SyntheticBackend::with_private_config(private_config)),
             auth,
             runtime_session: Arc::new(Mutex::new(None)),
+            ws_events: WsEventState::new(),
             ws_input: WsInputState::new(),
         }
     }
@@ -79,6 +83,7 @@ impl AppState {
             backend,
             auth,
             runtime_session: Arc::new(Mutex::new(None)),
+            ws_events: WsEventState::new(),
             ws_input: WsInputState::new(),
         }
     }
@@ -114,6 +119,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/ws/input",
             get(input_ws_handshake).fallback(method_not_allowed),
+        )
+        .route(
+            "/ws/events",
+            get(events_ws_handshake).fallback(method_not_allowed),
         )
         .fallback(not_found)
         .with_state(state)
@@ -195,6 +204,7 @@ async fn start_session(
         .runtime_session
         .lock()
         .expect("runtime session mutex poisoned") = Some(session_id);
+    state.ws_events.reset_session(&backend_session.session_id);
     state.ws_input.reset_session(&backend_session.session_id);
 
     let mut response = Json(StartSessionResponse {
@@ -288,6 +298,7 @@ async fn stop_session(
         .runtime_session
         .lock()
         .expect("runtime session mutex poisoned") = None;
+    state.ws_events.reset_session(&stopped.session_id);
     state.ws_input.reset_session(&stopped.session_id);
     if let Err(error) = state.auth.clear_session_headers(&headers) {
         return auth_error(error).into_response();
@@ -374,6 +385,37 @@ async fn input_ws_handshake(
     response
 }
 
+async fn events_ws_handshake(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    if let Err(response) = authenticate_runtime_request(&state, &headers, &uri) {
+        return response;
+    }
+
+    let session_id = match active_session_id(&state) {
+        Ok(session_id) => session_id,
+        Err(response) => return response,
+    };
+    let status = match state.backend.status(session_id.clone()) {
+        Ok(status) => status,
+        Err(error) => return backend_error(error).into_response(),
+    };
+    if status.session_id != session_id {
+        return auth_error(AuthError::BadSession).into_response();
+    }
+
+    let ws_events = state.ws_events.clone();
+    let sanitizer = state.config.private_config().public_sanitizer();
+    let mut response = ws
+        .on_upgrade(move |socket| serve_event_socket(socket, ws_events, sanitizer, status))
+        .into_response();
+    apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
+    response
+}
+
 fn run_state_transition(
     state: AppState,
     headers: HeaderMap,
@@ -454,6 +496,7 @@ fn cleanup_runtime_session(state: &AppState, reason: StopReason) -> Result<(), B
         .runtime_session
         .lock()
         .expect("runtime session mutex poisoned") = None;
+    state.ws_events.reset_session(&stopped.session_id);
     state.ws_input.reset_session(&stopped.session_id);
     Ok(())
 }

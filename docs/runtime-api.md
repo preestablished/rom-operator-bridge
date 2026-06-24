@@ -180,6 +180,8 @@ Input channel rules:
 Event channel rules:
 
 - `server_seq` is monotonically increasing per session;
+- reconnect snapshots continue from the active session's last assigned
+  `server_seq`;
 - the UI ignores events older than the last processed `server_seq`;
 - event payloads must be browser-safe summaries.
 
