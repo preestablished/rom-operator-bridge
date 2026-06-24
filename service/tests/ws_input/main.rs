@@ -22,8 +22,9 @@ use std::{
     net::SocketAddr,
     path::Path,
     sync::{Arc, Mutex},
+    time::Duration,
 };
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, time::timeout};
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{Message, client::IntoClientRequest, http::HeaderValue},
@@ -113,6 +114,57 @@ async fn schema_version_mismatch_returns_input_reject() {
     assert_eq!(reject["type"], "input_reject");
     assert_eq!(reject["payload"]["error"]["code"], "bad_request");
     assert_eq!(reject["payload"]["error"]["message"], "Input rejected.");
+}
+
+#[tokio::test]
+async fn schema_invalid_but_replyable_messages_return_input_reject() {
+    let (_workspace, app, backend) = ws_app(SessionState::Running);
+    let cookie = login_cookie(app.clone()).await;
+    let server = WsServer::start(app).await;
+    let mut ws = server.connect(&cookie).await;
+
+    let mut missing_server_seq = input_message(1, "keyboard", &["A"]);
+    missing_server_seq
+        .as_object_mut()
+        .expect("input message is object")
+        .remove("server_seq");
+    let missing_server_seq_reject = send_input(&mut ws, missing_server_seq).await;
+    assert_eq!(missing_server_seq_reject["type"], "input_reject");
+
+    let mut unknown_top_level = input_message(2, "keyboard", &["A"]);
+    unknown_top_level["private_path"] = json!("/home/private/rom");
+    let unknown_top_level_reject = send_input(&mut ws, unknown_top_level).await;
+    assert_eq!(unknown_top_level_reject["type"], "input_reject");
+
+    let mut unknown_payload = input_message(3, "keyboard", &["A"]);
+    unknown_payload["payload"]["debug"] = json!("stderr: should not leak");
+    let unknown_payload_reject = send_input(&mut ws, unknown_payload).await;
+    assert_eq!(unknown_payload_reject["type"], "input_reject");
+
+    let mut invalid_uuid = input_message(4, "keyboard", &["A"]);
+    invalid_uuid["payload"]["client_event_id"] = json!("not-a-uuid");
+    let invalid_uuid_reject = send_input(&mut ws, invalid_uuid).await;
+    assert_eq!(invalid_uuid_reject["type"], "input_reject");
+
+    assert!(backend.injected_requests().is_empty());
+}
+
+#[tokio::test]
+async fn invalid_echo_fields_are_not_scheduled_or_echoed() {
+    let (_workspace, app, backend) = ws_app(SessionState::Running);
+    let cookie = login_cookie(app.clone()).await;
+    let server = WsServer::start(app).await;
+    let mut ws = server.connect(&cookie).await;
+
+    let mut invalid_session_id = input_message(1, "keyboard", &["A"]);
+    invalid_session_id["session_id"] = json!("bad/session");
+    send_input_expect_no_reply(&mut ws, invalid_session_id).await;
+
+    let mut too_large_client_seq = input_message(1, "keyboard", &["A"]);
+    too_large_client_seq["client_seq"] = json!(9_007_199_254_740_992_u64);
+    send_input_expect_no_reply(&mut ws, too_large_client_seq).await;
+
+    assert!(backend.injected_requests().is_empty());
 }
 
 #[tokio::test]
@@ -231,7 +283,32 @@ async fn send_input(
         panic!("expected text websocket response");
     };
 
-    serde_json::from_str(&text).expect("response json parses")
+    let json: Value = serde_json::from_str(&text).expect("response json parses");
+    assert_matches_runtime_schema(&json);
+    json
+}
+
+async fn send_input_expect_no_reply(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    message: Value,
+) {
+    ws.send(Message::Text(message.to_string().into()))
+        .await
+        .expect("websocket send succeeds");
+    let response = timeout(Duration::from_millis(100), ws.next()).await;
+    assert!(response.is_err(), "invalid echo fields must not be echoed");
+}
+
+fn assert_matches_runtime_schema(json: &Value) {
+    let schema: Value =
+        serde_json::from_str(include_str!("../../../contracts/runtime-api.schema.json"))
+            .expect("runtime schema parses");
+    let validator = jsonschema::validator_for(&schema).expect("runtime schema compiles");
+    validator.validate(json).unwrap_or_else(|error| {
+        panic!("runtime schema validation failed: {error}");
+    });
 }
 
 fn input_message(client_seq: u64, source_id: &str, buttons: &[&str]) -> Value {

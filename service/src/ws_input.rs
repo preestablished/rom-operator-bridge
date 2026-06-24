@@ -15,6 +15,18 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+const JSON_SAFE_U64_MAX: u64 = 9_007_199_254_740_991;
+const TOP_LEVEL_FIELDS: &[&str] = &[
+    "schema_version",
+    "type",
+    "session_id",
+    "client_seq",
+    "source_id",
+    "server_seq",
+    "payload",
+];
+const MAX_RETAINED_REPLIES_PER_SOURCE: usize = 1024;
+
 #[derive(Debug, Clone, Default)]
 pub struct WsInputState {
     inner: Arc<Mutex<WsInputInner>>,
@@ -118,7 +130,12 @@ impl WsInputState {
 
         let reply = match outcome.status {
             InputScheduleStatus::Applied | InputScheduleStatus::Queued => {
-                inner.ack(&incoming, &outcome)
+                match inner.ack(&incoming, &outcome) {
+                    Ok(reply) => reply,
+                    Err(error) => {
+                        inner.reject(&incoming, error.code, error.message, error.retryable)
+                    }
+                }
             }
             InputScheduleStatus::Dropped => {
                 let error = WsInputError::from_dropped(&outcome);
@@ -178,9 +195,21 @@ impl WsInputInner {
                 .map_or(client_seq, |highest| highest.max(client_seq)),
         );
         source.replies.insert(client_seq, reply);
+        while source.replies.len() > MAX_RETAINED_REPLIES_PER_SOURCE {
+            source.replies.pop_first();
+        }
     }
 
-    fn ack(&mut self, incoming: &IncomingEnvelope, outcome: &InputScheduleOutcome) -> String {
+    fn ack(
+        &mut self,
+        incoming: &IncomingEnvelope,
+        outcome: &InputScheduleOutcome,
+    ) -> Result<String, WsInputError> {
+        let assigned_frame = outcome.assigned_frame.unwrap_or_default();
+        if assigned_frame > JSON_SAFE_U64_MAX {
+            return Err(WsInputError::bad_request());
+        }
+
         let envelope = WsOutputEnvelope {
             schema_version: RUNTIME_API_SCHEMA_VERSION,
             message_type: "input_ack",
@@ -190,12 +219,12 @@ impl WsInputInner {
             server_seq: Some(self.next_server_seq()),
             payload: json!(InputAckPayload {
                 client_event_id: incoming.client_event_id().to_string(),
-                assigned_frame: outcome.assigned_frame.unwrap_or_default(),
+                assigned_frame,
                 pad_word: outcome.pad_word,
                 status: outcome.status,
             }),
         };
-        serde_json::to_string(&envelope).expect("ws input ack serializes")
+        Ok(serde_json::to_string(&envelope).expect("ws input ack serializes"))
     }
 
     fn reject(
@@ -251,18 +280,16 @@ struct SourceState {
     replies: BTreeMap<u64, String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 struct RawIncomingEnvelope {
     schema_version: Option<u16>,
-    #[serde(rename = "type")]
     message_type: Option<String>,
     session_id: Option<String>,
     client_seq: Option<u64>,
     source_id: Option<String>,
-    #[serde(default)]
-    server_seq: Value,
-    #[serde(default)]
-    payload: Value,
+    server_seq: Option<Value>,
+    payload: Option<Value>,
+    has_unknown_fields: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -272,13 +299,14 @@ struct IncomingEnvelope {
     session_id: String,
     client_seq: u64,
     source_id: String,
-    server_seq: Value,
-    payload: Value,
+    server_seq: Option<Value>,
+    payload: Option<Value>,
+    has_unknown_fields: bool,
 }
 
 impl IncomingEnvelope {
     fn parse(text: &str) -> Option<Self> {
-        let raw: RawIncomingEnvelope = serde_json::from_str(text).ok()?;
+        let raw = RawIncomingEnvelope::parse(text)?;
         Some(Self {
             schema_version: raw.schema_version,
             message_type: raw.message_type,
@@ -287,20 +315,33 @@ impl IncomingEnvelope {
             source_id: raw.source_id?,
             server_seq: raw.server_seq,
             payload: raw.payload,
+            has_unknown_fields: raw.has_unknown_fields,
         })
     }
 
     fn validation_error(&self) -> Option<WsInputError> {
+        if self.has_unknown_fields {
+            return Some(WsInputError::bad_request());
+        }
         if self.schema_version != Some(RUNTIME_API_SCHEMA_VERSION) {
             return Some(WsInputError::bad_request());
         }
         if self.message_type.as_deref() != Some("input_state") {
             return Some(WsInputError::bad_request());
         }
-        if !self.server_seq.is_null() {
+        if self
+            .server_seq
+            .as_ref()
+            .is_none_or(|server_seq| !server_seq.is_null())
+        {
             return Some(WsInputError::bad_request());
         }
-        if self.session_id.is_empty() || self.source_id.is_empty() || self.source_id.len() > 64 {
+        if !is_contract_id(&self.session_id)
+            || self.source_id.is_empty()
+            || self.source_id.len() > 64
+            || self.client_seq > JSON_SAFE_U64_MAX
+            || self.payload.is_none()
+        {
             return Some(WsInputError::bad_request());
         }
 
@@ -308,8 +349,9 @@ impl IncomingEnvelope {
     }
 
     fn browser_input(&self) -> Result<BrowserInputState, WsInputError> {
-        let payload: InputStatePayload = serde_json::from_value(self.payload.clone())
-            .map_err(|_| WsInputError::bad_request())?;
+        let payload: InputStatePayload =
+            serde_json::from_value(self.payload.clone().ok_or_else(WsInputError::bad_request)?)
+                .map_err(|_| WsInputError::bad_request())?;
         payload.validate()?;
 
         let mut seen = BTreeSet::new();
@@ -334,13 +376,54 @@ impl IncomingEnvelope {
 
     fn client_event_id(&self) -> &str {
         self.payload
+            .as_ref()
+            .unwrap_or(&Value::Null)
             .get("client_event_id")
             .and_then(Value::as_str)
             .unwrap_or("")
     }
 }
 
+impl RawIncomingEnvelope {
+    fn parse(text: &str) -> Option<Self> {
+        let value: Value = serde_json::from_str(text).ok()?;
+        let object = value.as_object()?;
+        let has_unknown_fields = object
+            .keys()
+            .any(|key| !TOP_LEVEL_FIELDS.contains(&key.as_str()));
+
+        Some(Self {
+            schema_version: object
+                .get("schema_version")
+                .and_then(Value::as_u64)
+                .and_then(|value| u16::try_from(value).ok()),
+            message_type: object
+                .get("type")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            session_id: object
+                .get("session_id")
+                .and_then(Value::as_str)
+                .filter(|session_id| is_contract_id(session_id))
+                .map(ToOwned::to_owned),
+            client_seq: object
+                .get("client_seq")
+                .and_then(Value::as_u64)
+                .filter(|client_seq| *client_seq <= JSON_SAFE_U64_MAX),
+            source_id: object
+                .get("source_id")
+                .and_then(Value::as_str)
+                .filter(|source_id| !source_id.is_empty() && source_id.len() <= 64)
+                .map(ToOwned::to_owned),
+            server_seq: object.get("server_seq").cloned(),
+            payload: object.get("payload").cloned(),
+            has_unknown_fields,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct InputStatePayload {
     client_event_id: String,
     client_time_ms: f64,
@@ -351,6 +434,7 @@ struct InputStatePayload {
 impl InputStatePayload {
     fn validate(&self) -> Result<(), WsInputError> {
         if self.client_event_id.is_empty()
+            || !is_uuid(&self.client_event_id)
             || !self.client_time_ms.is_finite()
             || self.client_time_ms < 0.0
             || !matches!(self.source.as_str(), "keyboard" | "gamepad" | "combined")
@@ -360,6 +444,28 @@ impl InputStatePayload {
 
         Ok(())
     }
+}
+
+fn is_contract_id(candidate: &str) -> bool {
+    !candidate.is_empty()
+        && candidate.len() <= 128
+        && candidate
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+}
+
+fn is_uuid(candidate: &str) -> bool {
+    if candidate.len() != 36 {
+        return false;
+    }
+
+    candidate.bytes().enumerate().all(|(index, byte)| {
+        if matches!(index, 8 | 13 | 18 | 23) {
+            byte == b'-'
+        } else {
+            byte.is_ascii_hexdigit()
+        }
+    })
 }
 
 #[derive(Debug, Clone, Serialize)]
