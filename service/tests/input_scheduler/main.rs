@@ -721,5 +721,8 @@ fn status(run_id: &str, state: SessionState, current_frame: FrameCounter) -> Run
         backend_mode: BackendMode::Synthetic,
         current_frame,
         capabilities: BackendCapabilities::synthetic_mvp(),
+        last_applied_input_frame: 0,
+        last_preview_frame: 0,
+        active_capture_job_id: None,
     }
 }

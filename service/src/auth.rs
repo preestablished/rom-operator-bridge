@@ -106,6 +106,13 @@ impl AuthState {
         self.authenticate_token(token)
     }
 
+    pub fn clear_session_headers(&self, headers: &HeaderMap) -> Result<(), AuthError> {
+        let token = session_cookie(headers).ok_or(AuthError::MissingSession)?;
+        self.authenticate_token(token)?;
+        self.clear_session_token(token);
+        Ok(())
+    }
+
     pub fn authenticate_token(&self, token: &str) -> Result<(), AuthError> {
         let mut inner = self.inner.lock().expect("auth mutex poisoned");
         let now = self.clock.now_unix_seconds();
@@ -236,6 +243,10 @@ pub fn session_cookie_header(session: &OperatorSession) -> String {
         "{SESSION_COOKIE_NAME}={}; Path=/; Max-Age={SESSION_TTL_SECONDS}; HttpOnly; Secure; SameSite=Strict",
         session.token
     )
+}
+
+pub fn expired_session_cookie_header() -> String {
+    format!("{SESSION_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict")
 }
 
 fn session_cookie(headers: &HeaderMap) -> Option<&str> {

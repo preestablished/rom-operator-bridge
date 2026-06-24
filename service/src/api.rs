@@ -1,5 +1,8 @@
 use crate::{
-    auth::{ALLOWED_ORIGIN, AuthError, AuthState, session_cookie_header, validate_runtime_request},
+    auth::{
+        ALLOWED_ORIGIN, AuthError, AuthState, expired_session_cookie_header, session_cookie_header,
+        validate_runtime_request,
+    },
     backend::{BackendMode, BridgeBackend, RealBackendUnavailable, SyntheticBackend},
     config::ServiceConfig,
     input::{PAD_LAYOUT_ID, PAD_LAYOUT_VERSION},
@@ -33,7 +36,9 @@ pub struct AppState {
 impl AppState {
     pub fn from_config(config: ServiceConfig) -> Self {
         let backend: Arc<dyn BridgeBackend> = match config.backend_mode() {
-            BackendMode::Synthetic => Arc::new(SyntheticBackend),
+            BackendMode::Synthetic => Arc::new(SyntheticBackend::with_private_config(
+                config.private_config().clone(),
+            )),
             BackendMode::Real => Arc::new(RealBackendUnavailable),
         };
 
@@ -51,9 +56,10 @@ impl AppState {
     }
 
     pub fn synthetic_for_tests_with_auth(config: ServiceConfig, auth: AuthState) -> Self {
+        let private_config = config.private_config().clone();
         Self {
             config,
-            backend: Arc::new(SyntheticBackend),
+            backend: Arc::new(SyntheticBackend::with_private_config(private_config)),
             auth,
             runtime_session: Arc::new(Mutex::new(None)),
             ws_input: WsInputState::new(),
@@ -85,6 +91,22 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/session/start",
             post(start_session).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/session/stop",
+            post(stop_session).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/run/status",
+            get(run_status).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/run/pause",
+            post(pause_run).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/run/resume",
+            post(resume_run).fallback(method_not_allowed),
         )
         .route(
             "/ws/input",
@@ -232,6 +254,96 @@ async fn session_status(State(state): State<AppState>, headers: HeaderMap, uri: 
     response
 }
 
+async fn stop_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(request): Json<StopSessionRequest>,
+) -> Response {
+    if let Err(error) = validate_runtime_request(&headers, &uri)
+        .and_then(|()| state.auth.authenticate_headers(&headers))
+    {
+        return auth_error(error).into_response();
+    }
+    if request.schema_version != RUNTIME_API_SCHEMA_VERSION {
+        return bad_request("Unsupported schema version.").into_response();
+    }
+    if let Err(response) = ensure_active_session(&state, &request.session_id) {
+        return response;
+    }
+
+    let stopped = match state
+        .backend
+        .stop_session(request.session_id.clone(), request.reason)
+    {
+        Ok(stopped) => stopped,
+        Err(error) => return backend_error(error).into_response(),
+    };
+
+    *state
+        .runtime_session
+        .lock()
+        .expect("runtime session mutex poisoned") = None;
+    state.ws_input.reset_session(&stopped.session_id);
+    if let Err(error) = state.auth.clear_session_headers(&headers) {
+        return auth_error(error).into_response();
+    }
+
+    let mut response = Json(StopSessionResponse {
+        schema_version: RUNTIME_API_SCHEMA_VERSION,
+        session_id: stopped.session_id,
+        state: stopped.state,
+        final_frame: stopped.final_frame,
+    })
+    .into_response();
+    apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
+    response.headers_mut().insert(
+        SET_COOKIE,
+        HeaderValue::from_str(&expired_session_cookie_header())
+            .expect("expired session cookie contains only valid header characters"),
+    );
+    response
+}
+
+async fn run_status(State(state): State<AppState>, headers: HeaderMap, uri: Uri) -> Response {
+    if let Err(error) = validate_runtime_request(&headers, &uri)
+        .and_then(|()| state.auth.authenticate_headers(&headers))
+    {
+        return auth_error(error).into_response();
+    }
+    let session_id = match active_session_id(&state) {
+        Ok(session_id) => session_id,
+        Err(response) => return response,
+    };
+
+    let status = match state.backend.status(session_id) {
+        Ok(status) => status,
+        Err(error) => return backend_error(error).into_response(),
+    };
+
+    let mut response = Json(RunStatusResponse::from(status)).into_response();
+    apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
+    response
+}
+
+async fn pause_run(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(request): Json<SessionOnlyRequest>,
+) -> Response {
+    run_state_transition(state, headers, uri, request, RunTransition::Pause)
+}
+
+async fn resume_run(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(request): Json<SessionOnlyRequest>,
+) -> Response {
+    run_state_transition(state, headers, uri, request, RunTransition::Resume)
+}
+
 async fn input_ws_handshake(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
@@ -260,6 +372,68 @@ async fn input_ws_handshake(
         .into_response();
     apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
     response
+}
+
+fn run_state_transition(
+    state: AppState,
+    headers: HeaderMap,
+    uri: Uri,
+    request: SessionOnlyRequest,
+    transition: RunTransition,
+) -> Response {
+    if let Err(error) = validate_runtime_request(&headers, &uri)
+        .and_then(|()| state.auth.authenticate_headers(&headers))
+    {
+        return auth_error(error).into_response();
+    }
+    if request.schema_version != RUNTIME_API_SCHEMA_VERSION {
+        return bad_request("Unsupported schema version.").into_response();
+    }
+    if let Err(response) = ensure_active_session(&state, &request.session_id) {
+        return response;
+    }
+
+    let boundary = match transition {
+        RunTransition::Pause => state.backend.pause(request.session_id),
+        RunTransition::Resume => state.backend.resume(request.session_id),
+    };
+    let boundary = match boundary {
+        Ok(boundary) => boundary,
+        Err(error) => return backend_error(error).into_response(),
+    };
+
+    let mut response = Json(RunStateResponse {
+        schema_version: RUNTIME_API_SCHEMA_VERSION,
+        state: boundary.state,
+        current_frame: boundary.current_frame,
+    })
+    .into_response();
+    apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
+    response
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunTransition {
+    Pause,
+    Resume,
+}
+
+fn active_session_id(state: &AppState) -> Result<String, Response> {
+    state
+        .runtime_session
+        .lock()
+        .expect("runtime session mutex poisoned")
+        .clone()
+        .ok_or_else(|| auth_error(AuthError::MissingSession).into_response())
+}
+
+fn ensure_active_session(state: &AppState, session_id: &str) -> Result<(), Response> {
+    let active = active_session_id(state)?;
+    if active == session_id {
+        Ok(())
+    } else {
+        Err(auth_error(AuthError::BadSession).into_response())
+    }
 }
 
 async fn not_found() -> AppError {
@@ -306,6 +480,67 @@ pub struct StartSessionResponse {
     pub current_frame: u64,
     pub pad_layout: PadLayoutResponse,
     pub capabilities: crate::backend::BackendCapabilities,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct StopSessionRequest {
+    pub schema_version: u16,
+    pub session_id: String,
+    pub reason: crate::backend::StopReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StopSessionResponse {
+    pub schema_version: u16,
+    pub session_id: String,
+    pub state: crate::backend::SessionState,
+    pub final_frame: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SessionOnlyRequest {
+    pub schema_version: u16,
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RunStateResponse {
+    pub schema_version: u16,
+    pub state: crate::backend::SessionState,
+    pub current_frame: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RunStatusResponse {
+    pub schema_version: u16,
+    pub session_id: String,
+    pub run_id: String,
+    pub state: crate::backend::SessionState,
+    pub backend_mode: BackendMode,
+    pub current_frame: u64,
+    pub last_applied_input_frame: u64,
+    pub last_preview_frame: u64,
+    pub preview_stale: bool,
+    pub active_capture_job_id: Option<String>,
+    pub capabilities: crate::backend::BackendCapabilities,
+}
+
+impl From<crate::backend::RunStatus> for RunStatusResponse {
+    fn from(status: crate::backend::RunStatus) -> Self {
+        Self {
+            schema_version: RUNTIME_API_SCHEMA_VERSION,
+            session_id: status.session_id,
+            run_id: status.run_id,
+            state: status.state,
+            backend_mode: status.backend_mode,
+            current_frame: status.current_frame,
+            last_applied_input_frame: status.last_applied_input_frame,
+            last_preview_frame: status.last_preview_frame,
+            preview_stale: status.last_preview_frame < status.current_frame,
+            active_capture_job_id: status.active_capture_job_id,
+            capabilities: status.capabilities,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -409,6 +644,24 @@ fn apply_runtime_headers(headers: &mut axum::http::HeaderMap, origin: Option<&'s
         );
         headers.insert(VARY, HeaderValue::from_static("Origin"));
     }
+}
+
+fn bad_request(message: &'static str) -> AppError {
+    AppError::new(
+        StatusCode::BAD_REQUEST,
+        ErrorCode::BadRequest,
+        message,
+        false,
+    )
+}
+
+fn backend_error(_error: crate::backend::BackendError) -> AppError {
+    AppError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        ErrorCode::BackendUnavailable,
+        "Backend unavailable.",
+        true,
+    )
 }
 
 fn auth_error(error: AuthError) -> AppError {

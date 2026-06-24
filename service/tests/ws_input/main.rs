@@ -448,6 +448,9 @@ impl BridgeBackend for RecordingBackend {
             backend_mode: self.mode(),
             current_frame: 0,
             capabilities: self.capabilities(),
+            last_applied_input_frame: 0,
+            last_preview_frame: 0,
+            active_capture_job_id: None,
         })
     }
 

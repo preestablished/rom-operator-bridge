@@ -163,7 +163,7 @@ fn config_rejects_invalid_overrides() {
 
 #[test]
 fn backend_trait_surface_wires_synthetic_and_real_modes() {
-    let synthetic = SyntheticBackend;
+    let synthetic = SyntheticBackend::new();
     let requested_capabilities = BackendCapabilities::synthetic_mvp();
     let session = synthetic
         .start_session(StartBackendSession {
