@@ -26,14 +26,24 @@ mode `0600`; configured private roots are created and enforced as mode `0700`;
 private files are written as mode `0600`. Do not commit the env file,
 credentials, tokens, ROM paths, or real private root paths.
 
-## Bridge Service Commands
+## Bridge Stack Commands
 
-Format, build, and test the Rust service:
+Run the frozen Phase 0 bridge-stack command family before handoff:
 
 ```sh
 cargo fmt --manifest-path service/Cargo.toml -- --check
-cargo build --manifest-path service/Cargo.toml
 cargo test --manifest-path service/Cargo.toml --all-targets
+npm --prefix ui ci
+npm --prefix ui run typecheck
+npm --prefix ui test -- --run
+npm --prefix ui run build
+scripts/quality-gate.sh
+```
+
+Run a service-only compile smoke when iterating on Rust service changes:
+
+```sh
+cargo build --manifest-path service/Cargo.toml
 ```
 
 Run the synthetic service using the configured deployment bind:
@@ -41,6 +51,12 @@ Run the synthetic service using the configured deployment bind:
 ```sh
 ROM_OPERATOR_BRIDGE_BACKEND=synthetic \
 cargo run --manifest-path service/Cargo.toml
+```
+
+Check deployment-bind liveness:
+
+```sh
+curl -fsS http://10.0.0.106:7410/health
 ```
 
 Run the synthetic service on loopback for local development:
@@ -52,7 +68,7 @@ RUST_LOG=rom_operator_bridge_service=info \
 cargo run --manifest-path service/Cargo.toml
 ```
 
-Check liveness:
+Check loopback development liveness:
 
 ```sh
 curl -fsS http://127.0.0.1:7410/health
@@ -204,8 +220,11 @@ before producing any public handoff.
 
 Run these only on the operator-approved host with private ROM metadata, private
 capture artifacts, private labels, and private forbidden-literal files available.
-Keep command output and generated reports private unless redaction-scanned and
-approved for sharing.
+Keep command output and generated reports private. After redaction scanning and
+operator approval, shared handoffs may include only aggregate status, counts,
+pass/fail booleans, and approved labels; never share report bodies, capture ids,
+decoded values, private artifact refs, private paths, or raw verifier/scorer
+errors.
 
 Private intake:
 
