@@ -8,19 +8,19 @@ const SOURCE_ROOT = join(UI_ROOT, "src");
 const PUBLIC_ROOT = join(UI_ROOT, "public");
 const DIST_ROOT = join(UI_ROOT, "dist");
 const PERSISTENCE_AND_DOWNLOAD_API_PATTERN =
-  /\b(serviceWorker|caches|CacheStorage|localStorage|sessionStorage|indexedDB|navigator\.storage|showSaveFilePicker|showDirectoryPicker|createObjectURL|revokeObjectURL|FileReader)\b|\.download\b|\sdownload\s*=/i;
-const DEPLOYABLE_TEXT_EXTENSIONS = /\.(css|html|js|json|txt|svg)$/;
+  /\b(serviceWorker|caches|CacheStorage|localStorage|sessionStorage|indexedDB|navigator\.storage|document\.cookie|openDatabase|requestFileSystem|webkitRequestFileSystem|showSaveFilePicker|showDirectoryPicker|createObjectURL|revokeObjectURL|FileReader)\b|\.download\b|\sdownload\s*=/i;
 const SOURCE_TEXT_EXTENSIONS = /\.(css|html|js|json|ts)$/;
+const FORBIDDEN_DEPLOYABLE_BINARY_EXTENSIONS = /\.(png|jpe?g|webp|gif|bmp|ico|avif|wasm|zip|gz|br|tar|bin)$/i;
 const FORBIDDEN_STATIC_PAYLOADS = [
   {
     label: "private absolute path",
     pattern:
-      /(?:\/home\/|\/Users\/|\/var\/(?:lib|log|tmp|run|secrets?)\/|\/tmp\/|\/run\/(?:dh|private|secret|rom|operator)\/|[A-Za-z]:\\Users\\)[^\s"'`<>)]+/i
+      /(?:^|[\s:=("'`])(?:\/(?:home|Users|opt|srv|mnt|Volumes|tmp)\/|\/var\/(?:lib|log|tmp|run|secrets?)\/|\/run\/(?:dh|private|secret|rom|operator)\/|[A-Za-z]:\\(?:Users|rombridge|private)\\)[^\s"'`<>)]+/i
   },
   {
     label: "operator credential or token value",
     pattern:
-      /operator-secret|(?:credential|password|secret|token)=\S+|Bearer\s+[A-Za-z0-9._-]{8,}/i
+      /operator-secret|(?:operator_credential|credential|password|secret|token)\s*[:=]\s*["']?(?![A-Za-z_$]{1,3}\.)[A-Za-z0-9._:/+=-]{6,}|Bearer\s+[A-Za-z0-9._-]{8,}/i
   },
   {
     label: "real-run capture id",
@@ -59,8 +59,8 @@ describe("browser privacy boundaries", () => {
     const apiSurfaces = [
       { path: join(UI_ROOT, "index.html"), text: readFileSync(join(UI_ROOT, "index.html"), "utf8") },
       ...readTextFiles(SOURCE_ROOT, SOURCE_TEXT_EXTENSIONS),
-      ...readTextFiles(PUBLIC_ROOT, DEPLOYABLE_TEXT_EXTENSIONS),
-      ...readTextFiles(DIST_ROOT, DEPLOYABLE_TEXT_EXTENSIONS)
+      ...readDeployableTextFiles(PUBLIC_ROOT),
+      ...readDeployableTextFiles(DIST_ROOT)
     ];
     expect(matchesFor(apiSurfaces, PERSISTENCE_AND_DOWNLOAD_API_PATTERN)).toEqual([]);
   });
@@ -71,6 +71,15 @@ describe("browser privacy boundaries", () => {
     for (const payload of FORBIDDEN_STATIC_PAYLOADS) {
       expect(matchesFor(deployableFiles, payload.pattern), payload.label).toEqual([]);
     }
+  });
+
+  it("rejects deployable binary or blob-like static assets", () => {
+    const deployablePaths = [...readAllFiles(PUBLIC_ROOT), ...readAllFiles(DIST_ROOT)];
+    expect(
+      deployablePaths
+        .filter((path) => FORBIDDEN_DEPLOYABLE_BINARY_EXTENSIONS.test(path))
+        .map((path) => path.replace(UI_ROOT, "ui/"))
+    ).toEqual([]);
   });
 
   it("keeps source maps out of deployable output", () => {
@@ -88,7 +97,12 @@ describe("browser privacy boundaries", () => {
   it("recognizes forbidden private payload samples", () => {
     const sampleFiles = [
       textFile("private-path.txt", "opened /home/operator/private.env"),
-      textFile("credential.txt", "operator-secret"),
+      textFile("private-path-opt.txt", "path=/opt/rombridge/private/run.json"),
+      textFile("private-path-srv.txt", "root: /srv/corpus/private"),
+      textFile("private-path-mnt.txt", "bundle=/mnt/private/capture.bin"),
+      textFile("private-path-volume.txt", "report: /Volumes/private/report.json"),
+      textFile("credential.txt", '"operator_credential": "operator-secret"'),
+      textFile("token.txt", "token: abcdef123456"),
       textFile("capture-id.txt", "real-capture-9f86d081884c7d65"),
       textFile("preview.txt", "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAA"),
       textFile("features.txt", "feature_values: [0.12, 0.34]"),
@@ -99,14 +113,18 @@ describe("browser privacy boundaries", () => {
     for (const payload of FORBIDDEN_STATIC_PAYLOADS) {
       expect(matchesFor(sampleFiles, payload.pattern), payload.label).not.toEqual([]);
     }
+    expect(PERSISTENCE_AND_DOWNLOAD_API_PATTERN.test("document.cookie = 'token=abc'")).toBe(true);
+    expect(PERSISTENCE_AND_DOWNLOAD_API_PATTERN.test("openDatabase('bridge')")).toBe(true);
+    expect(PERSISTENCE_AND_DOWNLOAD_API_PATTERN.test("webkitRequestFileSystem")).toBe(true);
+    expect(FORBIDDEN_DEPLOYABLE_BINARY_EXTENSIONS.test("capture-preview.png")).toBe(true);
   });
 });
 
 function deployableStaticFiles(): TextFile[] {
   return [
     { path: join(UI_ROOT, "index.html"), text: readFileSync(join(UI_ROOT, "index.html"), "utf8") },
-    ...readTextFiles(PUBLIC_ROOT, DEPLOYABLE_TEXT_EXTENSIONS),
-    ...readTextFiles(DIST_ROOT, DEPLOYABLE_TEXT_EXTENSIONS)
+    ...readDeployableTextFiles(PUBLIC_ROOT),
+    ...readDeployableTextFiles(DIST_ROOT)
   ];
 }
 
@@ -122,6 +140,15 @@ function readTextFiles(root: string, textExtensions: RegExp): TextFile[] {
     }
     return [];
   });
+}
+
+function readDeployableTextFiles(root: string): TextFile[] {
+  return readAllFiles(root)
+    .filter((path) => !FORBIDDEN_DEPLOYABLE_BINARY_EXTENSIONS.test(path))
+    .flatMap((path) => {
+      const text = readFileSync(path, "utf8");
+      return text.includes("\u0000") ? [] : [{ path, text }];
+    });
 }
 
 function readAllFiles(root: string): string[] {
