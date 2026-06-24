@@ -205,6 +205,7 @@ Run before sharing public notes, static artifacts, or handoff text:
 
 ```sh
 ROM_OPERATOR_BRIDGE_FORBID_FILE=<private-forbid-literals.txt> \
+ROM_OPERATOR_BRIDGE_REQUIRE_FORBID_FILE=1 \
 ROM_OPERATOR_BRIDGE_VALIDATION_DIR=<private-validation-dir> \
 scripts/redaction-gate.sh
 ```
@@ -212,8 +213,9 @@ scripts/redaction-gate.sh
 The gate builds the static UI output, scans committed public docs and deployable
 UI artifacts, and invokes the Phase-0-confirmed `refwork-verify redaction-scan`
 command with a forbidden-literals file. Reports stay under the private
-validation directory. Public console output is limited to pass/fail status and
-sanitized counts; it must not echo matched private literals or source excerpts.
+validation directory with private file permissions. Public console output is
+limited to pass/fail status and sanitized counts; it must not echo matched
+private literals or source excerpts.
 
 ## Private Real-Host Checks
 

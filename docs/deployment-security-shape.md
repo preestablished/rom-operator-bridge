@@ -68,7 +68,7 @@ wss://birb.homes/rom-bridge/ws/...
   files.
 - `13-deployment-security-checklist.md` requires HTTPS, WSS, Origin checks,
   no-store runtime headers, credential rotation, and rollback/restart notes.
-- `/home/infra-admin/.agents/projects/forgejo/README.md` records the current
+- `<forgejo-plan-readme>` records the current
   local service-style HTTPS pattern as K3s Traefik plus cert-manager.
 - `/home/infra-admin/gitea/k8s-forgejo-ingress.yaml` shows the active pattern
   for routing a service on `<bridge-private-ip>` through Traefik with TLS.

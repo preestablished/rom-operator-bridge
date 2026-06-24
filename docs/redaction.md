@@ -26,7 +26,9 @@ Set `BRIDGE_REFERENCE_WORKLOAD_CHECKOUT` or
 not at `/home/infra-admin/git/preestablished/reference-workload`.
 
 Set `ROM_OPERATOR_BRIDGE_FORBID_FILE` for operator-specific private literals.
-If `ROM_OPERATOR_BRIDGE_VALIDATION_DIR` is unset, reports go to
+Set `ROM_OPERATOR_BRIDGE_REQUIRE_FORBID_FILE=1` for publish/deploy runs; this
+fails the gate unless the private forbid file is present. If
+`ROM_OPERATOR_BRIDGE_VALIDATION_DIR` is unset, reports go to
 `$ROM_OPERATOR_BRIDGE_PRIVATE_ROOT/validation` when that root is set; otherwise
 they are written under a temporary directory for the current run.
 
@@ -34,5 +36,6 @@ The wrapper also checks static-output classes not currently built into
 `refwork-verify redaction-scan`: ROM/private corpus paths, credential-shaped
 values, real capture IDs, screenshot or preview-cache payloads, source-map
 private paths, validation excerpts, private network literals, and binary/blob
-static assets. Console output remains sanitized; finding paths and JSON reports
-are private validation artifacts.
+static assets, including symlinks in scanned public roots. Console output
+remains sanitized; finding paths and JSON reports are private validation
+artifacts. The gate uses private file permissions for generated reports.

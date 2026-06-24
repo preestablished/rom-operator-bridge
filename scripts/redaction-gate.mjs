@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, extname, join, relative, resolve } from "node:path";
 
 const TEXT_EXTENSIONS = new Set([
@@ -29,8 +29,6 @@ const SCAN_TARGETS = [
   "ui/dist"
 ];
 
-const STATIC_ASSET_ROOTS = ["ui/public", "ui/dist"];
-
 const PATTERNS = [
   {
     kind: "rom_path",
@@ -43,9 +41,14 @@ const PATTERNS = [
       /(?:^|[\s:=("'`])(?:\/(?:srv|mnt|Volumes)\/(?:corpus|private)\b|\/run\/(?:private|secret|rom|operator)\b|[A-Za-z]:\\(?:Users\\rombridge|private)\b)/i
   },
   {
+    kind: "private_absolute_path",
+    pattern:
+      /(?:^|[\s:=("'`])(?:\/home\/[^/\s"'`<>)]+\/(?:\.agents|private|rom|corpus|secrets?)\b|\/Users\/[^/\s"'`<>)]+\/(?:private|rom|corpus|secrets?)\b)/i
+  },
+  {
     kind: "operator_credential",
     pattern:
-      /operator-secret|Bearer\s+[A-Za-z0-9._-]{8,}|(?:operator_credential|credential|password|secret|token)\s*[:=]\s*["'][^"'<]{6,}["']/i
+      /operator-secret|Bearer\s+[A-Za-z0-9._-]{8,}|(?:operator_credential|credential|password|secret|token)\s*["']?\s*[:=]\s*(?:"[^"'<]{6,}"|'[^'<>]{6,}')/i
   },
   {
     kind: "real_capture_id",
@@ -65,7 +68,7 @@ const PATTERNS = [
   {
     kind: "validation_excerpt",
     pattern:
-      /validation report excerpt:\s*\S|verifier (?:stdout|stderr):\s*\S|(?:stack trace|traceback):\s*\S|panic at [^\s"'`<>)]+/i
+      /validation report excerpt:\s*\S|(?:verifier|validation|scorer) (?:stdout|stderr|output):\s*\S|raw (?:verifier|validation|scorer) output|(?:stack trace|traceback):\s*\S|panic at [^\s"'`<>)]+/i
   },
   {
     kind: "private_network_literal",
@@ -84,8 +87,12 @@ function main() {
     selfTest();
     return;
   }
+  if (command === "fixture-test") {
+    fixtureTest();
+    return;
+  }
 
-  throw new Error("usage: redaction-gate.mjs <scan|self-test> [options]");
+  throw new Error("usage: redaction-gate.mjs <scan|self-test|fixture-test> [options]");
 }
 
 function scanCommand(args) {
@@ -97,18 +104,23 @@ function scanCommand(args) {
   const findings = [];
   const aggregateChunks = [];
 
-  for (const file of files) {
+  for (const fileInfo of files) {
+    const file = fileInfo.path;
     const relPath = relative(root, file).replaceAll("\\", "/");
+    if (fileInfo.symlink) {
+      findings.push(finding("symlink_public_asset", relPath, 1, 1));
+      continue;
+    }
     const bytes = readFileSync(file);
     if (bytes.includes(0)) {
-      if (isStaticAsset(relPath)) {
-        findings.push(finding("binary_or_blob_static_asset", relPath, 1, 1));
+      if (isScannedPublicFile(relPath)) {
+        findings.push(finding("binary_or_blob_public_asset", relPath, 1, 1));
       }
       continue;
     }
     if (!TEXT_EXTENSIONS.has(extname(file)) && relPath !== "README.md") {
-      if (isStaticAsset(relPath)) {
-        findings.push(finding("binary_or_blob_static_asset", relPath, 1, 1));
+      if (isScannedPublicFile(relPath)) {
+        findings.push(finding("binary_or_blob_public_asset", relPath, 1, 1));
       }
       continue;
     }
@@ -147,11 +159,12 @@ function selfTest() {
   const samples = [
     ["rom_path", "loaded /srv/corpus/private/operator-rom.sfc"],
     ["private_corpus_root", "private root: /mnt/private/corpus"],
-    ["operator_credential", 'operator_credential: "operator-secret"'],
+    ["private_absolute_path", "opened /home/operator/.agents/private-note.md"],
+    ["operator_credential", '"operator_credential": "operator-secret"'],
     ["real_capture_id", "real-capture-9f86d081884c7d65"],
     ["screenshot_or_preview_cache", "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAA"],
     ["source_map_private_path", "sourceMappingURL=/home/operator/build/index.js.map"],
-    ["validation_excerpt", "validation report excerpt: verifier stderr leaked"],
+    ["validation_excerpt", "raw verifier output: private details"],
     ["private_network_literal", "connect to 10.0.0.106:7410"]
   ];
 
@@ -168,6 +181,51 @@ function selfTest() {
   );
   if (cleanFindings.length !== 0) {
     throw new Error("redaction self-test flagged clean placeholder text");
+  }
+}
+
+function fixtureTest() {
+  const root = requiredOption(process.env.REDACTION_FIXTURE_ROOT, "REDACTION_FIXTURE_ROOT");
+  const aggregate = requiredOption(
+    process.env.REDACTION_FIXTURE_AGGREGATE,
+    "REDACTION_FIXTURE_AGGREGATE"
+  );
+  const summary = requiredOption(process.env.REDACTION_FIXTURE_SUMMARY, "REDACTION_FIXTURE_SUMMARY");
+  const files = collectScanFiles(root);
+  const findings = [];
+  for (const fileInfo of files) {
+    const file = fileInfo.path;
+    const relPath = relative(root, file).replaceAll("\\", "/");
+    if (fileInfo.symlink) {
+      findings.push(finding("symlink_public_asset", relPath, 1, 1));
+      continue;
+    }
+    const bytes = readFileSync(file);
+    if (bytes.includes(0) || (!TEXT_EXTENSIONS.has(extname(file)) && relPath !== "README.md")) {
+      findings.push(finding("binary_or_blob_public_asset", relPath, 1, 1));
+      continue;
+    }
+    findings.push(...scanText(relPath, bytes.toString("utf8")));
+  }
+  mkdirSync(dirname(aggregate), { recursive: true });
+  mkdirSync(dirname(summary), { recursive: true });
+  writeFileSync(aggregate, "fixture aggregate\n", "utf8");
+  writeFileSync(
+    summary,
+    `${JSON.stringify({ findings, counts_by_kind: countsByKind(findings) }, null, 2)}\n`,
+    "utf8"
+  );
+
+  for (const kind of [
+    "private_absolute_path",
+    "binary_or_blob_public_asset",
+    "symlink_public_asset",
+    "operator_credential",
+    "private_network_literal"
+  ]) {
+    if (!findings.some((entry) => entry.kind === kind)) {
+      throw new Error(`fixture test missed ${kind}`);
+    }
   }
 }
 
@@ -197,18 +255,23 @@ function collectScanFiles(root) {
     const path = join(root, target);
     collect(path, files);
   }
-  return files.sort();
+  return files.sort((left, right) => left.path.localeCompare(right.path));
 }
 
 function collect(path, files) {
   let stat;
   try {
-    stat = statSync(path);
+    stat = lstatSync(path);
   } catch (error) {
     if (error?.code === "ENOENT") {
       return;
     }
     throw error;
+  }
+
+  if (stat.isSymbolicLink()) {
+    files.push({ path, symlink: true });
+    return;
   }
 
   if (stat.isDirectory()) {
@@ -219,12 +282,12 @@ function collect(path, files) {
   }
 
   if (stat.isFile()) {
-    files.push(path);
+    files.push({ path, symlink: false });
   }
 }
 
-function isStaticAsset(relPath) {
-  return STATIC_ASSET_ROOTS.some((root) => relPath === root || relPath.startsWith(`${root}/`));
+function isScannedPublicFile(relPath) {
+  return SCAN_TARGETS.some((target) => relPath === target || relPath.startsWith(`${target}/`));
 }
 
 function scanText(path, text) {
