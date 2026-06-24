@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { mountOperatorApp } from "../../src/app";
 import type {
   RuntimeEventClient,
@@ -32,6 +32,10 @@ const capabilities = {
   privileged_features: true,
   validation_runner: false
 };
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 describe("capture review and label drawer", () => {
   it("renders capture job and recent review states with sanitized provenance only", async () => {
@@ -137,6 +141,151 @@ describe("capture review and label drawer", () => {
     expect(storageSpy).not.toHaveBeenCalled();
     expect(root.querySelector<HTMLTextAreaElement>("[data-private-note]")?.value).toBe("");
     expect(root.textContent).toContain("r2");
+  });
+
+  it("refreshes capture review and label state from runtime events", async () => {
+    const storageSpy = vi.spyOn(Storage.prototype, "setItem");
+    const socketClient = mockSocketClient();
+    let labelRevision = 1;
+    let captures = captureRecentResponse().captures;
+    const labelsByCapture = new Map<string, CaptureDetailResponse["labels"]>([
+      ["capture-001", ["first_boss", "needs_review"]],
+      ["capture-004", []]
+    ]);
+    const recentCaptures = vi.fn().mockImplementation(async () =>
+      captureRecentResponse({ captures })
+    );
+    const captureDetail = vi.fn().mockImplementation(async (captureId: string) =>
+      captureDetailResponse({
+        capture_id: captureId,
+        frame: captureId === "capture-004" ? 46 : 43,
+        preview_image_url: `/api/capture/${captureId}/preview`,
+        labels: labelsByCapture.get(captureId) ?? []
+      })
+    );
+    const labelsSnapshot = vi.fn().mockImplementation(async () =>
+      labelsSnapshotResponse({
+        label_revision: labelRevision,
+        target_labels: {
+          first_boss: labelRevision === 1 ? "capture-001" : null,
+          goal_positive: labelRevision >= 2 ? "capture-004" : null,
+          goal_negative: null
+        },
+        status_labels:
+          labelRevision >= 3 ? [{ capture_id: "capture-004", status: "needs_review" }] : [],
+        dedup_groups:
+          labelRevision >= 3
+            ? [
+                {
+                  group_id: "dedup-capture-001-capture-004",
+                  expected_relation: "same_canonical_state",
+                  capture_ids: ["capture-004", "capture-001"],
+                  changed_features: ["public rng guard"],
+                  status: "candidate"
+                }
+              ]
+            : []
+      })
+    );
+    const updateLabels = vi.fn().mockImplementation(async () => {
+      labelRevision = 2;
+      labelsByCapture.set("capture-004", ["goal_positive"]);
+      captures = captures.map((capture) =>
+        capture.capture_id === "capture-004" ? { ...capture, labels: ["goal_positive"] } : capture
+      );
+      return {
+        schema_version: 1,
+        applied: true,
+        label_revision: 2,
+        conflicts: []
+      };
+    });
+    const client = mockClient({
+      sessionStatus: vi.fn().mockResolvedValue(activeSessionResponse()),
+      runStatus: vi.fn().mockResolvedValue(runStatusResponse()),
+      currentFrame: vi.fn().mockResolvedValue(frameCurrentResponse()),
+      recentCaptures,
+      captureDetail,
+      captureJob: vi.fn().mockResolvedValue(
+        captureJobResponse({
+          job_id: "job-004",
+          capture_id: "capture-004",
+          status: "completed"
+        })
+      ),
+      labelsSnapshot,
+      updateLabels
+    });
+    const root = document.createElement("div");
+
+    mountOperatorApp(root, config, client, socketClient.client);
+    await flushPromises();
+    captures = [
+      {
+        capture_id: "capture-004",
+        frame: 46,
+        status: "completed",
+        labelable: true,
+        has_preview: true,
+        labels: [],
+        created_at: "2026-06-24T09:03:00Z"
+      },
+      ...captures
+    ];
+    socketClient.emitEvent(captureUpdated(2, { job_id: "job-004", capture_id: "capture-004" }));
+    await flushPromises();
+
+    expect(captureDetail).toHaveBeenLastCalledWith("capture-004");
+    expect(root.textContent).toContain("capture-004");
+    expect(root.querySelector("[data-capture-preview]")?.getAttribute("src")).toBe(
+      "/api/capture/capture-004/preview"
+    );
+
+    root.querySelector<HTMLInputElement>("input[name='label_goal_positive']")!.checked = true;
+    root.querySelector<HTMLTextAreaElement>("[data-private-note]")!.value =
+      "Private synthetic verifier note";
+    root
+      .querySelector<HTMLFormElement>("[data-label-drawer-form='capture']")
+      ?.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    await flushPromises();
+
+    expect(updateLabels).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionId: "session-001",
+        updates: [
+          {
+            op: "upsert",
+            capture_id: "capture-004",
+            role: "goal_positive",
+            confidence: "candidate",
+            note: "Private synthetic verifier note"
+          }
+        ]
+      })
+    );
+    expect(storageSpy).not.toHaveBeenCalled();
+    expect(root.textContent).toContain("r2");
+    expect(root.querySelector<HTMLInputElement>("input[name='label_goal_positive']")?.checked).toBe(
+      true
+    );
+
+    const snapshotCallsBeforeEvent = labelsSnapshot.mock.calls.length;
+    labelRevision = 3;
+    labelsByCapture.set("capture-004", ["goal_positive", "needs_review"]);
+    captures = captures.map((capture) =>
+      capture.capture_id === "capture-004"
+        ? { ...capture, labels: ["goal_positive", "needs_review"] }
+        : capture
+    );
+    socketClient.emitEvent(labelUpdated(3));
+    await flushPromises();
+
+    expect(labelsSnapshot).toHaveBeenCalledTimes(snapshotCallsBeforeEvent + 1);
+    expect(root.textContent).toContain("r3");
+    expect(root.querySelector<HTMLInputElement>("input[name='label_needs_review']")?.checked).toBe(
+      true
+    );
+    expect(root.textContent).toContain("2 captures, candidate");
   });
 
   it("shows sanitized role conflicts and keeps private paths out of the drawer", async () => {
@@ -372,7 +521,7 @@ function captureJobResponse(overrides: Record<string, unknown> = {}) {
   };
 }
 
-function captureRecentResponse(): CaptureRecentResponse {
+function captureRecentResponse(overrides: Partial<CaptureRecentResponse> = {}): CaptureRecentResponse {
   return {
     schema_version: 1,
     captures: [
@@ -404,7 +553,8 @@ function captureRecentResponse(): CaptureRecentResponse {
         created_at: "2026-06-24T09:02:00Z"
       }
     ],
-    next_cursor: null
+    next_cursor: null,
+    ...overrides
   };
 }
 
@@ -467,6 +617,21 @@ function captureUpdated(
       status: "completed",
       capture_id: "capture-001",
       ...overrides
+    }
+  };
+}
+
+function labelUpdated(serverSeq: number): RuntimeWsMessage {
+  return {
+    schema_version: 1,
+    type: "label_updated",
+    session_id: "session-001",
+    client_seq: null,
+    source_id: "server",
+    server_seq: serverSeq,
+    payload: {
+      label_revision: serverSeq,
+      applied: true
     }
   };
 }

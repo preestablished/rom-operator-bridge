@@ -11,7 +11,7 @@ use axum::{
 use futures_util::StreamExt;
 use rom_operator_bridge_service::{
     api::{AppState, router},
-    artifacts::RecentCapturesFile,
+    artifacts::{LabelDraftFile, RecentCapturesFile},
     auth::ALLOWED_ORIGIN,
     backend::{
         BackendCapabilities, BackendMode, BackendResult, BackendSession, BridgeBackend, CaptureJob,
@@ -353,6 +353,195 @@ async fn capture_completes_to_recent_detail_and_preview_after_durable_private_in
 }
 
 #[tokio::test]
+async fn synthetic_capture_labels_round_trip_private_files_and_event_refreshes() {
+    let (_workspace, app, private_root) = capture_app(CaptureBackend::new([2, 3, 4]));
+    let cookie =
+        login_cookie_with_capabilities(app.clone(), &["capture", "preview", "labels"]).await;
+    let server = WsServer::start(app.clone()).await;
+    let mut ws = server.connect(&cookie).await;
+
+    let snapshot = read_events(&mut ws, 4).await;
+    assert_eq!(
+        event_types(&snapshot),
+        [
+            "session_updated",
+            "run_updated",
+            "label_updated",
+            "validation_updated"
+        ]
+    );
+
+    let stale = trigger_capture(
+        app.clone(),
+        &cookie,
+        SESSION_ID,
+        "00000000-0000-4000-8000-000000000050",
+        1,
+    )
+    .await;
+    assert_eq!(stale["status"], "failed");
+    let stale_events = read_events(&mut ws, 1).await;
+    assert_eq!(stale_events[0]["type"], "capture_updated");
+    assert_eq!(stale_events[0]["payload"]["status"], "failed");
+    assert_eq!(stale_events[0]["payload"]["capture_id"], Value::Null);
+
+    let first = complete_capture(
+        app.clone(),
+        &cookie,
+        2,
+        "00000000-0000-4000-8000-000000000051",
+    )
+    .await;
+    assert_eq!(first["status"], "completed");
+    let first_events = read_events(&mut ws, 3).await;
+    assert_eq!(
+        first_events
+            .iter()
+            .map(|event| event["payload"]["status"].as_str().expect("status"))
+            .collect::<Vec<_>>(),
+        ["requested", "capturing", "completed"]
+    );
+    let first_capture_id = first["capture_id"]
+        .as_str()
+        .expect("first capture id")
+        .to_string();
+
+    let second = complete_capture(
+        app.clone(),
+        &cookie,
+        3,
+        "00000000-0000-4000-8000-000000000052",
+    )
+    .await;
+    assert_eq!(second["status"], "completed");
+    let second_events = read_events(&mut ws, 3).await;
+    assert_eq!(
+        second_events
+            .iter()
+            .map(|event| event["payload"]["status"].as_str().expect("status"))
+            .collect::<Vec<_>>(),
+        ["requested", "capturing", "completed"]
+    );
+    let second_capture_id = second["capture_id"]
+        .as_str()
+        .expect("second capture id")
+        .to_string();
+
+    let persisted: RecentCapturesFile = serde_json::from_str(
+        &fs::read_to_string(private_root.join("captures/recent-captures.json"))
+            .expect("synthetic recent captures file is durable"),
+    )
+    .expect("synthetic recent captures file parses");
+    assert_eq!(persisted.captures[0].capture_id, second_capture_id);
+    assert_eq!(persisted.captures[1].capture_id, first_capture_id);
+    assert_eq!(persisted.captures[0].status, "completed");
+
+    let note = "synthetic operator note for private draft";
+    let labels = apply_labels_with_dedup(
+        app.clone(),
+        &cookie,
+        "00000000-0000-4000-8000-000000000053",
+        json!([{
+            "op": "upsert",
+            "capture_id": first_capture_id,
+            "role": "goal_positive",
+            "confidence": "confirmed",
+            "note": note
+        }]),
+        json!([{
+            "op": "upsert",
+            "group_id": "dedup-synthetic-flow",
+            "expected_relation": "same_canonical_state",
+            "capture_ids": [first_capture_id, second_capture_id],
+            "changed_features": ["public rng guard"],
+            "status": "candidate"
+        }]),
+    )
+    .await;
+    assert_eq!(labels["applied"], true);
+    assert_eq!(labels["label_revision"], 1);
+    assert!(!labels.to_string().contains(note));
+    PublicSanitizer::new()
+        .with_private_root(&private_root)
+        .with_forbidden_literal(GOOD_CREDENTIAL)
+        .with_forbidden_literal(SESSION_SECRET)
+        .inspect_json(&labels)
+        .expect("label response is public-safe");
+
+    let label_event = read_events(&mut ws, 1).await;
+    assert_eq!(label_event[0]["type"], "label_updated");
+    assert_eq!(label_event[0]["payload"]["label_revision"], 1);
+    assert_eq!(label_event[0]["payload"]["applied"], true);
+
+    let snapshot = request_json(app.clone(), runtime_get("/api/labels", &cookie)).await;
+    assert_eq!(snapshot["label_revision"], 1);
+    assert_eq!(
+        snapshot["dedup_groups"][0]["group_id"],
+        "dedup-synthetic-flow"
+    );
+    assert_eq!(
+        snapshot["dedup_groups"][0]["expected_relation"],
+        "same_canonical_state"
+    );
+    assert_eq!(
+        snapshot["dedup_groups"][0]["changed_features"],
+        json!(["public rng guard"])
+    );
+    assert_eq!(snapshot["dedup_groups"][0]["status"], "candidate");
+    assert_eq!(
+        snapshot["dedup_groups"][0]["capture_ids"],
+        json!([first_capture_id.as_str(), second_capture_id.as_str()])
+    );
+
+    let first_draft = read_label_draft(&private_root, &first_capture_id);
+    assert_eq!(first_draft.private_note.as_deref(), Some(note));
+    assert_eq!(first_draft.labels[0].label, "goal_positive");
+    let second_draft = read_label_draft(&private_root, &second_capture_id);
+    assert!(second_draft.labels.is_empty());
+
+    let recent = request_json(app.clone(), runtime_get("/api/capture/recent", &cookie)).await;
+    assert_eq!(recent["captures"][1]["capture_id"], first_capture_id);
+    assert_eq!(recent["captures"][1]["labels"], json!(["goal_positive"]));
+    PublicSanitizer::new()
+        .with_private_root(&private_root)
+        .with_forbidden_literal(note)
+        .inspect_json(&recent)
+        .expect("capture recent stays public-safe after labeling");
+    let detail = request_json(
+        app.clone(),
+        runtime_get(&format!("/api/capture/{first_capture_id}"), &cookie),
+    )
+    .await;
+    assert_eq!(detail["labels"], json!(["goal_positive"]));
+    assert_eq!(
+        detail["sanitized_provenance"]["capture_source"],
+        "synthetic"
+    );
+    PublicSanitizer::new()
+        .with_private_root(&private_root)
+        .with_forbidden_literal(note)
+        .inspect_json(&detail)
+        .expect("capture detail stays public-safe after labeling");
+
+    let conflict = apply_labels_with_dedup(
+        app.clone(),
+        &cookie,
+        "00000000-0000-4000-8000-000000000054",
+        json!([{ "op": "upsert", "capture_id": first_capture_id, "role": "rejected" }]),
+        json!([]),
+    )
+    .await;
+    assert_eq!(conflict["applied"], false);
+    assert_eq!(conflict["label_revision"], 1);
+    assert_eq!(conflict["conflicts"][0]["code"], "label_conflict");
+
+    let conflict_event = read_events(&mut ws, 1).await;
+    assert_eq!(conflict_event[0]["type"], "label_updated");
+    assert_eq!(conflict_event[0]["payload"]["label_revision"], 1);
+    assert_eq!(conflict_event[0]["payload"]["applied"], false);
+}
+
+#[tokio::test]
 async fn failed_stale_capture_is_retryable_with_a_new_idempotency_key() {
     let (_workspace, app, _private_root) = capture_app(CaptureBackend::new([10]));
     let cookie = login_cookie(app.clone()).await;
@@ -497,7 +686,36 @@ async fn trigger_capture(
     .await
 }
 
+async fn apply_labels_with_dedup(
+    app: axum::Router,
+    cookie: &str,
+    idempotency_key: &str,
+    updates: Value,
+    dedup_updates: Value,
+) -> Value {
+    request_json(
+        app,
+        runtime_json_request(
+            Method::POST,
+            "/api/labels",
+            cookie,
+            json!({
+                "schema_version": 1,
+                "session_id": SESSION_ID,
+                "idempotency_key": idempotency_key,
+                "updates": updates,
+                "dedup_updates": dedup_updates
+            }),
+        ),
+    )
+    .await
+}
+
 async fn login_cookie(app: axum::Router) -> String {
+    login_cookie_with_capabilities(app, &["capture", "preview"]).await
+}
+
+async fn login_cookie_with_capabilities(app: axum::Router, capabilities: &[&str]) -> String {
     let response = app
         .oneshot(
             Request::builder()
@@ -510,7 +728,7 @@ async fn login_cookie(app: axum::Router) -> String {
                         "schema_version": 1,
                         "operator_credential": GOOD_CREDENTIAL,
                         "backend_mode": "synthetic",
-                        "requested_capabilities": ["capture", "preview"]
+                        "requested_capabilities": capabilities
                     })
                     .to_string(),
                 ))
@@ -526,6 +744,15 @@ async fn login_cookie(app: axum::Router) -> String {
         .and_then(|cookie| cookie.split(';').next())
         .expect("session cookie pair exists")
         .to_string()
+}
+
+fn read_label_draft(private_root: &Path, capture_id: &str) -> LabelDraftFile {
+    let path = private_root
+        .join("captures")
+        .join(capture_id)
+        .join("label-draft.json");
+    serde_json::from_str(&fs::read_to_string(path).expect("label draft exists"))
+        .expect("label draft parses")
 }
 
 async fn request_json(app: axum::Router, request: Request<Body>) -> Value {
