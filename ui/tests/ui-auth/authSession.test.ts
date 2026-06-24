@@ -50,7 +50,7 @@ describe("UI auth and session flow", () => {
       operator_credential: "operator-secret",
       requested_capabilities: ["input", "preview", "capture", "labels"]
     });
-    expect(html).toContain("Logout");
+    expect(html).toContain("Stop");
     expect(html).not.toContain("operator-secret");
   });
 
@@ -193,6 +193,7 @@ function activeState(): AuthSessionState {
       last_applied_input_frame: 10,
       last_preview_frame: 11,
       preview_stale: true,
+      active_capture_job_id: null,
       capabilities
     }
   };
