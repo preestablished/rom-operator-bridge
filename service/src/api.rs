@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{Arc, Mutex},
 };
 
@@ -172,15 +172,27 @@ impl CaptureState {
         let removed_job_ids: Vec<String> = inner
             .jobs
             .iter()
-            .filter(|(_, job)| job.session_id == session_id && job.status.is_active())
+            .filter(|(_, job)| job.session_id == session_id)
             .map(|(job_id, _)| job_id.clone())
             .collect();
         if removed_job_ids.is_empty() {
             return;
         }
+        let removed_capture_ids: BTreeSet<String> = inner
+            .captures
+            .iter()
+            .filter(|(_, record)| removed_job_ids.contains(&record.job_id))
+            .map(|(capture_id, _)| capture_id.clone())
+            .collect();
         inner
             .jobs
             .retain(|job_id, _| !removed_job_ids.contains(job_id));
+        inner
+            .captures
+            .retain(|capture_id, _| !removed_capture_ids.contains(capture_id));
+        inner
+            .capture_order
+            .retain(|capture_id| !removed_capture_ids.contains(capture_id));
         inner.idempotency.retain(|(stored_session_id, _), job_id| {
             stored_session_id != session_id || !removed_job_ids.contains(job_id)
         });
@@ -733,6 +745,7 @@ async fn start_session(
         .frame_previews
         .reset_session(&backend_session.session_id);
     state.captures.reset_session(&backend_session.session_id);
+    state.labels.reset();
     state.ws_events.reset_session(&backend_session.session_id);
     state.ws_input.reset_session(&backend_session.session_id);
 
@@ -830,6 +843,7 @@ async fn stop_session(
         .expect("runtime session mutex poisoned") = None;
     state.frame_previews.reset_session(&stopped.session_id);
     state.captures.reset_session(&stopped.session_id);
+    state.labels.reset();
     state.ws_events.reset_session(&stopped.session_id);
     state.ws_input.reset_session(&stopped.session_id);
     if let Err(error) = state.auth.clear_session_headers(&headers) {
@@ -1102,7 +1116,11 @@ async fn capture_recent(State(state): State<AppState>, headers: HeaderMap, uri: 
         captures: view
             .captures
             .into_iter()
-            .map(CaptureSummaryResponse::from)
+            .map(|summary| {
+                let mut response = CaptureSummaryResponse::from(summary);
+                response.labels = state.labels.label_names_for_capture(&response.capture_id);
+                response
+            })
             .collect(),
         next_cursor: view.next_cursor,
     })
@@ -1133,7 +1151,9 @@ async fn capture_detail(
         .into_response();
     };
 
-    let mut response = Json(CaptureDetailResponse::from(view)).into_response();
+    let mut detail = CaptureDetailResponse::from(view);
+    detail.labels = state.labels.label_names_for_capture(&detail.capture_id);
+    let mut response = Json(detail).into_response();
     apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
     response
 }
@@ -1536,6 +1556,7 @@ fn cleanup_runtime_session(state: &AppState, reason: StopReason) -> Result<(), B
         .expect("runtime session mutex poisoned") = None;
     state.frame_previews.reset_session(&stopped.session_id);
     state.captures.reset_session(&stopped.session_id);
+    state.labels.reset();
     state.ws_events.reset_session(&stopped.session_id);
     state.ws_input.reset_session(&stopped.session_id);
     Ok(())

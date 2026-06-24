@@ -6,6 +6,7 @@ use std::{
 };
 
 const UPDATED_AT: &str = "1970-01-01T00:00:00Z";
+const JSON_SAFE_U64_MAX: u64 = 9_007_199_254_740_991;
 
 #[derive(Debug, Clone, Default)]
 pub struct LabelState {
@@ -15,6 +16,10 @@ pub struct LabelState {
 impl LabelState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn reset(&self) {
+        *self.inner.lock().expect("label mutex poisoned") = LabelInner::default();
     }
 
     pub fn apply<F>(
@@ -27,7 +32,7 @@ impl LabelState {
         F: FnMut(&str) -> bool,
     {
         let key = (request.session_id.clone(), request.idempotency_key.clone());
-        let inner = self.inner.lock().expect("label mutex poisoned");
+        let mut inner = self.inner.lock().expect("label mutex poisoned");
         if let Some(outcome) = inner.idempotency.get(&key) {
             return Ok(outcome.clone());
         }
@@ -52,8 +57,7 @@ impl LabelState {
                 label_revision: inner.label_revision,
                 conflicts,
             };
-            drop(inner);
-            self.remember_outcome(key, outcome.clone());
+            inner.idempotency.insert(key, outcome.clone());
             return Ok(outcome);
         }
 
@@ -79,8 +83,7 @@ impl LabelState {
                 label_revision: inner.label_revision,
                 conflicts,
             };
-            drop(inner);
-            self.remember_outcome(key, outcome.clone());
+            inner.idempotency.insert(key, outcome.clone());
             return Ok(outcome);
         }
 
@@ -90,16 +93,29 @@ impl LabelState {
                 label_revision: inner.label_revision,
                 conflicts: Vec::new(),
             };
-            drop(inner);
-            self.remember_outcome(key, outcome.clone());
+            inner.idempotency.insert(key, outcome.clone());
             return Ok(outcome);
         }
 
         if let Some(store) = store {
+            let rollback_drafts: BTreeMap<String, LabelDraftFile> = changed_captures
+                .iter()
+                .map(|capture_id| (capture_id.clone(), inner.draft_for(capture_id)))
+                .collect();
+            let mut written_captures = Vec::new();
             for capture_id in &changed_captures {
-                store
+                if store
                     .write_label_draft(&next.draft_for(capture_id))
-                    .map_err(|_| LabelStoreError::BackendUnavailable)?;
+                    .is_err()
+                {
+                    for written_capture_id in written_captures {
+                        if let Some(draft) = rollback_drafts.get(&written_capture_id) {
+                            let _ = store.write_label_draft(draft);
+                        }
+                    }
+                    return Err(LabelStoreError::BackendUnavailable);
+                }
+                written_captures.push(capture_id.clone());
             }
         }
 
@@ -110,8 +126,7 @@ impl LabelState {
             conflicts: Vec::new(),
         };
         next.idempotency.insert(key, outcome.clone());
-        drop(inner);
-        *self.inner.lock().expect("label mutex poisoned") = next;
+        *inner = next;
         Ok(outcome)
     }
 
@@ -119,9 +134,19 @@ impl LabelState {
         self.inner.lock().expect("label mutex poisoned").snapshot()
     }
 
+    pub fn label_names_for_capture(&self, capture_id: &str) -> Vec<String> {
+        self.inner
+            .lock()
+            .expect("label mutex poisoned")
+            .roles_for_capture(capture_id)
+            .into_iter()
+            .map(|role| role.as_str().to_string())
+            .collect()
+    }
+
     pub fn upsert_dedup_group(&self, group: DedupGroup) -> Result<u64, LabelStoreError> {
-        validate_dedup_group(&group)?;
         let mut inner = self.inner.lock().expect("label mutex poisoned");
+        validate_dedup_group(&inner, &group)?;
         inner.dedup_groups.insert(group.group_id.clone(), group);
         inner.label_revision = inner.label_revision.saturating_add(1);
         Ok(inner.label_revision)
@@ -139,14 +164,6 @@ impl LabelState {
             inner.label_revision = inner.label_revision.saturating_add(1);
         }
         Ok(inner.label_revision)
-    }
-
-    fn remember_outcome(&self, key: (String, String), outcome: LabelApplyOutcome) {
-        self.inner
-            .lock()
-            .expect("label mutex poisoned")
-            .idempotency
-            .insert(key, outcome);
     }
 }
 
@@ -168,9 +185,9 @@ impl LabelInner {
 
         match update.role.classify() {
             LabelRoleClass::Target(role) => {
-                if self.statuses.get(&update.capture_id) == Some(&StatusLabelRole::Rejected) {
+                if self.statuses.contains_key(&update.capture_id) {
                     return Err(LabelConflict::label(
-                        "Rejected captures cannot be target labels.",
+                        "Status-labeled captures cannot be target labels.",
                         false,
                     ));
                 }
@@ -187,6 +204,16 @@ impl LabelInner {
                 if self.statuses.get(&update.capture_id) == Some(&StatusLabelRole::Rejected) {
                     return Err(LabelConflict::label(
                         "Rejected captures cannot also need review.",
+                        false,
+                    ));
+                }
+                if self
+                    .targets
+                    .values()
+                    .any(|capture_id| capture_id == &update.capture_id)
+                {
+                    return Err(LabelConflict::label(
+                        "Target label captures cannot also need review.",
                         false,
                     ));
                 }
@@ -208,6 +235,16 @@ impl LabelInner {
                 {
                     return Err(LabelConflict::label(
                         "Target label captures cannot be rejected.",
+                        false,
+                    ));
+                }
+                if self
+                    .dedup_groups
+                    .values()
+                    .any(|group| group.capture_ids.contains(&update.capture_id))
+                {
+                    return Err(LabelConflict::label(
+                        "Dedup captures cannot be rejected.",
                         false,
                     ));
                 }
@@ -491,7 +528,7 @@ pub struct ChangedOffsetRange {
     pub len: u64,
 }
 
-fn validate_dedup_group(group: &DedupGroup) -> Result<(), LabelStoreError> {
+fn validate_dedup_group(inner: &LabelInner, group: &DedupGroup) -> Result<(), LabelStoreError> {
     let mut conflicts = Vec::new();
     if !is_contract_id(&group.group_id) {
         conflicts.push(LabelConflict::bad_request(
@@ -504,6 +541,12 @@ fn validate_dedup_group(group: &DedupGroup) -> Result<(), LabelStoreError> {
         if !is_contract_id(capture_id) || !captures.insert(capture_id) {
             conflicts.push(LabelConflict::bad_request(
                 "Dedup group capture ids are invalid.",
+                false,
+            ));
+        }
+        if inner.statuses.get(capture_id) == Some(&StatusLabelRole::Rejected) {
+            conflicts.push(LabelConflict::label(
+                "Rejected captures cannot be in dedup groups.",
                 false,
             ));
         }
@@ -520,15 +563,26 @@ fn validate_dedup_group(group: &DedupGroup) -> Result<(), LabelStoreError> {
             false,
         ));
     }
-    if group
-        .changed_features
-        .iter()
-        .any(|feature| feature.is_empty() || feature.len() > 128 || !valid_note(feature))
-    {
-        conflicts.push(LabelConflict::bad_request(
-            "Dedup changed feature is invalid.",
-            false,
-        ));
+    let mut features = BTreeSet::new();
+    for feature in &group.changed_features {
+        if feature.is_empty()
+            || feature.len() > 128
+            || !valid_note(feature)
+            || !features.insert(feature)
+        {
+            conflicts.push(LabelConflict::bad_request(
+                "Dedup changed feature is invalid.",
+                false,
+            ));
+        }
+    }
+    for range in &group.changed_offset_ranges {
+        if range.start > JSON_SAFE_U64_MAX || range.len > JSON_SAFE_U64_MAX {
+            conflicts.push(LabelConflict::bad_request(
+                "Dedup changed offset range is invalid.",
+                false,
+            ));
+        }
     }
     if conflicts.is_empty() {
         Ok(())

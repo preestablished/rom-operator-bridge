@@ -105,12 +105,22 @@ async fn target_labels_are_unique_idempotent_and_private_notes_stay_private() {
     assert_eq!(replacement["applied"], true);
     assert_eq!(replacement["label_revision"], 2);
 
-    let snapshot = request_json(app, runtime_get("/api/labels", &cookie)).await;
+    let snapshot = request_json(app.clone(), runtime_get("/api/labels", &cookie)).await;
     assert_matches_runtime_schema(&snapshot);
     assert_eq!(snapshot["label_revision"], 2);
     assert_eq!(snapshot["target_labels"]["first_boss"], second_id);
     assert_eq!(snapshot["target_labels"]["goal_positive"], Value::Null);
     assert_eq!(snapshot["target_labels"]["goal_negative"], Value::Null);
+
+    let recent = request_json(app.clone(), runtime_get("/api/capture/recent", &cookie)).await;
+    assert_eq!(recent["captures"][0]["capture_id"], second_id);
+    assert_eq!(recent["captures"][0]["labels"], json!(["first_boss"]));
+    let detail = request_json(
+        app.clone(),
+        runtime_get(&format!("/api/capture/{second_id}"), &cookie),
+    )
+    .await;
+    assert_eq!(detail["labels"], json!(["first_boss"]));
 
     let first_draft = read_draft(&private_root, first_id);
     assert!(first_draft.labels.is_empty());
@@ -160,6 +170,16 @@ async fn rejected_and_needs_review_conflicts_are_reported_without_revision_bump(
     assert_eq!(rejected_target["label_revision"], 1);
     assert_eq!(rejected_target["conflicts"][0]["code"], "label_conflict");
 
+    let review_target = apply_labels(
+        app.clone(),
+        &cookie,
+        "00000000-0000-4000-8000-000000002108",
+        json!([{ "op": "upsert", "capture_id": first_id, "role": "needs_review" }]),
+    )
+    .await;
+    assert_eq!(review_target["applied"], false);
+    assert_eq!(review_target["conflicts"][0]["code"], "label_conflict");
+
     let needs_review = apply_labels(
         app.clone(),
         &cookie,
@@ -196,6 +216,16 @@ async fn rejected_and_needs_review_conflicts_are_reported_without_revision_bump(
     )
     .await;
     assert_eq!(rejected["label_revision"], 4);
+
+    let reviewed_target = apply_labels(
+        app.clone(),
+        &cookie,
+        "00000000-0000-4000-8000-000000002107",
+        json!([{ "op": "upsert", "capture_id": second_id, "role": "goal_negative" }]),
+    )
+    .await;
+    assert_eq!(reviewed_target["applied"], false);
+    assert_eq!(reviewed_target["conflicts"][0]["code"], "label_conflict");
 
     let snapshot = request_json(app, runtime_get("/api/labels", &cookie)).await;
     assert_eq!(snapshot["status_labels"][0]["capture_id"], second_id);
@@ -282,6 +312,114 @@ async fn notes_schema_and_active_capture_validation_reject_bad_updates() {
     ));
 }
 
+#[tokio::test]
+async fn session_boundaries_clear_labels_and_old_captures() {
+    let (_workspace, app, _private_root) = labels_app(LabelBackend::new([5]));
+    let cookie = login_cookie(app.clone()).await;
+    let capture = complete_capture(
+        app.clone(),
+        &cookie,
+        5,
+        "00000000-0000-4000-8000-000000004001",
+    )
+    .await;
+    let capture_id = capture["capture_id"].as_str().expect("capture id");
+    let labeled = apply_labels(
+        app.clone(),
+        &cookie,
+        "00000000-0000-4000-8000-000000004101",
+        json!([{ "op": "upsert", "capture_id": capture_id, "role": "needs_review" }]),
+    )
+    .await;
+    assert_eq!(labeled["label_revision"], 1);
+
+    let stop = app
+        .clone()
+        .oneshot(runtime_json_request(
+            Method::POST,
+            "/api/session/stop",
+            &cookie,
+            json!({
+                "schema_version": 1,
+                "session_id": SESSION_ID,
+                "reason": "operator_stop"
+            }),
+        ))
+        .await
+        .expect("stop request runs");
+    assert_eq!(stop.status(), StatusCode::OK);
+
+    let next_cookie = login_cookie(app.clone()).await;
+    let snapshot = request_json(app.clone(), runtime_get("/api/labels", &next_cookie)).await;
+    assert_eq!(snapshot["label_revision"], 0);
+    assert!(
+        snapshot["status_labels"]
+            .as_array()
+            .expect("status labels")
+            .is_empty()
+    );
+
+    let stale_label = apply_labels(
+        app,
+        &next_cookie,
+        "00000000-0000-4000-8000-000000004102",
+        json!([{ "op": "upsert", "capture_id": capture_id, "role": "needs_review" }]),
+    )
+    .await;
+    assert_eq!(stale_label["applied"], false);
+    assert_eq!(stale_label["conflicts"][0]["code"], "label_conflict");
+}
+
+#[tokio::test]
+async fn failed_multi_draft_write_rolls_back_published_drafts() {
+    let (_workspace, app, private_root) = labels_app(LabelBackend::new([15, 16]));
+    let cookie = login_cookie(app.clone()).await;
+    let first = complete_capture(
+        app.clone(),
+        &cookie,
+        15,
+        "00000000-0000-4000-8000-000000005001",
+    )
+    .await;
+    let second = complete_capture(
+        app.clone(),
+        &cookie,
+        16,
+        "00000000-0000-4000-8000-000000005002",
+    )
+    .await;
+    let first_id = first["capture_id"].as_str().expect("capture id");
+    let second_id = second["capture_id"].as_str().expect("capture id");
+
+    let first_label = apply_labels(
+        app.clone(),
+        &cookie,
+        "00000000-0000-4000-8000-000000005101",
+        json!([{ "op": "upsert", "capture_id": first_id, "role": "first_boss" }]),
+    )
+    .await;
+    assert_eq!(first_label["label_revision"], 1);
+
+    fs::write(
+        private_root.join("captures").join(second_id),
+        b"not a directory",
+    )
+    .expect("blocking capture path written");
+
+    let failed = app
+        .oneshot(labels_request(
+            &cookie,
+            "00000000-0000-4000-8000-000000005102",
+            json!([{ "op": "upsert", "capture_id": second_id, "role": "first_boss" }]),
+        ))
+        .await
+        .expect("failed label replacement request runs");
+    assert_eq!(failed.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let first_draft = read_draft(&private_root, first_id);
+    assert_eq!(first_draft.labels[0].label, "first_boss");
+}
+
 #[test]
 fn dedup_groups_update_delete_and_validate_shape() {
     let labels = LabelState::new();
@@ -314,11 +452,52 @@ fn dedup_groups_update_delete_and_validate_shape() {
         }),
         Err(LabelStoreError::Conflict(_))
     ));
+    assert!(matches!(
+        labels.upsert_dedup_group(DedupGroup {
+            group_id: "dedup-duplicate-feature".to_string(),
+            expected_relation: DedupRelation::SameCanonicalState,
+            capture_ids: vec!["capture-a".to_string(), "capture-b".to_string()],
+            changed_features: vec!["volatile_rng".to_string(), "volatile_rng".to_string()],
+            changed_offset_ranges: Vec::new(),
+            status: Some(DedupStatus::Confirmed),
+        }),
+        Err(LabelStoreError::Conflict(_))
+    ));
+
+    let rejected = labels
+        .apply(
+            rom_operator_bridge_service::labels::LabelApplyRequest {
+                session_id: SESSION_ID.to_string(),
+                idempotency_key: "00000000-0000-4000-8000-000000006001".to_string(),
+                updates: vec![rom_operator_bridge_service::labels::LabelUpdate {
+                    op: rom_operator_bridge_service::labels::LabelOp::Upsert,
+                    capture_id: "capture-rejected".to_string(),
+                    role: rom_operator_bridge_service::labels::LabelRole::Rejected,
+                    confidence: None,
+                    note: None,
+                }],
+            },
+            |_| true,
+            None,
+        )
+        .expect("rejected label applies");
+    assert_eq!(rejected.label_revision, 2);
+    assert!(matches!(
+        labels.upsert_dedup_group(DedupGroup {
+            group_id: "dedup-rejected".to_string(),
+            expected_relation: DedupRelation::SameCanonicalState,
+            capture_ids: vec!["capture-rejected".to_string(), "capture-b".to_string()],
+            changed_features: vec!["volatile_rng".to_string()],
+            changed_offset_ranges: Vec::new(),
+            status: Some(DedupStatus::Conflict),
+        }),
+        Err(LabelStoreError::Conflict(_))
+    ));
 
     let revision = labels
         .delete_dedup_group("dedup-001")
         .expect("dedup group deletes");
-    assert_eq!(revision, 2);
+    assert_eq!(revision, 3);
     assert!(labels.snapshot().dedup_groups.is_empty());
 }
 
