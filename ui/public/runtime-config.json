@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "api_base_path": "/api",
+  "ws_base_path": "/ws",
+  "allow_persistence": false
+}

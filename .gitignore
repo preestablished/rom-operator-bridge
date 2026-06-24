@@ -30,3 +30,7 @@ rom-operator-bridge.env
 *.rombridge.env
 private/
 service/private/
+
+# UI package generated files.
+ui/node_modules/
+ui/dist/
