@@ -103,6 +103,82 @@ fn queues_paused_input_and_flushes_in_fifo_order_after_resume() {
 }
 
 #[test]
+fn flush_with_no_pending_input_skips_backend_status() {
+    let backend = FakeBackend::new([(SessionState::Running, 10)]);
+    let mut scheduler = InputScheduler::new();
+    let mut rejections = RecordingRejectionSink::default();
+
+    let outcomes = scheduler
+        .flush_pending(&backend, SESSION_ID, &mut rejections)
+        .expect("empty flush succeeds without backend status");
+
+    assert!(outcomes.is_empty());
+    assert_eq!(backend.status_calls(), 0);
+    assert!(backend.request_frames().is_empty());
+    assert!(rejections.records.is_empty());
+}
+
+#[test]
+fn applies_real_paused_input_immediately_when_input_capability_is_granted() {
+    let backend = FakeBackend::from_statuses([real_status(RUN_ID, SessionState::Paused, 12, true)]);
+    let mut scheduler = InputScheduler::new();
+    let mut rejections = RecordingRejectionSink::default();
+
+    let outcome = scheduler
+        .submit(
+            &backend,
+            input(1, PadWord::from_buttons([PadButton::A])),
+            &mut rejections,
+        )
+        .expect("real paused input schedules");
+
+    assert_eq!(outcome.status, InputScheduleStatus::Applied);
+    assert_eq!(outcome.assigned_frame, Some(13));
+    assert_eq!(backend.request_frames(), [13]);
+    assert_eq!(scheduler.pending_len(), 0);
+    assert!(rejections.records.is_empty());
+}
+
+#[test]
+fn rejects_real_input_when_running_or_input_capability_is_missing() {
+    let mut scheduler = InputScheduler::new();
+    let mut rejections = RecordingRejectionSink::default();
+    let running_backend =
+        FakeBackend::from_statuses([real_status(RUN_ID, SessionState::Running, 12, true)]);
+
+    let running_error = scheduler
+        .submit(
+            &running_backend,
+            input(1, PadWord::from_buttons([PadButton::A])),
+            &mut rejections,
+        )
+        .expect_err("real running sessions reject input");
+
+    assert!(matches!(
+        running_error,
+        InputSchedulerError::SessionNotAcceptingInput { .. }
+    ));
+    assert!(running_backend.request_frames().is_empty());
+
+    let no_input_backend =
+        FakeBackend::from_statuses([real_status(RUN_ID, SessionState::Paused, 12, false)]);
+    let no_input_error = scheduler
+        .submit(
+            &no_input_backend,
+            input(2, PadWord::from_buttons([PadButton::B])),
+            &mut rejections,
+        )
+        .expect_err("real sessions without input capability reject input");
+
+    assert!(matches!(
+        no_input_error,
+        InputSchedulerError::SessionNotAcceptingInput { .. }
+    ));
+    assert!(no_input_backend.request_frames().is_empty());
+    assert!(rejections.records.is_empty());
+}
+
+#[test]
 fn preserves_pending_input_when_flush_hits_non_stale_backend_error() {
     let backend = FakeBackend::new([(SessionState::Paused, 10), (SessionState::Running, 20)]);
     backend.push_injection(Err(BackendError::BackendUnavailable));
@@ -157,6 +233,78 @@ fn retries_once_when_backend_rejects_a_late_frame() {
         }]
     );
     assert!(rejections.records.is_empty());
+}
+
+#[test]
+fn retries_real_paused_stale_input_from_refreshed_frame_base() {
+    let backend = FakeBackend::from_statuses([
+        real_status(RUN_ID, SessionState::Paused, 12, true),
+        real_status(RUN_ID, SessionState::Paused, 20, true),
+    ]);
+    backend.push_injection(Err(stale_frame(13, 20)));
+    let mut scheduler = InputScheduler::new();
+    let mut rejections = RecordingRejectionSink::default();
+
+    let outcome = scheduler
+        .submit(
+            &backend,
+            input(9, PadWord::from_buttons([PadButton::Start])),
+            &mut rejections,
+        )
+        .expect("real stale input retries");
+
+    assert_eq!(outcome.status, InputScheduleStatus::Applied);
+    assert_eq!(outcome.assigned_frame, Some(21));
+    assert_eq!(backend.request_frames(), [13, 21]);
+    assert_eq!(
+        scheduler.applied_frames(),
+        [AppliedInputFrame {
+            frame: 21,
+            pad_word: PadButton::Start.mask()
+        }]
+    );
+    assert!(rejections.records.is_empty());
+}
+
+#[test]
+fn failed_real_paused_stale_retry_records_private_input_rejection() {
+    let backend = FakeBackend::from_statuses([
+        real_status(RUN_ID, SessionState::Paused, 12, true),
+        real_status(RUN_ID, SessionState::Paused, 20, true),
+    ]);
+    backend.push_injection(Err(stale_frame(13, 20)));
+    backend.push_injection(Err(stale_frame(21, 22)));
+    let mut scheduler = InputScheduler::new();
+    let mut rejections = RecordingRejectionSink::default();
+
+    let outcome = scheduler
+        .submit(
+            &backend,
+            input(10, PadWord::from_buttons([PadButton::Select])),
+            &mut rejections,
+        )
+        .expect("failed real stale retry drops input");
+
+    assert_eq!(outcome.status, InputScheduleStatus::Dropped);
+    assert_eq!(outcome.assigned_frame, None);
+    assert_eq!(backend.request_frames(), [13, 21]);
+    assert_eq!(
+        outcome
+            .rejection
+            .as_ref()
+            .map(|rejection| rejection.reason_code.as_str()),
+        Some(FRAME_STALE_REASON_CODE)
+    );
+    assert_eq!(
+        rejections.records,
+        [InputRejectionRecord {
+            run_id: RUN_ID.to_string(),
+            client_seq: 10,
+            occurred_at: OCCURRED_AT.to_string(),
+            reason_code: FRAME_STALE_REASON_CODE.to_string(),
+            public_message: PUBLIC_INPUT_REJECTION_MESSAGE.to_string(),
+        }]
+    );
 }
 
 #[test]
@@ -594,6 +742,7 @@ impl InputRejectionSink for RecordingRejectionSink {
 struct FakeBackend {
     statuses: Mutex<VecDeque<RunStatus>>,
     last_status: Mutex<RunStatus>,
+    status_calls: Mutex<usize>,
     injections: Mutex<VecDeque<BackendResult<InputScheduleReceipt>>>,
     requests: Mutex<Vec<InputScheduleRequest>>,
 }
@@ -631,6 +780,7 @@ impl FakeBackend {
                 queue.append(&mut statuses);
                 queue
             }),
+            status_calls: Mutex::new(0),
             injections: Mutex::new(VecDeque::new()),
             requests: Mutex::new(Vec::new()),
         }
@@ -647,6 +797,10 @@ impl FakeBackend {
             .iter()
             .map(|request| request.target_frame)
             .collect()
+    }
+
+    fn status_calls(&self) -> usize {
+        *self.status_calls.lock().unwrap()
     }
 }
 
@@ -672,6 +826,7 @@ impl BridgeBackend for FakeBackend {
     }
 
     fn status(&self, session_id: SessionId) -> BackendResult<RunStatus> {
+        *self.status_calls.lock().unwrap() += 1;
         let mut statuses = self.statuses.lock().unwrap();
         let mut last_status = self.last_status.lock().unwrap();
         let next = statuses.pop_front().unwrap_or_else(|| last_status.clone());
@@ -721,6 +876,28 @@ fn status(run_id: &str, state: SessionState, current_frame: FrameCounter) -> Run
         backend_mode: BackendMode::Synthetic,
         current_frame,
         capabilities: BackendCapabilities::synthetic_mvp(),
+        last_applied_input_frame: 0,
+        last_preview_frame: 0,
+        preview_stale: 0 < current_frame,
+        active_capture_job_id: None,
+    }
+}
+
+fn real_status(
+    run_id: &str,
+    state: SessionState,
+    current_frame: FrameCounter,
+    input_capability: bool,
+) -> RunStatus {
+    let mut capabilities = BackendCapabilities::real_input_preview_mvp();
+    capabilities.input = input_capability;
+    RunStatus {
+        session_id: SESSION_ID.to_string(),
+        run_id: run_id.to_string(),
+        state,
+        backend_mode: BackendMode::Real,
+        current_frame,
+        capabilities,
         last_applied_input_frame: 0,
         last_preview_frame: 0,
         preview_stale: 0 < current_frame,

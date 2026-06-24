@@ -98,6 +98,17 @@ impl BackendCapabilities {
             validation_runner: false,
         }
     }
+
+    pub const fn real_input_preview_mvp() -> Self {
+        Self {
+            input: true,
+            preview: true,
+            capture: false,
+            labels: false,
+            privileged_features: false,
+            validation_runner: false,
+        }
+    }
 }
 
 pub type BackendResult<T> = Result<T, BackendError>;
@@ -500,7 +511,7 @@ impl BridgeBackend for SyntheticBackend {
             )
         };
 
-        inner.write_input_artifacts(
+        write_input_artifacts(
             &self.private_config,
             &run_id,
             &previous_inputs,
@@ -627,40 +638,39 @@ impl SyntheticBackendInner {
         self.next_event_seq = next_event_seq;
         Ok(())
     }
+}
 
-    fn write_input_artifacts(
-        &mut self,
-        private_config: &BridgePrivateConfig,
-        run_id: &str,
-        previous_inputs: &[AppliedInputFrame],
-        applied_inputs: &[AppliedInputFrame],
-        event: PadLogEventRow,
-    ) -> BackendResult<()> {
-        if private_config.is_placeholder() {
-            return Ok(());
-        }
-
-        let store = PrivateArtifactStore::new(private_config);
-        Self::write_padlog_snapshot(&store, run_id, applied_inputs)?;
-        if store.append_padlog_event(run_id, &event).is_err() {
-            let _ = Self::write_padlog_snapshot(&store, run_id, previous_inputs);
-            return Err(BackendError::BackendUnavailable);
-        }
-        Ok(())
+fn write_input_artifacts(
+    private_config: &BridgePrivateConfig,
+    run_id: &str,
+    previous_inputs: &[AppliedInputFrame],
+    applied_inputs: &[AppliedInputFrame],
+    event: PadLogEventRow,
+) -> BackendResult<()> {
+    if private_config.is_placeholder() {
+        return Ok(());
     }
 
-    fn write_padlog_snapshot(
-        store: &PrivateArtifactStore<'_>,
-        run_id: &str,
-        applied_inputs: &[AppliedInputFrame],
-    ) -> BackendResult<()> {
-        let padlog = PadLog::from_applied_frames(applied_inputs.iter().cloned())
-            .map_err(|_| BackendError::BackendUnavailable)?;
-        store
-            .write_padlog(run_id, &padlog)
-            .map(|_| ())
-            .map_err(|_| BackendError::BackendUnavailable)
+    let store = PrivateArtifactStore::new(private_config);
+    write_padlog_snapshot(&store, run_id, applied_inputs)?;
+    if store.append_padlog_event(run_id, &event).is_err() {
+        let _ = write_padlog_snapshot(&store, run_id, previous_inputs);
+        return Err(BackendError::BackendUnavailable);
     }
+    Ok(())
+}
+
+fn write_padlog_snapshot(
+    store: &PrivateArtifactStore<'_>,
+    run_id: &str,
+    applied_inputs: &[AppliedInputFrame],
+) -> BackendResult<()> {
+    let padlog = PadLog::from_applied_frames(applied_inputs.iter().cloned())
+        .map_err(|_| BackendError::BackendUnavailable)?;
+    store
+        .write_padlog(run_id, &padlog)
+        .map(|_| ())
+        .map_err(|_| BackendError::BackendUnavailable)
 }
 
 #[derive(Debug, Clone)]
@@ -816,6 +826,27 @@ impl RealBackend {
         let _ = self.append_real_event(run_id, "cleanup_failed", "real backend cleanup failed");
     }
 
+    fn quarantine_after_input_artifact_failure(&self, session: &RealSession) {
+        {
+            let mut inner = self.inner.lock().expect("real backend mutex poisoned");
+            if inner
+                .active
+                .as_ref()
+                .is_some_and(|active| active.session_id == session.session_id)
+            {
+                inner.active = None;
+            }
+        }
+        let _ = self.append_real_event(
+            &session.run_id,
+            "input_artifact_failed",
+            "real backend input artifact persistence failed",
+        );
+        if self.worker.stop(session.lease.clone()).is_err() {
+            self.append_cleanup_failed(&session.run_id);
+        }
+    }
+
     fn clear_starting(&self) {
         self.inner
             .lock()
@@ -830,7 +861,7 @@ impl BridgeBackend for RealBackend {
     }
 
     fn capabilities(&self) -> BackendCapabilities {
-        BackendCapabilities::real_preview_mvp()
+        BackendCapabilities::real_input_preview_mvp()
     }
 
     fn start_session(&self, request: StartBackendSession) -> BackendResult<BackendSession> {
@@ -878,6 +909,9 @@ impl BridgeBackend for RealBackend {
             last_preview_frame: 0,
             preview_stale: outcome.current_frame > 0,
             last_applied_input_frame: 0,
+            frame_base_known: true,
+            input_in_flight: false,
+            applied_inputs: Vec::new(),
             capabilities: request.requested_capabilities,
         };
         let backend_session = session.backend_session();
@@ -972,7 +1006,7 @@ impl BridgeBackend for RealBackend {
                 .cloned()
                 .ok_or(BackendError::BackendUnavailable)?
         };
-        if session.state == SessionState::Faulted {
+        if session.state == SessionState::Faulted || session.input_in_flight {
             return Err(BackendError::BackendUnavailable);
         }
 
@@ -1016,19 +1050,41 @@ impl BridgeBackend for RealBackend {
 
     fn resume(&self, session_id: SessionId) -> BackendResult<RunBoundary> {
         let session = {
-            let inner = self.inner.lock().expect("real backend mutex poisoned");
-            inner
+            let mut inner = self.inner.lock().expect("real backend mutex poisoned");
+            let active = inner
                 .active
-                .as_ref()
+                .as_mut()
                 .filter(|session| session.session_id == session_id)
-                .cloned()
-                .ok_or(BackendError::BackendUnavailable)?
+                .ok_or(BackendError::BackendUnavailable)?;
+            if active.state != SessionState::Paused || active.input_in_flight {
+                return Err(BackendError::BackendUnavailable);
+            }
+            active.state = SessionState::Running;
+            active.clone()
         };
-        if session.state == SessionState::Faulted {
-            return Err(BackendError::BackendUnavailable);
-        }
 
-        let outcome = self.worker.resume(session.lease.clone())?;
+        let outcome = match self.worker.resume(session.lease.clone()) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                {
+                    let mut inner = self.inner.lock().expect("real backend mutex poisoned");
+                    if let Some(active) = inner
+                        .active
+                        .as_mut()
+                        .filter(|active| active.session_id == session.session_id)
+                    {
+                        active.state = SessionState::Faulted;
+                        active.input_in_flight = false;
+                    }
+                }
+                let _ = self.append_real_event(
+                    &session.run_id,
+                    "session_faulted",
+                    "real backend session faulted",
+                );
+                return Err(error.into());
+            }
+        };
         if outcome.faulted {
             {
                 let mut inner = self.inner.lock().expect("real backend mutex poisoned");
@@ -1039,6 +1095,7 @@ impl BridgeBackend for RealBackend {
                 {
                     active.state = SessionState::Faulted;
                     active.current_icount = outcome.current_icount;
+                    active.input_in_flight = false;
                 }
             }
             let _ = self.append_real_event(
@@ -1058,10 +1115,13 @@ impl BridgeBackend for RealBackend {
                 .ok_or(BackendError::BackendUnavailable)?;
             active.state = SessionState::Paused;
             active.current_icount = outcome.current_icount;
+            active.input_in_flight = false;
             if let Some(frame) = outcome.current_frame {
                 active.current_frame = frame;
+                active.frame_base_known = true;
                 active.preview_stale = active.last_preview_frame < active.current_frame;
             } else {
+                active.frame_base_known = false;
                 active.preview_stale = true;
             }
         }
@@ -1080,8 +1140,205 @@ impl BridgeBackend for RealBackend {
         Ok(active.boundary())
     }
 
-    fn inject_input(&self, _request: InputScheduleRequest) -> BackendResult<InputScheduleReceipt> {
-        Err(BackendError::BackendUnavailable)
+    fn inject_input(&self, request: InputScheduleRequest) -> BackendResult<InputScheduleReceipt> {
+        if request.target_frame >= u64::from(u32::MAX) {
+            return Err(BackendError::BackendUnavailable);
+        }
+        let target_frame =
+            u32::try_from(request.target_frame).map_err(|_| BackendError::BackendUnavailable)?;
+
+        let mut session = {
+            let mut inner = self.inner.lock().expect("real backend mutex poisoned");
+            let active = inner
+                .active
+                .as_mut()
+                .filter(|session| session.session_id == request.session_id)
+                .ok_or(BackendError::BackendUnavailable)?;
+            if !active.capabilities.input
+                || active.state != SessionState::Paused
+                || active.input_in_flight
+            {
+                return Err(BackendError::BackendUnavailable);
+            }
+            active.input_in_flight = true;
+            active.clone()
+        };
+
+        if !session.frame_base_known {
+            match self.worker.frame_counter(session.lease.clone()) {
+                Ok(outcome) => {
+                    let mut inner = self.inner.lock().expect("real backend mutex poisoned");
+                    let active = inner
+                        .active
+                        .as_mut()
+                        .filter(|active| active.session_id == session.session_id)
+                        .filter(|active| active.input_in_flight)
+                        .ok_or(BackendError::BackendUnavailable)?;
+                    active.current_frame = outcome.frame;
+                    active.current_icount = outcome.icount;
+                    active.frame_base_known = true;
+                    active.preview_stale = active.last_preview_frame < active.current_frame;
+                    session = active.clone();
+                }
+                Err(error) => {
+                    let mut inner = self.inner.lock().expect("real backend mutex poisoned");
+                    if let Some(active) = inner
+                        .active
+                        .as_mut()
+                        .filter(|active| active.session_id == session.session_id)
+                    {
+                        active.input_in_flight = false;
+                        active.frame_base_known = false;
+                    }
+                    return Err(error.into());
+                }
+            }
+        }
+
+        if request.target_frame <= session.current_frame {
+            let mut inner = self.inner.lock().expect("real backend mutex poisoned");
+            if let Some(active) = inner
+                .active
+                .as_mut()
+                .filter(|active| active.session_id == session.session_id)
+            {
+                active.input_in_flight = false;
+            }
+            return Err(BackendError::FrameStale {
+                requested_frame: request.target_frame,
+                current_frame: session.current_frame,
+            });
+        }
+
+        let outcome =
+            match self
+                .worker
+                .inject_input(session.lease.clone(), target_frame, request.pad_word)
+            {
+                Ok(outcome) => outcome,
+                Err(RealWorkerFailure::FrameStale) => {
+                    let current_frame = match self.worker.frame_counter(session.lease.clone()) {
+                        Ok(outcome) => {
+                            let mut inner = self.inner.lock().expect("real backend mutex poisoned");
+                            if let Some(active) = inner
+                                .active
+                                .as_mut()
+                                .filter(|active| active.session_id == session.session_id)
+                            {
+                                active.current_frame = outcome.frame;
+                                active.current_icount = outcome.icount;
+                                active.frame_base_known = true;
+                                active.preview_stale =
+                                    active.last_preview_frame < active.current_frame;
+                                active.input_in_flight = false;
+                            }
+                            outcome.frame
+                        }
+                        Err(error) => {
+                            let mut inner = self.inner.lock().expect("real backend mutex poisoned");
+                            if let Some(active) = inner
+                                .active
+                                .as_mut()
+                                .filter(|active| active.session_id == session.session_id)
+                            {
+                                active.frame_base_known = false;
+                                active.input_in_flight = false;
+                            }
+                            return Err(error.into());
+                        }
+                    };
+                    if current_frame < request.target_frame {
+                        return Err(BackendError::BackendUnavailable);
+                    }
+                    return Err(BackendError::FrameStale {
+                        requested_frame: request.target_frame,
+                        current_frame,
+                    });
+                }
+                Err(error) => {
+                    let mut inner = self.inner.lock().expect("real backend mutex poisoned");
+                    if let Some(active) = inner
+                        .active
+                        .as_mut()
+                        .filter(|active| active.session_id == session.session_id)
+                    {
+                        active.input_in_flight = false;
+                    }
+                    return Err(error.into());
+                }
+            };
+
+        if outcome.scheduled != 1 {
+            let mut inner = self.inner.lock().expect("real backend mutex poisoned");
+            if let Some(active) = inner
+                .active
+                .as_mut()
+                .filter(|active| active.session_id == session.session_id)
+            {
+                active.input_in_flight = false;
+            }
+            return Err(BackendError::BackendUnavailable);
+        }
+
+        let (run_id, frame_index, previous_inputs, applied_inputs, cleanup_session) = {
+            let inner = self.inner.lock().expect("real backend mutex poisoned");
+            let active = inner
+                .active
+                .as_ref()
+                .filter(|active| active.session_id == session.session_id)
+                .filter(|active| active.input_in_flight)
+                .ok_or(BackendError::BackendUnavailable)?;
+            let frame_index = active.applied_inputs.len() as u64;
+            let previous_inputs = active.applied_inputs.clone();
+            let mut applied_inputs = previous_inputs.clone();
+            applied_inputs.push(AppliedInputFrame {
+                frame: request.target_frame,
+                pad_word: request.pad_word.raw(),
+            });
+            (
+                active.run_id.clone(),
+                frame_index,
+                previous_inputs,
+                applied_inputs,
+                active.clone(),
+            )
+        };
+
+        if let Err(error) = write_input_artifacts(
+            &self.private_config,
+            &run_id,
+            &previous_inputs,
+            &applied_inputs,
+            PadLogEventRow::new(
+                &run_id,
+                frame_index,
+                request.target_frame,
+                request.pad_word.raw(),
+                request.client_seq,
+                &request.source_id,
+                "applied",
+                "input applied",
+            ),
+        ) {
+            self.quarantine_after_input_artifact_failure(&cleanup_session);
+            return Err(error);
+        }
+
+        let mut inner = self.inner.lock().expect("real backend mutex poisoned");
+        let active = inner
+            .active
+            .as_mut()
+            .filter(|active| active.session_id == session.session_id)
+            .filter(|active| active.input_in_flight)
+            .ok_or(BackendError::BackendUnavailable)?;
+        active.input_in_flight = false;
+        active.last_applied_input_frame = request.target_frame;
+        active.applied_inputs = applied_inputs;
+        Ok(InputScheduleReceipt {
+            session_id: request.session_id,
+            assigned_frame: request.target_frame,
+            pad_word: request.pad_word,
+        })
     }
 
     fn framebuffer(&self, session_id: SessionId) -> BackendResult<FramePreview> {
@@ -1109,6 +1366,7 @@ impl BridgeBackend for RealBackend {
         active.last_preview_frame = outcome.frame;
         active.current_frame = active.current_frame.max(outcome.frame);
         active.current_icount = outcome.icount;
+        active.frame_base_known = true;
         active.preview_stale = active.last_preview_frame < active.current_frame;
 
         Ok(FramePreview {
@@ -1148,6 +1406,9 @@ struct RealSession {
     last_preview_frame: FrameCounter,
     preview_stale: bool,
     last_applied_input_frame: FrameCounter,
+    frame_base_known: bool,
+    input_in_flight: bool,
+    applied_inputs: Vec<AppliedInputFrame>,
     capabilities: BackendCapabilities,
 }
 
@@ -1255,6 +1516,34 @@ impl RealWorkerThread {
         rx.recv()
             .map_err(|_| RealWorkerFailure::BackendUnavailable)?
     }
+
+    fn frame_counter(&self, lease: dh::Lease) -> RealWorkerResult<RealFrameCounterOutcome> {
+        let (reply, rx) = mpsc::channel();
+        self.tx
+            .send(RealWorkerCommand::FrameCounter { lease, reply })
+            .map_err(|_| RealWorkerFailure::BackendUnavailable)?;
+        rx.recv()
+            .map_err(|_| RealWorkerFailure::BackendUnavailable)?
+    }
+
+    fn inject_input(
+        &self,
+        lease: dh::Lease,
+        target_frame: u32,
+        pad_word: PadWord,
+    ) -> RealWorkerResult<RealInjectInputOutcome> {
+        let (reply, rx) = mpsc::channel();
+        self.tx
+            .send(RealWorkerCommand::InjectInput {
+                lease,
+                target_frame,
+                pad_word,
+                reply,
+            })
+            .map_err(|_| RealWorkerFailure::BackendUnavailable)?;
+        rx.recv()
+            .map_err(|_| RealWorkerFailure::BackendUnavailable)?
+    }
 }
 
 type RealWorkerResult<T> = Result<T, RealWorkerFailure>;
@@ -1285,17 +1574,32 @@ enum RealWorkerCommand {
         lease: dh::Lease,
         reply: mpsc::Sender<RealWorkerResult<RealFramebufferOutcome>>,
     },
+    FrameCounter {
+        lease: dh::Lease,
+        reply: mpsc::Sender<RealWorkerResult<RealFrameCounterOutcome>>,
+    },
+    InjectInput {
+        lease: dh::Lease,
+        target_frame: u32,
+        pad_word: PadWord,
+        reply: mpsc::Sender<RealWorkerResult<RealInjectInputOutcome>>,
+    },
 }
 
 #[derive(Debug)]
 enum RealWorkerFailure {
     BackendUnavailable,
     FailedPrecondition,
+    FrameStale,
 }
 
 impl From<RealWorkerFailure> for BackendError {
-    fn from(_failure: RealWorkerFailure) -> Self {
-        BackendError::BackendUnavailable
+    fn from(failure: RealWorkerFailure) -> Self {
+        match failure {
+            RealWorkerFailure::BackendUnavailable
+            | RealWorkerFailure::FailedPrecondition
+            | RealWorkerFailure::FrameStale => BackendError::BackendUnavailable,
+        }
     }
 }
 
@@ -1336,6 +1640,15 @@ struct RealFramebufferOutcome {
     width: u32,
     height: u32,
     png_bytes: Vec<u8>,
+}
+
+struct RealFrameCounterOutcome {
+    frame: FrameCounter,
+    icount: u64,
+}
+
+struct RealInjectInputOutcome {
+    scheduled: u32,
 }
 
 #[derive(Default)]
@@ -1393,6 +1706,18 @@ fn run_real_worker_thread(
             RealWorkerCommand::Framebuffer { lease, reply } => {
                 let _ = reply.send(runtime.block_on(state.framebuffer(lease)));
             }
+            RealWorkerCommand::FrameCounter { lease, reply } => {
+                let _ = reply.send(runtime.block_on(state.frame_counter(lease)));
+            }
+            RealWorkerCommand::InjectInput {
+                lease,
+                target_frame,
+                pad_word,
+                reply,
+            } => {
+                let _ =
+                    reply.send(runtime.block_on(state.inject_input(lease, target_frame, pad_word)));
+            }
         }
     }
 }
@@ -1415,6 +1740,12 @@ fn reply_unavailable(command: RealWorkerCommand) {
             let _ = reply.send(Err(RealWorkerFailure::BackendUnavailable));
         }
         RealWorkerCommand::Framebuffer { reply, .. } => {
+            let _ = reply.send(Err(RealWorkerFailure::BackendUnavailable));
+        }
+        RealWorkerCommand::FrameCounter { reply, .. } => {
+            let _ = reply.send(Err(RealWorkerFailure::BackendUnavailable));
+        }
+        RealWorkerCommand::InjectInput { reply, .. } => {
             let _ = reply.send(Err(RealWorkerFailure::BackendUnavailable));
         }
     }
@@ -1594,6 +1925,50 @@ impl RealWorkerState {
             png_bytes,
         })
     }
+
+    async fn frame_counter(
+        &mut self,
+        lease: dh::Lease,
+    ) -> RealWorkerResult<RealFrameCounterOutcome> {
+        let response = self
+            .client()
+            .await?
+            .get_framebuffer(dh::GetFramebufferRequest { lease: Some(lease) })
+            .await
+            .map_err(|_| RealWorkerFailure::BackendUnavailable)?
+            .into_inner();
+        Ok(RealFrameCounterOutcome {
+            frame: u64::from(response.frame_counter),
+            icount: response.icount,
+        })
+    }
+
+    async fn inject_input(
+        &mut self,
+        lease: dh::Lease,
+        target_frame: u32,
+        pad_word: PadWord,
+    ) -> RealWorkerResult<RealInjectInputOutcome> {
+        let response = self
+            .client()
+            .await?
+            .inject_inputs(dh::InjectInputsRequest {
+                lease: Some(lease),
+                events: vec![dh::ScheduledEvent {
+                    at: Some(dh::scheduled_event::At::AtFrame(target_frame)),
+                    event: Some(dh::scheduled_event::Event::PadSet(dh::PadSet {
+                        port: 0,
+                        buttons: u32::from(pad_word.raw()),
+                    })),
+                }],
+            })
+            .await
+            .map_err(input_worker_failure_from_status)?
+            .into_inner();
+        Ok(RealInjectInputOutcome {
+            scheduled: response.scheduled,
+        })
+    }
 }
 
 async fn connect_real_worker(
@@ -1672,6 +2047,14 @@ fn worker_failure_from_status(status: tonic::Status) -> RealWorkerFailure {
         RealWorkerFailure::FailedPrecondition
     } else {
         RealWorkerFailure::BackendUnavailable
+    }
+}
+
+fn input_worker_failure_from_status(status: tonic::Status) -> RealWorkerFailure {
+    match status.code() {
+        Code::InvalidArgument => RealWorkerFailure::FrameStale,
+        Code::FailedPrecondition => RealWorkerFailure::FailedPrecondition,
+        _ => RealWorkerFailure::BackendUnavailable,
     }
 }
 

@@ -1462,8 +1462,11 @@ async fn input_ws_handshake(
 
     let backend = state.backend.clone();
     let ws_input = state.ws_input.clone();
+    let private_config = state.config.private_config().clone();
     let mut response = ws
-        .on_upgrade(move |socket| serve_input_socket(socket, backend, ws_input, session_id))
+        .on_upgrade(move |socket| {
+            serve_input_socket(socket, backend, ws_input, session_id, private_config)
+        })
         .into_response();
     apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
     response
@@ -1529,6 +1532,12 @@ fn run_state_transition(
         return response;
     }
 
+    if transition == RunTransition::Resume
+        && flush_pending_input(&state, &request.session_id).is_err()
+    {
+        return backend_error(BackendError::BackendUnavailable).into_response();
+    }
+
     let boundary = match transition {
         RunTransition::Pause => state.backend.pause(request.session_id),
         RunTransition::Resume => state.backend.resume(request.session_id),
@@ -1538,10 +1547,8 @@ fn run_state_transition(
         Err(error) => return backend_error(error).into_response(),
     };
     if transition == RunTransition::Resume
-        && state
-            .ws_input
-            .flush_pending(state.backend.as_ref(), &boundary.session_id)
-            .is_err()
+        && state.backend.mode() == BackendMode::Synthetic
+        && flush_pending_input(&state, &boundary.session_id).is_err()
     {
         return backend_error(BackendError::BackendUnavailable).into_response();
     }
@@ -1555,6 +1562,23 @@ fn run_state_transition(
     .into_response();
     apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
     response
+}
+
+fn flush_pending_input(
+    state: &AppState,
+    session_id: &str,
+) -> Result<Vec<crate::input::InputScheduleOutcome>, crate::input::InputSchedulerError> {
+    if state.config.private_config().is_placeholder() {
+        let mut rejection_sink = crate::input::NoopInputRejectionSink;
+        state
+            .ws_input
+            .flush_pending(state.backend.as_ref(), session_id, &mut rejection_sink)
+    } else {
+        let mut rejection_sink = PrivateArtifactStore::new(state.config.private_config());
+        state
+            .ws_input
+            .flush_pending(state.backend.as_ref(), session_id, &mut rejection_sink)
+    }
 }
 
 fn authenticate_runtime_request(

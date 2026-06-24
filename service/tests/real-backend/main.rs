@@ -13,7 +13,12 @@ use dh_proto::v1::hypervisor_worker_server::{HypervisorWorker, HypervisorWorkerS
 use rom_operator_bridge_service::{
     api::{AppState, router},
     auth::ALLOWED_ORIGIN,
+    backend::{
+        BackendCapabilities, BackendError, BridgeBackend, InputScheduleRequest, RealBackend,
+        SessionState, StartBackendSession,
+    },
     config::{ENV_BACKEND_MODE, ServiceConfig},
+    input::{PadButton, PadLog, PadWord},
     private_config::{
         ENV_CAPTURE_SPEC_REF, ENV_CREATE_VM_CONFIG_REF, ENV_HYPERVISOR_ENDPOINT,
         ENV_OPERATOR_CREDENTIAL, ENV_PRIVATE_ROOT, ENV_REAL_SNAPSHOT_REF,
@@ -125,7 +130,7 @@ async fn real_restore_snapshot_lifecycle_calls_worker_and_stays_sanitized() {
     assert_eq!(start_body["run_id"], "real-run-0000");
     assert_eq!(start_body["state"], "paused");
     assert_eq!(start_body["current_frame"], 12);
-    assert_eq!(start_body["capabilities"]["input"], false);
+    assert_eq!(start_body["capabilities"]["input"], true);
     assert_eq!(start_body["capabilities"]["preview"], true);
     assert_eq!(start_body["capabilities"]["capture"], false);
     assert_public_json_sanitized(&start_body, &private_root, &reference_checkout, &server);
@@ -199,6 +204,286 @@ async fn real_restore_snapshot_lifecycle_calls_worker_and_stays_sanitized() {
     assert!(calls.iter().any(|call| *call == "run"));
     assert!(calls.iter().any(|call| *call == "list_slots"));
     assert!(calls.iter().any(|call| *call == "destroy_vm"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_input_injection_schedules_pad_set_and_writes_private_padlog() {
+    let workspace = tempfile::tempdir().expect("tempdir creates");
+    let private_root = workspace.path().join("bridge-private");
+    let reference_checkout = workspace.path().join("reference-workload");
+    let worker = MockWorker::new();
+    let server = WorkerServer::start(worker.clone()).await;
+    let config = real_config_with_start(
+        &private_root,
+        &reference_checkout,
+        &format!("unix://{}", server.uds_path.display()),
+        Some((ENV_REAL_SNAPSHOT_REF, SNAPSHOT_REF.to_string())),
+    );
+    let backend = real_backend_from_config(&config);
+    let session = backend
+        .start_session(StartBackendSession {
+            requested_capabilities: BackendCapabilities::synthetic_mvp(),
+        })
+        .expect("real session starts");
+    assert_eq!(session.capabilities.input, true);
+
+    let pad_word = PadWord::from_buttons([PadButton::A, PadButton::Start]);
+    let receipt = backend
+        .inject_input(input_request(&session.session_id, 13, pad_word))
+        .expect("real input schedules");
+
+    assert_eq!(receipt.session_id, session.session_id);
+    assert_eq!(receipt.assigned_frame, 13);
+    assert_eq!(receipt.pad_word, pad_word);
+
+    let inject_request = worker
+        .state
+        .lock()
+        .expect("mock worker mutex poisoned")
+        .inject_inputs
+        .first()
+        .cloned()
+        .expect("inject_inputs was called");
+    let lease = inject_request.lease.as_ref().expect("lease is set");
+    assert_eq!(lease.slot_id, 7);
+    assert_eq!(lease.token.as_slice(), LEASE_TOKEN);
+    assert_eq!(inject_request.events.len(), 1);
+    let scheduled = inject_request
+        .events
+        .first()
+        .expect("scheduled event exists");
+    assert_eq!(scheduled.at, Some(dh::scheduled_event::At::AtFrame(13)));
+    let pad_set = match scheduled.event.as_ref() {
+        Some(dh::scheduled_event::Event::PadSet(pad_set)) => pad_set,
+        other => panic!("expected PadSet event, got {other:?}"),
+    };
+    assert_eq!(pad_set.port, 0);
+    assert_eq!(pad_set.buttons, u32::from(pad_word.raw()));
+
+    let run_root = private_root.join("runs").join(&session.run_id);
+    let padlog_text = fs::read_to_string(run_root.join("input.padlog")).expect("padlog is written");
+    let parsed = PadLog::parse(&padlog_text).expect("padlog parses");
+    assert_eq!(
+        parsed
+            .frames()
+            .iter()
+            .map(|word| word.raw())
+            .collect::<Vec<_>>(),
+        vec![pad_word.raw()]
+    );
+
+    let event_lines = read_lines(&run_root.join("padlog-events.jsonl"));
+    assert_eq!(event_lines.len(), 1);
+    let event: Value = serde_json::from_str(&event_lines[0]).expect("padlog event parses");
+    assert_eq!(event["run_id"], session.run_id);
+    assert_eq!(event["frame_index"], 0);
+    assert_eq!(event["assigned_frame"], 13);
+    assert_eq!(event["pad_word"], pad_word.raw());
+    assert_eq!(event["client_seq"], 42);
+    assert_eq!(event["source_id"], "keyboard");
+    assert_eq!(event["status"], "applied");
+    assert_private_artifacts_do_not_contain_lease(&private_root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_input_rejects_frame_hint_none_boundary_before_worker_call() {
+    let workspace = tempfile::tempdir().expect("tempdir creates");
+    let private_root = workspace.path().join("bridge-private");
+    let reference_checkout = workspace.path().join("reference-workload");
+    let worker = MockWorker::new();
+    let server = WorkerServer::start(worker.clone()).await;
+    let config = real_config_with_start(
+        &private_root,
+        &reference_checkout,
+        &format!("unix://{}", server.uds_path.display()),
+        Some((ENV_REAL_SNAPSHOT_REF, SNAPSHOT_REF.to_string())),
+    );
+    let backend = real_backend_from_config(&config);
+    let session = backend
+        .start_session(StartBackendSession {
+            requested_capabilities: BackendCapabilities::synthetic_mvp(),
+        })
+        .expect("real session starts");
+
+    let error = backend
+        .inject_input(input_request(
+            &session.session_id,
+            u64::from(u32::MAX),
+            PadWord::from_buttons([PadButton::A]),
+        ))
+        .expect_err("frame hint sentinel is rejected");
+
+    assert_eq!(error, BackendError::BackendUnavailable);
+    assert!(!worker.calls().contains(&"inject_inputs"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_input_invalid_argument_refreshes_frame_and_returns_stale() {
+    let workspace = tempfile::tempdir().expect("tempdir creates");
+    let private_root = workspace.path().join("bridge-private");
+    let reference_checkout = workspace.path().join("reference-workload");
+    let worker = MockWorker::new();
+    let server = WorkerServer::start(worker.clone()).await;
+    let config = real_config_with_start(
+        &private_root,
+        &reference_checkout,
+        &format!("unix://{}", server.uds_path.display()),
+        Some((ENV_REAL_SNAPSHOT_REF, SNAPSHOT_REF.to_string())),
+    );
+    let backend = real_backend_from_config(&config);
+    let session = backend
+        .start_session(StartBackendSession {
+            requested_capabilities: BackendCapabilities::synthetic_mvp(),
+        })
+        .expect("real session starts");
+    {
+        let mut state = worker.state.lock().expect("mock worker mutex poisoned");
+        state.inject_status = Some(tonic::Code::InvalidArgument);
+        state.framebuffer_response = MockWorker::framebuffer_response(20, 123);
+    }
+
+    let error = backend
+        .inject_input(input_request(
+            &session.session_id,
+            13,
+            PadWord::from_buttons([PadButton::B]),
+        ))
+        .expect_err("stale input reports frame stale");
+
+    assert_eq!(
+        error,
+        BackendError::FrameStale {
+            requested_frame: 13,
+            current_frame: 20,
+        }
+    );
+    let calls = worker.calls();
+    assert!(calls.contains(&"inject_inputs"));
+    assert!(calls.contains(&"get_framebuffer"));
+    let status = backend
+        .status(session.session_id)
+        .expect("status is still available");
+    assert_eq!(status.current_frame, 20);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_input_invalid_argument_with_refresh_failure_returns_unavailable() {
+    let workspace = tempfile::tempdir().expect("tempdir creates");
+    let private_root = workspace.path().join("bridge-private");
+    let reference_checkout = workspace.path().join("reference-workload");
+    let worker = MockWorker::new();
+    let server = WorkerServer::start(worker.clone()).await;
+    let config = real_config_with_start(
+        &private_root,
+        &reference_checkout,
+        &format!("unix://{}", server.uds_path.display()),
+        Some((ENV_REAL_SNAPSHOT_REF, SNAPSHOT_REF.to_string())),
+    );
+    let backend = real_backend_from_config(&config);
+    let session = backend
+        .start_session(StartBackendSession {
+            requested_capabilities: BackendCapabilities::synthetic_mvp(),
+        })
+        .expect("real session starts");
+    {
+        let mut state = worker.state.lock().expect("mock worker mutex poisoned");
+        state.inject_status = Some(tonic::Code::InvalidArgument);
+        state.framebuffer_status = Some(tonic::Code::Unavailable);
+    }
+
+    let error = backend
+        .inject_input(input_request(
+            &session.session_id,
+            13,
+            PadWord::from_buttons([PadButton::B]),
+        ))
+        .expect_err("refresh failure is sanitized unavailable");
+
+    assert_eq!(error, BackendError::BackendUnavailable);
+    let calls = worker.calls();
+    assert!(calls.contains(&"inject_inputs"));
+    assert!(calls.contains(&"get_framebuffer"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_input_artifact_failure_quarantines_session_and_stops_worker() {
+    let workspace = tempfile::tempdir().expect("tempdir creates");
+    let private_root = workspace.path().join("bridge-private");
+    let reference_checkout = workspace.path().join("reference-workload");
+    let worker = MockWorker::new();
+    let server = WorkerServer::start(worker.clone()).await;
+    let config = real_config_with_start(
+        &private_root,
+        &reference_checkout,
+        &format!("unix://{}", server.uds_path.display()),
+        Some((ENV_REAL_SNAPSHOT_REF, SNAPSHOT_REF.to_string())),
+    );
+    let backend = real_backend_from_config(&config);
+    let session = backend
+        .start_session(StartBackendSession {
+            requested_capabilities: BackendCapabilities::synthetic_mvp(),
+        })
+        .expect("real session starts");
+    let run_root = private_root.join("runs").join(&session.run_id);
+    fs::create_dir(run_root.join("padlog-events.jsonl"))
+        .expect("directory blocks padlog event append");
+
+    let error = backend
+        .inject_input(input_request(
+            &session.session_id,
+            13,
+            PadWord::from_buttons([PadButton::X]),
+        ))
+        .expect_err("artifact failure is sanitized");
+
+    assert_eq!(error, BackendError::BackendUnavailable);
+    let calls = worker.calls();
+    assert!(calls.contains(&"inject_inputs"));
+    assert!(calls.contains(&"destroy_vm"));
+    assert_eq!(
+        backend
+            .status(session.session_id)
+            .expect_err("quarantined session is inactive"),
+        BackendError::BackendUnavailable
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_resume_worker_failure_faults_after_transient_running_state() {
+    let workspace = tempfile::tempdir().expect("tempdir creates");
+    let private_root = workspace.path().join("bridge-private");
+    let reference_checkout = workspace.path().join("reference-workload");
+    let worker = MockWorker::new();
+    let server = WorkerServer::start(worker.clone()).await;
+    let config = real_config_with_start(
+        &private_root,
+        &reference_checkout,
+        &format!("unix://{}", server.uds_path.display()),
+        Some((ENV_REAL_SNAPSHOT_REF, SNAPSHOT_REF.to_string())),
+    );
+    let backend = real_backend_from_config(&config);
+    let session = backend
+        .start_session(StartBackendSession {
+            requested_capabilities: BackendCapabilities::synthetic_mvp(),
+        })
+        .expect("real session starts");
+    worker
+        .state
+        .lock()
+        .expect("mock worker mutex poisoned")
+        .run_status = Some(tonic::Code::Unavailable);
+
+    let error = backend
+        .resume(session.session_id.clone())
+        .expect_err("worker run failure is sanitized");
+
+    assert_eq!(error, BackendError::BackendUnavailable);
+    let status = backend
+        .status(session.session_id)
+        .expect("faulted session remains inspectable");
+    assert_eq!(status.state, SessionState::Faulted);
+    assert_ne!(status.state, SessionState::Running);
+    assert!(worker.calls().contains(&"run"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -532,7 +817,7 @@ async fn real_start_without_preview_request_keeps_preview_capability_ungranted()
     assert_eq!(start.status(), StatusCode::OK);
     let cookie = response_cookie(&start);
     let start_body = body_json(start).await;
-    assert_eq!(start_body["capabilities"]["input"], false);
+    assert_eq!(start_body["capabilities"]["input"], true);
     assert_eq!(start_body["capabilities"]["preview"], false);
 
     let status = send_request(
@@ -691,6 +976,17 @@ fn real_config_with_start(
     ServiceConfig::from_pairs(values).expect("real private config loads")
 }
 
+fn real_backend_from_config(config: &ServiceConfig) -> RealBackend {
+    RealBackend::new(
+        config.private_config().clone(),
+        config
+            .private_config()
+            .real_runtime_config()
+            .expect("real runtime config is present")
+            .clone(),
+    )
+}
+
 fn runtime_request(method: Method, uri: &str, body: Body) -> Request<Body> {
     Request::builder()
         .method(method)
@@ -757,11 +1053,29 @@ fn stop_body(session_id: &str) -> String {
     .to_string()
 }
 
+fn input_request(session_id: &str, target_frame: u64, pad_word: PadWord) -> InputScheduleRequest {
+    InputScheduleRequest {
+        session_id: session_id.to_string(),
+        target_frame,
+        pad_word,
+        client_seq: 42,
+        source_id: "keyboard".to_string(),
+    }
+}
+
 async fn body_json(response: axum::response::Response) -> Value {
     let body = to_bytes(response.into_body(), 16 * 1024)
         .await
         .expect("body reads");
     serde_json::from_slice(&body).expect("body is json")
+}
+
+fn read_lines(path: &Path) -> Vec<String> {
+    fs::read_to_string(path)
+        .expect("jsonl file reads")
+        .lines()
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 fn response_cookie(response: &axum::response::Response) -> String {
@@ -870,8 +1184,16 @@ fn sha256_ref(bytes: &[u8]) -> String {
 
 fn assert_private_artifacts_do_not_contain_lease(private_root: &Path) {
     let run_dir = private_root.join("runs").join("real-run-0000");
-    for file_name in ["run-manifest.json", "bridge-events.jsonl"] {
+    for file_name in [
+        "run-manifest.json",
+        "bridge-events.jsonl",
+        "input.padlog",
+        "padlog-events.jsonl",
+    ] {
         let path = run_dir.join(file_name);
+        if !path.exists() || !path.is_file() {
+            continue;
+        }
         let contents = fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
         assert!(
@@ -962,7 +1284,11 @@ struct MockWorkerState {
     active_slot: Option<dh::SlotInfo>,
     restore_hash: Option<Vec<u8>>,
     create_vm: Option<dh::CreateVmRequest>,
+    inject_inputs: Vec<dh::InjectInputsRequest>,
     destroy_fails: bool,
+    inject_status: Option<tonic::Code>,
+    inject_scheduled: u32,
+    run_status: Option<tonic::Code>,
     framebuffer_status: Option<tonic::Code>,
     framebuffer_response: dh::GetFramebufferResponse,
     icount: u64,
@@ -975,7 +1301,11 @@ impl Default for MockWorkerState {
             active_slot: None,
             restore_hash: None,
             create_vm: None,
+            inject_inputs: Vec::new(),
             destroy_fails: false,
+            inject_status: None,
+            inject_scheduled: 1,
+            run_status: None,
             framebuffer_status: None,
             framebuffer_response: MockWorker::framebuffer_response(12, 0),
             icount: 0,
@@ -1095,9 +1425,20 @@ impl HypervisorWorker for MockWorker {
 
     async fn inject_inputs(
         &self,
-        _request: TonicRequest<dh::InjectInputsRequest>,
+        request: TonicRequest<dh::InjectInputsRequest>,
     ) -> Result<TonicResponse<dh::InjectInputsResponse>, Status> {
-        Err(Status::unimplemented("not used by bridge bp8"))
+        let mut state = self.state.lock().expect("mock worker mutex poisoned");
+        state.calls.push("inject_inputs");
+        state.inject_inputs.push(request.into_inner());
+        if let Some(code) = state.inject_status {
+            return Err(Status::new(
+                code,
+                "private inject worker failure at /private/input",
+            ));
+        }
+        Ok(TonicResponse::new(dh::InjectInputsResponse {
+            scheduled: state.inject_scheduled,
+        }))
     }
 
     async fn run(
@@ -1106,6 +1447,12 @@ impl HypervisorWorker for MockWorker {
     ) -> Result<TonicResponse<dh::RunResponse>, Status> {
         let mut state = self.state.lock().expect("mock worker mutex poisoned");
         state.calls.push("run");
+        if let Some(code) = state.run_status {
+            return Err(Status::new(
+                code,
+                "private run worker failure at /private/run",
+            ));
+        }
         state.icount = state.icount.saturating_add(11);
         let icount = state.icount;
         state.active_slot = Some(Self::active_slot(icount));
