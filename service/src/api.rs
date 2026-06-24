@@ -4,7 +4,7 @@ use crate::{
         validate_origin, validate_runtime_request,
     },
     backend::{
-        BackendError, BackendMode, BridgeBackend, RealBackendUnavailable, StopReason,
+        BackendError, BackendMode, BridgeBackend, FramePreview, RealBackendUnavailable, StopReason,
         SyntheticBackend,
     },
     config::ServiceConfig,
@@ -28,9 +28,14 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+};
 
 pub const RUNTIME_API_SCHEMA_VERSION: u16 = 1;
+const JSON_SAFE_U64_MAX: u64 = 9_007_199_254_740_991;
+const MAX_CACHED_FRAME_PREVIEWS: usize = 16;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -38,6 +43,7 @@ pub struct AppState {
     backend: Arc<dyn BridgeBackend>,
     auth: AuthState,
     runtime_session: Arc<Mutex<Option<String>>>,
+    frame_previews: FramePreviewState,
     ws_events: WsEventState,
     ws_input: WsInputState,
 }
@@ -56,6 +62,7 @@ impl AppState {
             backend,
             auth: AuthState::new(),
             runtime_session: Arc::new(Mutex::new(None)),
+            frame_previews: FramePreviewState::new(),
             ws_events: WsEventState::new(),
             ws_input: WsInputState::new(),
         }
@@ -72,6 +79,7 @@ impl AppState {
             backend: Arc::new(SyntheticBackend::with_private_config(private_config)),
             auth,
             runtime_session: Arc::new(Mutex::new(None)),
+            frame_previews: FramePreviewState::new(),
             ws_events: WsEventState::new(),
             ws_input: WsInputState::new(),
         }
@@ -87,9 +95,48 @@ impl AppState {
             backend,
             auth,
             runtime_session: Arc::new(Mutex::new(None)),
+            frame_previews: FramePreviewState::new(),
             ws_events: WsEventState::new(),
             ws_input: WsInputState::new(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct FramePreviewState {
+    inner: Arc<Mutex<VecDeque<FramePreview>>>,
+}
+
+impl FramePreviewState {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn reset_session(&self, _session_id: &str) {
+        self.inner
+            .lock()
+            .expect("frame preview mutex poisoned")
+            .clear();
+    }
+
+    fn remember(&self, preview: &FramePreview) {
+        let mut previews = self.inner.lock().expect("frame preview mutex poisoned");
+        previews.retain(|cached| {
+            cached.session_id != preview.session_id || cached.frame != preview.frame
+        });
+        previews.push_back(preview.clone());
+        while previews.len() > MAX_CACHED_FRAME_PREVIEWS {
+            previews.pop_front();
+        }
+    }
+
+    fn get(&self, session_id: &str, frame: u64) -> Option<FramePreview> {
+        self.inner
+            .lock()
+            .expect("frame preview mutex poisoned")
+            .iter()
+            .find(|preview| preview.session_id == session_id && preview.frame == frame)
+            .cloned()
     }
 }
 
@@ -216,6 +263,9 @@ async fn start_session(
         .runtime_session
         .lock()
         .expect("runtime session mutex poisoned") = Some(session_id);
+    state
+        .frame_previews
+        .reset_session(&backend_session.session_id);
     state.ws_events.reset_session(&backend_session.session_id);
     state.ws_input.reset_session(&backend_session.session_id);
 
@@ -311,6 +361,7 @@ async fn stop_session(
         .runtime_session
         .lock()
         .expect("runtime session mutex poisoned") = None;
+    state.frame_previews.reset_session(&stopped.session_id);
     state.ws_events.reset_session(&stopped.session_id);
     state.ws_input.reset_session(&stopped.session_id);
     if let Err(error) = state.auth.clear_session_headers(&headers) {
@@ -365,10 +416,17 @@ async fn frame_current(State(state): State<AppState>, headers: HeaderMap, uri: U
         Ok(status) => status,
         Err(error) => return backend_error(error).into_response(),
     };
-    let preview = match state.backend.framebuffer(session_id) {
+    if status.session_id != session_id {
+        return auth_error(AuthError::BadSession).into_response();
+    }
+    let preview = match state.backend.framebuffer(session_id.clone()) {
         Ok(preview) => preview,
         Err(error) => return backend_error(error).into_response(),
     };
+    if let Err(response) = validate_frame_preview(&session_id, &preview) {
+        return response;
+    }
+    state.frame_previews.remember(&preview);
 
     let mut response = Json(FrameCurrentResponse {
         schema_version: RUNTIME_API_SCHEMA_VERSION,
@@ -395,13 +453,42 @@ async fn frame_current_image(
     {
         return response;
     }
+    let requested_frame = match requested_frame_hint(&uri) {
+        Ok(requested_frame) => requested_frame,
+        Err(response) => return response,
+    };
     let session_id = match active_session_id(&state) {
         Ok(session_id) => session_id,
         Err(response) => return response,
     };
-    let preview = match state.backend.framebuffer(session_id) {
-        Ok(preview) => preview,
-        Err(error) => return backend_error(error).into_response(),
+    let preview = if let Some(frame) = requested_frame {
+        match state.frame_previews.get(&session_id, frame) {
+            Some(preview) => preview,
+            None => {
+                let preview = match state.backend.framebuffer(session_id.clone()) {
+                    Ok(preview) => preview,
+                    Err(error) => return backend_error(error).into_response(),
+                };
+                if let Err(response) = validate_frame_preview(&session_id, &preview) {
+                    return response;
+                }
+                if preview.frame != frame {
+                    return bad_request("Preview frame unavailable.").into_response();
+                }
+                state.frame_previews.remember(&preview);
+                preview
+            }
+        }
+    } else {
+        let preview = match state.backend.framebuffer(session_id.clone()) {
+            Ok(preview) => preview,
+            Err(error) => return backend_error(error).into_response(),
+        };
+        if let Err(response) = validate_frame_preview(&session_id, &preview) {
+            return response;
+        }
+        state.frame_previews.remember(&preview);
+        preview
     };
 
     let mut response = Response::new(Body::from(preview.png_bytes));
@@ -586,6 +673,30 @@ fn is_frame_hint_query(query: &str) -> bool {
     !frame.is_empty() && frame.bytes().all(|byte| byte.is_ascii_digit())
 }
 
+fn requested_frame_hint(uri: &Uri) -> Result<Option<u64>, Response> {
+    let Some(query) = uri.query().filter(|query| is_frame_hint_query(query)) else {
+        return Ok(None);
+    };
+    let frame = query
+        .strip_prefix("frame=")
+        .expect("frame hint query was validated")
+        .parse::<u64>()
+        .ok()
+        .filter(|frame| *frame <= JSON_SAFE_U64_MAX)
+        .ok_or_else(|| bad_request("Preview frame unavailable.").into_response())?;
+    Ok(Some(frame))
+}
+
+fn validate_frame_preview(session_id: &str, preview: &FramePreview) -> Result<(), Response> {
+    if preview.session_id != session_id {
+        return Err(auth_error(AuthError::BadSession).into_response());
+    }
+    if preview.frame > JSON_SAFE_U64_MAX {
+        return Err(bad_request("Preview frame unavailable.").into_response());
+    }
+    Ok(())
+}
+
 fn cleanup_runtime_session(state: &AppState, reason: StopReason) -> Result<(), BackendError> {
     let session_id = state
         .runtime_session
@@ -602,6 +713,7 @@ fn cleanup_runtime_session(state: &AppState, reason: StopReason) -> Result<(), B
         .runtime_session
         .lock()
         .expect("runtime session mutex poisoned") = None;
+    state.frame_previews.reset_session(&stopped.session_id);
     state.ws_events.reset_session(&stopped.session_id);
     state.ws_input.reset_session(&stopped.session_id);
     Ok(())

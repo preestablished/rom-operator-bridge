@@ -2,7 +2,10 @@ use axum::{
     body::{Body, to_bytes},
     http::{
         Method, Request, StatusCode,
-        header::{CACHE_CONTROL, CONTENT_TYPE, COOKIE, ORIGIN, SET_COOKIE},
+        header::{
+            ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, CONTENT_TYPE, COOKIE, ORIGIN, PRAGMA,
+            SET_COOKIE, VARY,
+        },
     },
 };
 use rom_operator_bridge_service::{
@@ -22,6 +25,7 @@ use rom_operator_bridge_service::{
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::VecDeque,
     path::{Path, PathBuf},
     sync::Mutex,
 };
@@ -31,6 +35,7 @@ const GOOD_CREDENTIAL: &str = "operator-credential-from-test-source";
 const SESSION_SECRET: &str = "session-secret-from-test-source-32-bytes";
 const SESSION_ID: &str = "synthetic-session-frame";
 const RUN_ID: &str = "synthetic-run-frame";
+const JSON_SAFE_U64_MAX: u64 = 9_007_199_254_740_991;
 
 #[tokio::test]
 async fn current_frame_metadata_and_image_are_schema_safe_and_no_store() {
@@ -113,20 +118,118 @@ async fn frame_metadata_marks_preview_stale_when_backend_frame_lags() {
 }
 
 #[tokio::test]
+async fn frame_image_serves_the_preview_advertised_by_metadata() {
+    let (_workspace, app, _private_root) =
+        frame_app(FrameBackend::new(10, 9).with_preview_frames([9, 10]));
+    let cookie = login_cookie(app.clone()).await;
+
+    let metadata_response = app
+        .clone()
+        .oneshot(runtime_get("/api/frame/current", &cookie))
+        .await
+        .expect("frame metadata request runs");
+    assert_eq!(metadata_response.status(), StatusCode::OK);
+    let metadata_body = to_bytes(metadata_response.into_body(), 8192)
+        .await
+        .expect("metadata body reads");
+    let metadata: Value = serde_json::from_slice(&metadata_body).expect("metadata json parses");
+    let image_url = metadata["image_url"]
+        .as_str()
+        .expect("image_url is a string");
+
+    let image_response = app
+        .oneshot(runtime_get(image_url, &cookie))
+        .await
+        .expect("frame image request runs");
+    assert_eq!(image_response.status(), StatusCode::OK);
+    let bytes = to_bytes(image_response.into_body(), 512 * 1024)
+        .await
+        .expect("image body reads");
+
+    assert_eq!(metadata["frame"], 9);
+    assert_eq!(metadata["preview_hash"], sha256_ref(&bytes));
+    assert_eq!(bytes.as_ref(), synthetic_frame_png(9).as_slice());
+    assert_ne!(bytes.as_ref(), synthetic_frame_png(10).as_slice());
+}
+
+#[tokio::test]
+async fn frame_routes_reject_backend_session_mismatches() {
+    let (_workspace, status_app, status_private_root) =
+        frame_app(FrameBackend::new(10, 10).with_status_session_id("other-session"));
+    let status_cookie = login_cookie(status_app.clone()).await;
+
+    let status_mismatch = status_app
+        .oneshot(runtime_get("/api/frame/current", &status_cookie))
+        .await
+        .expect("frame metadata request runs");
+    assert_eq!(status_mismatch.status(), StatusCode::UNAUTHORIZED);
+    assert_session_inactive_safe_error(status_mismatch, &status_private_root).await;
+
+    let (_workspace, preview_app, preview_private_root) =
+        frame_app(FrameBackend::new(10, 10).with_preview_session_id("other-session"));
+    let preview_cookie = login_cookie(preview_app.clone()).await;
+
+    let metadata_preview_mismatch = preview_app
+        .clone()
+        .oneshot(runtime_get("/api/frame/current", &preview_cookie))
+        .await
+        .expect("frame metadata request runs");
+    assert_eq!(metadata_preview_mismatch.status(), StatusCode::UNAUTHORIZED);
+    assert_session_inactive_safe_error(metadata_preview_mismatch, &preview_private_root).await;
+
+    let image_preview_mismatch = preview_app
+        .oneshot(runtime_get(
+            "/api/frame/current/image?frame=10",
+            &preview_cookie,
+        ))
+        .await
+        .expect("frame image request runs");
+    assert_eq!(image_preview_mismatch.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(
+        image_preview_mismatch
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("image/png")
+    );
+    assert_session_inactive_safe_error(image_preview_mismatch, &preview_private_root).await;
+}
+
+#[tokio::test]
+async fn frame_metadata_rejects_schema_unsafe_frame_counters() {
+    let (_workspace, app, _private_root) = frame_app(FrameBackend::new(
+        JSON_SAFE_U64_MAX + 1,
+        JSON_SAFE_U64_MAX + 1,
+    ));
+    let cookie = login_cookie(app.clone()).await;
+
+    let response = app
+        .oneshot(runtime_get("/api/frame/current", &cookie))
+        .await
+        .expect("frame metadata request runs");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn frame_image_allows_only_numeric_frame_query_hint() {
     let (_workspace, app, private_root) = synthetic_frame_app();
     let cookie = login_cookie(app.clone()).await;
 
-    let response = app
-        .oneshot(runtime_get(
-            "/api/frame/current/image?next=operator-credential-from-test-source",
-            &cookie,
-        ))
-        .await
-        .expect("frame image request runs");
+    for uri in [
+        "/api/frame/current/image?next=operator-credential-from-test-source",
+        "/api/frame/current/image?frame=",
+        "/api/frame/current/image?frame=1&next=2",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(runtime_get(uri, &cookie))
+            .await
+            .expect("frame image request runs");
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_auth_safe_error(response, &private_root).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_auth_safe_error(response, &private_root).await;
+    }
 }
 
 fn assert_no_store_headers(headers: &axum::http::HeaderMap) {
@@ -137,10 +240,24 @@ fn assert_no_store_headers(headers: &axum::http::HeaderMap) {
         Some("no-store")
     );
     assert_eq!(
+        headers.get(PRAGMA).and_then(|value| value.to_str().ok()),
+        Some("no-cache")
+    );
+    assert_eq!(
         headers
             .get("x-content-type-options")
             .and_then(|value| value.to_str().ok()),
         Some("nosniff")
+    );
+    assert_eq!(
+        headers
+            .get(ACCESS_CONTROL_ALLOW_ORIGIN)
+            .and_then(|value| value.to_str().ok()),
+        Some(ALLOWED_ORIGIN)
+    );
+    assert_eq!(
+        headers.get(VARY).and_then(|value| value.to_str().ok()),
+        Some("Origin")
     );
 }
 
@@ -160,6 +277,23 @@ async fn assert_auth_safe_error(response: axum::response::Response, private_root
         .expect("error body reads");
     let json: Value = serde_json::from_slice(&body).expect("error json parses");
     assert_eq!(json["error"]["code"], "auth_rejected");
+    PublicSanitizer::new()
+        .with_private_root(private_root)
+        .with_forbidden_literal(GOOD_CREDENTIAL)
+        .with_forbidden_literal(SESSION_SECRET)
+        .inspect_json(&json)
+        .expect("error is public-safe");
+}
+
+async fn assert_session_inactive_safe_error(
+    response: axum::response::Response,
+    private_root: &Path,
+) {
+    let body = to_bytes(response.into_body(), 8192)
+        .await
+        .expect("error body reads");
+    let json: Value = serde_json::from_slice(&body).expect("error json parses");
+    assert_eq!(json["error"]["code"], "session_inactive");
     PublicSanitizer::new()
         .with_private_root(private_root)
         .with_forbidden_literal(GOOD_CREDENTIAL)
@@ -254,7 +388,9 @@ fn sha256_ref(bytes: &[u8]) -> String {
 #[derive(Debug)]
 struct FrameBackend {
     current_frame: u64,
-    preview_frame: u64,
+    preview_frames: Mutex<VecDeque<u64>>,
+    status_session_id: String,
+    preview_session_id: String,
     state: Mutex<SessionState>,
 }
 
@@ -262,13 +398,39 @@ impl FrameBackend {
     fn new(current_frame: u64, preview_frame: u64) -> Self {
         Self {
             current_frame,
-            preview_frame,
+            preview_frames: Mutex::new(VecDeque::from([preview_frame])),
+            status_session_id: SESSION_ID.to_string(),
+            preview_session_id: SESSION_ID.to_string(),
             state: Mutex::new(SessionState::Running),
         }
     }
 
+    fn with_status_session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.status_session_id = session_id.into();
+        self
+    }
+
+    fn with_preview_session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.preview_session_id = session_id.into();
+        self
+    }
+
+    fn with_preview_frames<const N: usize>(self, frames: [u64; N]) -> Self {
+        *self.preview_frames.lock().expect("preview mutex poisoned") = VecDeque::from(frames);
+        self
+    }
+
     fn state(&self) -> SessionState {
         *self.state.lock().expect("state mutex poisoned")
+    }
+
+    fn preview_frame(&self) -> u64 {
+        let mut frames = self.preview_frames.lock().expect("preview mutex poisoned");
+        if frames.len() > 1 {
+            frames.pop_front().expect("preview frame exists")
+        } else {
+            *frames.front().expect("preview frame exists")
+        }
     }
 }
 
@@ -303,16 +465,21 @@ impl BridgeBackend for FrameBackend {
         })
     }
 
-    fn status(&self, session_id: SessionId) -> BackendResult<RunStatus> {
+    fn status(&self, _session_id: SessionId) -> BackendResult<RunStatus> {
         Ok(RunStatus {
-            session_id,
+            session_id: self.status_session_id.clone(),
             run_id: RUN_ID.to_string(),
             state: self.state(),
             backend_mode: self.mode(),
             current_frame: self.current_frame,
             capabilities: self.capabilities(),
             last_applied_input_frame: 0,
-            last_preview_frame: self.preview_frame,
+            last_preview_frame: *self
+                .preview_frames
+                .lock()
+                .expect("preview mutex poisoned")
+                .front()
+                .expect("preview frame exists"),
             active_capture_job_id: None,
         })
     }
@@ -341,13 +508,14 @@ impl BridgeBackend for FrameBackend {
         })
     }
 
-    fn framebuffer(&self, session_id: SessionId) -> BackendResult<FramePreview> {
+    fn framebuffer(&self, _session_id: SessionId) -> BackendResult<FramePreview> {
+        let frame = self.preview_frame();
         Ok(FramePreview {
-            session_id,
-            frame: self.preview_frame,
+            session_id: self.preview_session_id.clone(),
+            frame,
             width: SYNTHETIC_FRAME_WIDTH,
             height: SYNTHETIC_FRAME_HEIGHT,
-            png_bytes: synthetic_frame_png(self.preview_frame),
+            png_bytes: synthetic_frame_png(frame),
         })
     }
 

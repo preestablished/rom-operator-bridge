@@ -12,10 +12,10 @@ pub fn synthetic_frame_png(frame: u64) -> Vec<u8> {
     for y in 0..height {
         scanlines.push(0);
         for x in 0..width {
-            let phase = frame as usize;
-            scanlines.push(((x + phase) & 0xff) as u8);
-            scanlines.push(((y * 2 + phase) & 0xff) as u8);
-            scanlines.push((((x ^ y) + phase) & 0xff) as u8);
+            let phase = frame as u8;
+            scanlines.push((x as u8).wrapping_add(phase));
+            scanlines.push((y as u8).wrapping_mul(2).wrapping_add(phase));
+            scanlines.push(((x ^ y) as u8).wrapping_add(phase));
         }
     }
 
