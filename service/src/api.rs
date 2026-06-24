@@ -12,6 +12,10 @@ use crate::{
     },
     config::ServiceConfig,
     input::{PAD_LAYOUT_ID, PAD_LAYOUT_VERSION},
+    labels::{
+        LabelApplyOutcome, LabelApplyRequest, LabelConflict, LabelConflictKind, LabelSnapshot,
+        LabelState, LabelStoreError, LabelUpdate,
+    },
     ws_events::{WsEventState, serve_event_socket},
     ws_input::{WsInputState, serve_input_socket},
 };
@@ -32,7 +36,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{Arc, Mutex},
 };
 
@@ -49,6 +53,7 @@ pub struct AppState {
     auth: AuthState,
     runtime_session: Arc<Mutex<Option<String>>>,
     captures: CaptureState,
+    labels: LabelState,
     frame_previews: FramePreviewState,
     ws_events: WsEventState,
     ws_input: WsInputState,
@@ -69,6 +74,7 @@ impl AppState {
             auth: AuthState::new(),
             runtime_session: Arc::new(Mutex::new(None)),
             captures: CaptureState::new(),
+            labels: LabelState::new(),
             frame_previews: FramePreviewState::new(),
             ws_events: WsEventState::new(),
             ws_input: WsInputState::new(),
@@ -87,6 +93,7 @@ impl AppState {
             auth,
             runtime_session: Arc::new(Mutex::new(None)),
             captures: CaptureState::new(),
+            labels: LabelState::new(),
             frame_previews: FramePreviewState::new(),
             ws_events: WsEventState::new(),
             ws_input: WsInputState::new(),
@@ -104,6 +111,7 @@ impl AppState {
             auth,
             runtime_session: Arc::new(Mutex::new(None)),
             captures: CaptureState::new(),
+            labels: LabelState::new(),
             frame_previews: FramePreviewState::new(),
             ws_events: WsEventState::new(),
             ws_input: WsInputState::new(),
@@ -164,15 +172,27 @@ impl CaptureState {
         let removed_job_ids: Vec<String> = inner
             .jobs
             .iter()
-            .filter(|(_, job)| job.session_id == session_id && job.status.is_active())
+            .filter(|(_, job)| job.session_id == session_id)
             .map(|(job_id, _)| job_id.clone())
             .collect();
         if removed_job_ids.is_empty() {
             return;
         }
+        let removed_capture_ids: BTreeSet<String> = inner
+            .captures
+            .iter()
+            .filter(|(_, record)| removed_job_ids.contains(&record.job_id))
+            .map(|(capture_id, _)| capture_id.clone())
+            .collect();
         inner
             .jobs
             .retain(|job_id, _| !removed_job_ids.contains(job_id));
+        inner
+            .captures
+            .retain(|capture_id, _| !removed_capture_ids.contains(capture_id));
+        inner
+            .capture_order
+            .retain(|capture_id| !removed_capture_ids.contains(capture_id));
         inner.idempotency.retain(|(stored_session_id, _), job_id| {
             stored_session_id != session_id || !removed_job_ids.contains(job_id)
         });
@@ -185,6 +205,20 @@ impl CaptureState {
             .values()
             .find(|job| job.session_id == session_id && job.status.is_active())
             .map(|job| job.job_id.clone())
+    }
+
+    fn is_labelable_capture(&self, session_id: &str, capture_id: &str) -> bool {
+        let inner = self.inner.lock().expect("capture mutex poisoned");
+        let Some(record) = inner.captures.get(capture_id) else {
+            return false;
+        };
+        let Some(job) = inner.jobs.get(&record.job_id) else {
+            return false;
+        };
+        job.session_id == session_id
+            && job.capture_id.as_deref() == Some(capture_id)
+            && job.status == CaptureStatus::Completed
+            && job.labelable
     }
 
     fn trigger(&self, input: CaptureTriggerInput) -> Result<CaptureJobView, CaptureTriggerError> {
@@ -614,6 +648,12 @@ pub fn router(state: AppState) -> Router {
             get(capture_preview).fallback(method_not_allowed),
         )
         .route(
+            "/api/labels",
+            get(labels_snapshot)
+                .post(labels_apply)
+                .fallback(method_not_allowed),
+        )
+        .route(
             "/ws/input",
             get(input_ws_handshake).fallback(method_not_allowed),
         )
@@ -705,6 +745,7 @@ async fn start_session(
         .frame_previews
         .reset_session(&backend_session.session_id);
     state.captures.reset_session(&backend_session.session_id);
+    state.labels.reset();
     state.ws_events.reset_session(&backend_session.session_id);
     state.ws_input.reset_session(&backend_session.session_id);
 
@@ -802,6 +843,7 @@ async fn stop_session(
         .expect("runtime session mutex poisoned") = None;
     state.frame_previews.reset_session(&stopped.session_id);
     state.captures.reset_session(&stopped.session_id);
+    state.labels.reset();
     state.ws_events.reset_session(&stopped.session_id);
     state.ws_input.reset_session(&stopped.session_id);
     if let Err(error) = state.auth.clear_session_headers(&headers) {
@@ -1074,7 +1116,11 @@ async fn capture_recent(State(state): State<AppState>, headers: HeaderMap, uri: 
         captures: view
             .captures
             .into_iter()
-            .map(CaptureSummaryResponse::from)
+            .map(|summary| {
+                let mut response = CaptureSummaryResponse::from(summary);
+                response.labels = state.labels.label_names_for_capture(&response.capture_id);
+                response
+            })
             .collect(),
         next_cursor: view.next_cursor,
     })
@@ -1105,7 +1151,9 @@ async fn capture_detail(
         .into_response();
     };
 
-    let mut response = Json(CaptureDetailResponse::from(view)).into_response();
+    let mut detail = CaptureDetailResponse::from(view);
+    detail.labels = state.labels.label_names_for_capture(&detail.capture_id);
+    let mut response = Json(detail).into_response();
     apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
     response
 }
@@ -1141,6 +1189,71 @@ async fn capture_preview(
     response
         .headers_mut()
         .insert(CONTENT_TYPE, HeaderValue::from_static("image/png"));
+    response
+}
+
+async fn labels_apply(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(request): Json<LabelsRequest>,
+) -> Response {
+    if let Err(response) = authenticate_runtime_request(&state, &headers, &uri) {
+        return response;
+    }
+    if request.schema_version != RUNTIME_API_SCHEMA_VERSION {
+        return bad_request("Unsupported schema version.").into_response();
+    }
+    if !is_contract_id(&request.session_id) || !is_contract_uuid(&request.idempotency_key) {
+        return bad_request("Invalid labels request.").into_response();
+    }
+    if request.updates.is_empty() {
+        return bad_request("Invalid labels request.").into_response();
+    }
+    if let Err(response) = ensure_active_session(&state, &request.session_id) {
+        return response;
+    }
+
+    let store = (!state.config.private_config().is_placeholder())
+        .then(|| PrivateArtifactStore::new(state.config.private_config()));
+    let apply = LabelApplyRequest {
+        session_id: request.session_id.clone(),
+        idempotency_key: request.idempotency_key,
+        updates: request.updates,
+    };
+    let outcome = match state.labels.apply(
+        apply,
+        |capture_id| {
+            state
+                .captures
+                .is_labelable_capture(&request.session_id, capture_id)
+        },
+        store.as_ref(),
+    ) {
+        Ok(outcome) => outcome,
+        Err(LabelStoreError::BackendUnavailable) => {
+            return backend_error(BackendError::BackendUnavailable).into_response();
+        }
+        Err(LabelStoreError::Conflict(conflicts)) => LabelApplyOutcome {
+            applied: false,
+            label_revision: state.labels.snapshot().label_revision,
+            conflicts,
+        },
+    };
+    publish_label_event(&state, outcome.label_revision, outcome.applied);
+
+    let mut response = Json(LabelsResponse::from(outcome)).into_response();
+    apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
+    response
+}
+
+async fn labels_snapshot(State(state): State<AppState>, headers: HeaderMap, uri: Uri) -> Response {
+    if let Err(response) = authenticate_runtime_request(&state, &headers, &uri) {
+        return response;
+    }
+
+    let mut response = Json(LabelsSnapshotResponse::from(state.labels.snapshot())).into_response();
+    apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
     response
 }
 
@@ -1215,8 +1328,11 @@ async fn events_ws_handshake(
 
     let ws_events = state.ws_events.clone();
     let sanitizer = state.config.private_config().public_sanitizer();
+    let label_revision = state.labels.snapshot().label_revision;
     let mut response = ws
-        .on_upgrade(move |socket| serve_event_socket(socket, ws_events, sanitizer, status))
+        .on_upgrade(move |socket| {
+            serve_event_socket(socket, ws_events, sanitizer, status, label_revision)
+        })
         .into_response();
     apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
     response
@@ -1440,6 +1556,7 @@ fn cleanup_runtime_session(state: &AppState, reason: StopReason) -> Result<(), B
         .expect("runtime session mutex poisoned") = None;
     state.frame_previews.reset_session(&stopped.session_id);
     state.captures.reset_session(&stopped.session_id);
+    state.labels.reset();
     state.ws_events.reset_session(&stopped.session_id);
     state.ws_input.reset_session(&stopped.session_id);
     Ok(())
@@ -1475,6 +1592,16 @@ fn publish_capture_event(state: &AppState, session_id: &str, view: &CaptureJobVi
         view.capture_id.clone(),
         &sanitizer,
     );
+}
+
+fn publish_label_event(state: &AppState, label_revision: u64, applied: bool) {
+    let Ok(session_id) = active_session_id(state) else {
+        return;
+    };
+    let sanitizer = state.config.private_config().public_sanitizer();
+    let _ = state
+        .ws_events
+        .publish_label(&session_id, label_revision, applied, &sanitizer);
 }
 
 fn project_active_capture(
@@ -1751,6 +1878,74 @@ pub struct SanitizedProvenance {
     pub layout_hash: &'static str,
     pub capture_spec_hash: &'static str,
     pub map_hash: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LabelsRequest {
+    pub schema_version: u16,
+    pub session_id: String,
+    pub idempotency_key: String,
+    pub updates: Vec<LabelUpdate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LabelsResponse {
+    pub schema_version: u16,
+    pub applied: bool,
+    pub label_revision: u64,
+    pub conflicts: Vec<ErrorObject>,
+}
+
+impl From<LabelApplyOutcome> for LabelsResponse {
+    fn from(outcome: LabelApplyOutcome) -> Self {
+        Self {
+            schema_version: RUNTIME_API_SCHEMA_VERSION,
+            applied: outcome.applied,
+            label_revision: outcome.label_revision,
+            conflicts: outcome
+                .conflicts
+                .into_iter()
+                .map(ErrorObject::from)
+                .collect(),
+        }
+    }
+}
+
+impl From<LabelConflict> for ErrorObject {
+    fn from(conflict: LabelConflict) -> Self {
+        let code = match conflict.kind {
+            LabelConflictKind::LabelConflict => ErrorCode::LabelConflict,
+            LabelConflictKind::BadRequest => ErrorCode::BadRequest,
+        };
+        Self {
+            code,
+            message: conflict.message.to_string(),
+            retryable: conflict.retryable,
+            details: json!({}),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LabelsSnapshotResponse {
+    pub schema_version: u16,
+    pub label_revision: u64,
+    pub target_labels: crate::labels::LabelTargetSnapshot,
+    pub status_labels: Vec<crate::labels::StatusLabelSnapshot>,
+    pub dedup_groups: Vec<crate::labels::DedupGroup>,
+}
+
+impl From<LabelSnapshot> for LabelsSnapshotResponse {
+    fn from(snapshot: LabelSnapshot) -> Self {
+        Self {
+            schema_version: RUNTIME_API_SCHEMA_VERSION,
+            label_revision: snapshot.label_revision,
+            target_labels: snapshot.target_labels,
+            status_labels: snapshot.status_labels,
+            dedup_groups: snapshot.dedup_groups,
+        }
+    }
 }
 
 impl From<crate::backend::RunStatus> for RunStatusResponse {

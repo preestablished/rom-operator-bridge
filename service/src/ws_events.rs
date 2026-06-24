@@ -147,20 +147,46 @@ impl WsEventState {
         Ok(())
     }
 
+    pub(crate) fn publish_label(
+        &self,
+        session_id: &str,
+        label_revision: u64,
+        applied: bool,
+        sanitizer: &PublicSanitizer,
+    ) -> Result<(), WsEventError> {
+        ensure_json_safe(label_revision)?;
+        let mut inner = self.inner.lock().expect("ws event mutex poisoned");
+        let message = inner.message(
+            session_id,
+            "label_updated",
+            json!(LabelUpdatedPayload {
+                label_revision,
+                applied,
+            }),
+            sanitizer,
+        )?;
+        drop(inner);
+        self.publish(vec![message]);
+        Ok(())
+    }
+
     fn snapshot_messages(
         &self,
         status: &RunStatus,
+        label_revision: u64,
         sanitizer: &PublicSanitizer,
     ) -> Result<Vec<String>, WsEventError> {
-        self.status_messages(status, sanitizer)
+        self.status_messages(status, label_revision, sanitizer)
     }
 
     fn status_messages(
         &self,
         status: &RunStatus,
+        label_revision: u64,
         sanitizer: &PublicSanitizer,
     ) -> Result<Vec<String>, WsEventError> {
         ensure_json_safe(status.current_frame)?;
+        ensure_json_safe(label_revision)?;
 
         let mut inner = self.inner.lock().expect("ws event mutex poisoned");
         let mut messages = Vec::with_capacity(5);
@@ -202,7 +228,7 @@ impl WsEventState {
             &status.session_id,
             "label_updated",
             json!(LabelUpdatedPayload {
-                label_revision: 0,
+                label_revision,
                 applied: false,
             }),
             sanitizer,
@@ -232,9 +258,10 @@ pub async fn serve_event_socket(
     event_state: WsEventState,
     sanitizer: PublicSanitizer,
     status: RunStatus,
+    label_revision: u64,
 ) {
     let mut events = event_state.subscribe();
-    let Ok(messages) = event_state.snapshot_messages(&status, &sanitizer) else {
+    let Ok(messages) = event_state.snapshot_messages(&status, label_revision, &sanitizer) else {
         let _ = socket.send(Message::Close(None)).await;
         return;
     };
