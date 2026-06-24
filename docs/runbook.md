@@ -40,6 +40,10 @@ npm --prefix ui run build
 scripts/quality-gate.sh
 ```
 
+Ralph agents should use `scripts/quality-gate.sh` as the root VERIFY command.
+The command is documented in `docs/quality-gate.md` and is the extension point
+for later static redaction and synthetic integration gates.
+
 Run a service-only compile smoke when iterating on Rust service changes:
 
 ```sh
