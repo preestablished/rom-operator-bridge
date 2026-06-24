@@ -9,6 +9,7 @@ import {
 import {
   RuntimeApiClient,
   RuntimeWebSocketClient,
+  type FrameCurrentResponse,
   type RuntimeEventMessage,
   type RuntimeWsMessage,
   type ValidationUpdatedPayload
@@ -29,36 +30,53 @@ type OperatorViewModel = {
   validationState: "idle" | "queued" | "passed" | "failed";
   config: RuntimeConfig;
   auth: AuthSessionState;
+  preview: FrameCurrentResponse | null;
 };
 
 type OperatorRuntimeViewState = {
   validationState: OperatorViewModel["validationState"];
+  preview: FrameCurrentResponse | null;
 };
 
 export type RuntimeEventClient = Pick<RuntimeWebSocketClient, "eventSocket">;
+export type RuntimePreviewClient = Pick<RuntimeApiClient, "currentFrame">;
+type OperatorRuntimeClient = RuntimeSessionClient & Partial<RuntimePreviewClient>;
 
 const INITIAL_VIEW_MODEL: Omit<OperatorViewModel, "config" | "auth"> = {
   backendMode: "synthetic",
   sessionState: "idle",
   currentFrame: 0,
   previewState: "waiting",
-  validationState: "idle"
+  validationState: "idle",
+  preview: null
 };
 
 export function renderOperatorApp(
   config: RuntimeConfig,
   auth: AuthSessionState = initialAuthSessionState(),
-  runtimeView: OperatorRuntimeViewState = { validationState: INITIAL_VIEW_MODEL.validationState }
+  runtimeView: OperatorRuntimeViewState = {
+    validationState: INITIAL_VIEW_MODEL.validationState,
+    preview: null
+  }
 ): string {
   const model: OperatorViewModel = {
     ...INITIAL_VIEW_MODEL,
     backendMode: auth.session.backend_mode,
     sessionState: auth.session.state,
-    currentFrame: auth.session.current_frame,
-    previewState: auth.session.active ? (auth.session.preview_stale ? "stale" : "fresh") : "waiting",
+    currentFrame: runtimeView.preview?.frame ?? auth.session.current_frame,
+    previewState: auth.session.active
+      ? runtimeView.preview
+        ? runtimeView.preview.stale
+          ? "stale"
+          : "fresh"
+        : auth.session.preview_stale
+          ? "stale"
+          : "waiting"
+      : "waiting",
     validationState: runtimeView.validationState,
     config,
-    auth
+    auth,
+    preview: runtimeView.preview
   };
 
   return `
@@ -86,7 +104,9 @@ export function renderOperatorApp(
             </div>
             <span class="frame-counter">#${model.currentFrame}</span>
           </div>
-          <div class="preview-surface" aria-label="Framebuffer preview"></div>
+          <div class="preview-surface" aria-label="Framebuffer preview">
+            ${renderPreviewImage(model)}
+          </div>
         </article>
 
         <article class="panel input-panel">
@@ -126,13 +146,15 @@ export function renderOperatorApp(
 export function mountOperatorApp(
   root: HTMLElement,
   config: RuntimeConfig,
-  client: RuntimeSessionClient = new RuntimeApiClient(config),
+  client: OperatorRuntimeClient = new RuntimeApiClient(config),
   eventClient: RuntimeEventClient | null =
     typeof globalThis.WebSocket === "function" ? new RuntimeWebSocketClient(config) : null
 ): void {
   let auth = initialAuthSessionState();
   let authRequestSeq = 0;
+  let previewRequestSeq = 0;
   let validationState: OperatorViewModel["validationState"] = INITIAL_VIEW_MODEL.validationState;
+  let preview: FrameCurrentResponse | null = null;
   let eventSocket: ReturnType<RuntimeEventClient["eventSocket"]> | null = null;
   let eventSessionId: string | null = null;
   root.innerHTML = '<div data-operator-app></div><p class="session-live" aria-live="polite"></p>';
@@ -143,7 +165,7 @@ export function mountOperatorApp(
     if (!appRegion || !liveRegion) {
       return;
     }
-    appRegion.innerHTML = renderOperatorApp(config, auth, { validationState });
+    appRegion.innerHTML = renderOperatorApp(config, auth, { validationState, preview });
     liveRegion.textContent = sessionStatusLabel(auth);
     if (focusTarget) {
       focusSessionTarget(appRegion, focusTarget);
@@ -154,9 +176,15 @@ export function mountOperatorApp(
     if (requestSeq !== authRequestSeq) {
       return;
     }
+    const previousSessionId = auth.session.session_id;
     auth = next;
+    if (!auth.session.active || auth.session.session_id !== previousSessionId) {
+      preview = null;
+      previewRequestSeq += 1;
+    }
     syncEventStream();
     render(focusTargetForAuth(auth));
+    refreshPreview();
   };
 
   function closeEventStream() {
@@ -235,11 +263,52 @@ export function mountOperatorApp(
       closeEventStream();
       auth = initialAuthSessionState();
       validationState = INITIAL_VIEW_MODEL.validationState;
+      preview = null;
+      previewRequestSeq += 1;
       render("credential");
       return;
     }
 
     render();
+    if (message.type === "session_updated" || message.type === "run_updated") {
+      refreshPreview();
+    }
+  }
+
+  function refreshPreview() {
+    const currentFrame = client.currentFrame?.bind(client);
+    if (!currentFrame || auth.status !== "active" || !auth.session.session_id) {
+      return;
+    }
+    const requestSeq = ++previewRequestSeq;
+    const sessionId = auth.session.session_id;
+    currentFrame()
+      .then((nextPreview) => {
+        if (
+          requestSeq !== previewRequestSeq ||
+          auth.status !== "active" ||
+          auth.session.session_id !== sessionId
+        ) {
+          return;
+        }
+        preview = nextPreview;
+        auth = {
+          ...auth,
+          session: {
+            ...auth.session,
+            current_frame: nextPreview.frame,
+            last_preview_frame: nextPreview.frame,
+            preview_stale: nextPreview.stale
+          }
+        };
+        render();
+      })
+      .catch(() => {
+        if (requestSeq === previewRequestSeq) {
+          preview = null;
+          render();
+        }
+      });
   }
 
   root.addEventListener("submit", (event) => {
@@ -258,6 +327,8 @@ export function mountOperatorApp(
     const requestSeq = ++authRequestSeq;
     auth = { ...auth, status: "starting", error: null };
     validationState = INITIAL_VIEW_MODEL.validationState;
+    preview = null;
+    previewRequestSeq += 1;
     render();
     submitCredential(auth, client, credential).then((next) => {
       applyAuthResult(requestSeq, next);
@@ -274,6 +345,8 @@ export function mountOperatorApp(
     const stateToStop = auth;
     const requestSeq = ++authRequestSeq;
     auth = { ...auth, status: "stopping", error: null };
+    preview = null;
+    previewRequestSeq += 1;
     syncEventStream();
     render();
     logoutSession(stateToStop, client).then((next) => {
@@ -281,11 +354,43 @@ export function mountOperatorApp(
     });
   });
 
+  root.addEventListener(
+    "error",
+    (event) => {
+      const target = event.target instanceof Element ? event.target : null;
+      if (!target?.matches("[data-preview-image]") || auth.status !== "active") {
+        return;
+      }
+      preview = null;
+      previewRequestSeq += 1;
+      render();
+      const refreshSeq = ++authRequestSeq;
+      refreshSession(auth, client).then((next) => {
+        applyAuthResult(refreshSeq, next);
+      });
+    },
+    true
+  );
+
   render("credential");
   const refreshSeq = ++authRequestSeq;
   refreshSession(auth, client).then((next) => {
     applyAuthResult(refreshSeq, next);
   });
+}
+
+function renderPreviewImage(model: OperatorViewModel): string {
+  if (!model.auth.session.active || !model.preview) {
+    return "";
+  }
+  return `<img
+    src="${escapeHtml(model.preview.image_url)}"
+    width="${model.preview.width}"
+    height="${model.preview.height}"
+    alt="Framebuffer preview"
+    data-preview-image
+    data-preview-hash="${escapeHtml(model.preview.preview_hash)}"
+  />`;
 }
 
 function isRuntimeEvent(message: RuntimeWsMessage): message is RuntimeEventMessage {

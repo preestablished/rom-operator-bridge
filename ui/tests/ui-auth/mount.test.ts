@@ -2,7 +2,7 @@
 
 import { describe, expect, it, vi } from "vitest";
 import { mountOperatorApp } from "../../src/app";
-import type { RuntimeEventClient } from "../../src/app";
+import type { RuntimeEventClient, RuntimePreviewClient } from "../../src/app";
 import type { RuntimeSessionClient } from "../../src/authSession";
 import { RuntimeApiError } from "../../src/runtimeClient";
 import type { RuntimeWsMessage } from "../../src/runtimeClient";
@@ -131,7 +131,8 @@ describe("mounted auth/session screen", () => {
   it("subscribes active sessions to runtime events and renders live run updates", async () => {
     const eventClient = mockEventClient();
     const client = mockClient({
-      sessionStatus: vi.fn().mockResolvedValue(activeSessionResponse())
+      sessionStatus: vi.fn().mockResolvedValue(activeSessionResponse()),
+      currentFrame: vi.fn().mockResolvedValue(frameCurrentResponse(18))
     });
     const root = document.createElement("div");
 
@@ -153,14 +154,57 @@ describe("mounted auth/session screen", () => {
         active_capture_job_id: null
       }
     });
+    await flushPromises();
 
     expect(root.textContent).toContain("paused");
     expect(root.textContent).toContain("#18");
     expect(root.textContent).toContain("fresh");
   });
+
+  it("renders current frame preview metadata for active sessions", async () => {
+    const client = mockClient({
+      sessionStatus: vi.fn().mockResolvedValue(activeSessionResponse()),
+      currentFrame: vi.fn().mockResolvedValue(frameCurrentResponse())
+    });
+    const root = document.createElement("div");
+
+    mountOperatorApp(root, config, client, null);
+    await flushPromises();
+
+    const image = root.querySelector<HTMLImageElement>("[data-preview-image]");
+    expect(client.currentFrame).toHaveBeenCalledTimes(1);
+    expect(root.textContent).toContain("#21");
+    expect(root.textContent).toContain("fresh");
+    expect(image?.getAttribute("src")).toBe("/api/frame/current/image?frame=21");
+    expect(image?.dataset.previewHash).toBe(frameCurrentResponse().preview_hash);
+  });
+
+  it("rechecks session state when the protected preview image fails", async () => {
+    const client = mockClient({
+      sessionStatus: vi
+        .fn()
+        .mockResolvedValueOnce(activeSessionResponse())
+        .mockResolvedValueOnce({ schema_version: 1, active: false, state: "idle" }),
+      currentFrame: vi.fn().mockResolvedValue(frameCurrentResponse())
+    });
+    const root = document.createElement("div");
+
+    mountOperatorApp(root, config, client, null);
+    await flushPromises();
+    root
+      .querySelector<HTMLImageElement>("[data-preview-image]")
+      ?.dispatchEvent(new Event("error"));
+    await flushPromises();
+
+    expect(client.sessionStatus).toHaveBeenCalledTimes(2);
+    expect(root.querySelector("form[data-session-form='start']")).not.toBeNull();
+    expect(root.textContent).not.toContain("session-001");
+  });
 });
 
-function mockClient(overrides: Partial<RuntimeSessionClient> = {}): RuntimeSessionClient {
+type MockRuntimeClient = RuntimeSessionClient & Partial<RuntimePreviewClient>;
+
+function mockClient(overrides: Partial<MockRuntimeClient> = {}): MockRuntimeClient {
   return {
     startSession: vi.fn().mockResolvedValue(startSessionResponse()),
     sessionStatus: vi.fn().mockResolvedValue({ schema_version: 1, active: false, state: "idle" }),
@@ -188,6 +232,20 @@ function mockEventClient(): {
   };
 }
 
+function frameCurrentResponse(frame = 21) {
+  return {
+    schema_version: 1,
+    frame,
+    captured_at: "1970-01-01T00:00:00Z",
+    stale: false,
+    width: 256,
+    height: 224,
+    format: "image/png",
+    image_url: `/api/frame/current/image?frame=${frame}`,
+    preview_hash: "sha256:0123456789abcdef"
+  };
+}
+
 function deferred<T>(defaultValue: T): {
   promise: Promise<T>;
   resolve: (value?: T) => void;
@@ -203,8 +261,9 @@ function deferred<T>(defaultValue: T): {
 }
 
 async function flushPromises(): Promise<void> {
-  await Promise.resolve();
-  await Promise.resolve();
+  for (let index = 0; index < 4; index += 1) {
+    await Promise.resolve();
+  }
 }
 
 function activeSessionResponse(sessionId = "session-001") {
