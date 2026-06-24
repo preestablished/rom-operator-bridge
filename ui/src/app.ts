@@ -489,6 +489,8 @@ export function mountOperatorApp(
         recordRecoveryEvent({ code: "websocket_reconnect" });
         clearDisconnectedInputState();
         syncInputCaptureLifecycle();
+        refreshRunStatus();
+        refreshPreview();
         render();
       }
     });
@@ -626,6 +628,9 @@ export function mountOperatorApp(
     clearInputSources(false);
     padlogTail = applyInputRejectToState(message, padlogTail);
     auth = { ...auth, error: message.payload.error };
+    if (message.payload.error.code === "session_inactive") {
+      closeInputStream(false);
+    }
   }
 
   function refreshRunStatus() {
@@ -646,6 +651,7 @@ export function mountOperatorApp(
           return;
         }
         auth = { ...auth, session: applyRunStatus(auth.session, status), error: null };
+        clearRecoveryEvents("backend_unavailable", "websocket_reconnect");
         syncCaptureFromActiveJob(status.active_capture_job_id);
         render();
       })
@@ -662,6 +668,10 @@ export function mountOperatorApp(
     if (!jobId) {
       if (captureJob && isActiveCaptureStatus(captureJob.status)) {
         captureJob = null;
+      }
+      if (captureErrorCode === "capture_in_progress") {
+        captureError = null;
+        captureErrorCode = null;
       }
       capturePending = false;
       return;
@@ -699,18 +709,20 @@ export function mountOperatorApp(
         preview = nextPreview;
         auth = {
           ...auth,
+          error: auth.error?.code === "backend_unavailable" ? null : auth.error,
           session: {
             ...auth.session,
             last_preview_frame: nextPreview.frame,
             preview_stale: nextPreview.stale
           }
         };
+        clearRecoveryEvents("backend_unavailable");
         render();
       })
-      .catch(() => {
+      .catch((error) => {
         if (requestSeq === previewRequestSeq) {
           preview = null;
-          recordRecoveryEvent({ code: "backend_unavailable" });
+          auth = { ...auth, error: runtimeDisplayError(error, "backend_unavailable") };
           render();
         }
       });
@@ -912,10 +924,18 @@ export function mountOperatorApp(
   root.addEventListener("pointercancel", releasePadButtons);
   root.addEventListener("pointerleave", releasePadButtons);
   globalThis.addEventListener?.("pointerup", releasePadButtons);
-  globalThis.addEventListener?.("gamepadconnected", () => startGamepadPolling());
+  globalThis.addEventListener?.("gamepadconnected", () => {
+    const changed = clearRecoveryEvents("gamepad_disconnected");
+    startGamepadPolling();
+    if (changed) {
+      render();
+    }
+  });
   globalThis.addEventListener?.("gamepaddisconnected", () => {
     stopGamepadPolling();
-    recordRecoveryEvent({ code: "gamepad_disconnected" });
+    if (auth.status === "active" && auth.session.session_id) {
+      recordRecoveryEvent({ code: "gamepad_disconnected" });
+    }
     if (gamepadButtons.length === 0) {
       render();
       return;
@@ -1022,10 +1042,13 @@ export function mountOperatorApp(
       if (requestSeq !== captureRequestSeq) {
         return;
       }
-      capturePending = false;
       const displayError = runtimeDisplayError(error, "capture_failed");
+      capturePending = displayError.code === "capture_in_progress";
       captureError = displayError.message;
       captureErrorCode = displayError.code;
+      if (displayError.code === "capture_in_progress") {
+        refreshRunStatus();
+      }
       render();
     }
   }
@@ -1091,6 +1114,15 @@ export function mountOperatorApp(
       ...recoveryEvents.filter((current) => current.code !== event.code),
       { code: event.code, message: event.message ? safeBrowserMessage(event.message) : undefined }
     ].slice(-4);
+  }
+
+  function clearRecoveryEvents(...codes: RecoveryCode[]): boolean {
+    const nextEvents = recoveryEvents.filter((event) => !codes.includes(event.code));
+    if (nextEvents.length === recoveryEvents.length) {
+      return false;
+    }
+    recoveryEvents = nextEvents;
+    return true;
   }
 
   function clearInputSources(sendRelease = true): boolean {
@@ -1415,7 +1447,7 @@ function recoverySeverity(code: RecoveryCode): RecoveryNotice["severity"] {
 }
 
 function inputBlockingError(code: RuntimeErrorCode | undefined): boolean {
-  return code === "backend_unavailable" || code === "frame_stale";
+  return code === "backend_unavailable" || code === "frame_stale" || code === "session_inactive";
 }
 
 function applyInputAckToState(
@@ -1795,6 +1827,7 @@ function captureButtonDisabled(model: OperatorViewModel): boolean {
     model.controlsDisabled ||
     model.capturePending ||
     model.activeCaptureJobId !== null ||
+    model.captureErrorCode === "capture_in_progress" ||
     !model.preview ||
     !model.auth.session.capabilities?.capture
   );

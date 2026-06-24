@@ -10,7 +10,13 @@ import {
   type RuntimeRunClient
 } from "../../src/app";
 import type { AuthSessionState, RuntimeSessionClient } from "../../src/authSession";
-import { RuntimeApiError, type RuntimeErrorCode } from "../../src/runtimeClient";
+import {
+  RuntimeApiError,
+  type CaptureJobResponse,
+  type RunStatusResponse,
+  type RuntimeErrorCode,
+  type RuntimeWsMessage
+} from "../../src/runtimeClient";
 import type { RuntimeConfig } from "../../src/runtimeConfig";
 
 const config: RuntimeConfig = {
@@ -107,6 +113,9 @@ describe("browser-safe recovery states", () => {
       socketClient.triggerReconnect();
       expect(recovery(root, "websocket_reconnect")?.textContent).toContain("Input was cleared");
       expectSafe(root);
+
+      await flushPromises();
+      expect(recovery(root, "websocket_reconnect")).toBeNull();
     } finally {
       root.remove();
       vi.restoreAllMocks();
@@ -139,6 +148,32 @@ describe("browser-safe recovery states", () => {
     await flushPromises();
     expect(recovery(activeRoot, "backend_unavailable")?.textContent).toContain("Backend unavailable");
     expectSafe(activeRoot);
+
+    const currentFrame = vi
+      .fn()
+      .mockRejectedValueOnce(new Error(unsafeText))
+      .mockResolvedValueOnce(frameCurrentResponse(13, false));
+    const previewRoot = document.createElement("div");
+    const previewSocket = mockSocketClient();
+    mountOperatorApp(
+      previewRoot,
+      config,
+      mockClient({
+        sessionStatus: vi.fn().mockResolvedValue(activeSessionResponse()),
+        runStatus: vi.fn().mockResolvedValue(runStatusResponse({ preview_stale: false })),
+        currentFrame
+      }),
+      previewSocket.client
+    );
+    await flushPromises();
+    expect(recovery(previewRoot, "backend_unavailable")?.textContent).toContain("Backend unavailable");
+    expect(previewRoot.querySelector<HTMLButtonElement>("[data-pad-button='A']")?.disabled).toBe(true);
+    expectSafe(previewRoot);
+
+    previewSocket.emitEvent(runUpdated());
+    await flushPromises();
+    expect(recovery(previewRoot, "backend_unavailable")).toBeNull();
+    expect(previewRoot.querySelector<HTMLButtonElement>("[data-pad-button='A']")?.disabled).toBe(false);
   });
 
   it("renders capture in-progress and capture failed API recovery without leaking raw details", async () => {
@@ -148,16 +183,20 @@ describe("browser-safe recovery states", () => {
       config,
       mockClient({
         sessionStatus: vi.fn().mockResolvedValue(activeSessionResponse()),
-        runStatus: vi.fn().mockResolvedValue(runStatusResponse({ preview_stale: false })),
+        runStatus: vi
+          .fn()
+          .mockResolvedValue(runStatusResponse({ preview_stale: false, active_capture_job_id: "job-001" })),
         currentFrame: vi.fn().mockResolvedValue(frameCurrentResponse(12, false)),
-        triggerCapture: vi.fn().mockRejectedValue(runtimeApiError("capture_in_progress", "Capture already running."))
+        triggerCapture: vi.fn().mockRejectedValue(runtimeApiError("capture_in_progress", "Capture already running.")),
+        captureJob: vi.fn().mockResolvedValue(captureJobResponse())
       }),
       null
     );
     await flushPromises();
     inProgressRoot.querySelector<HTMLButtonElement>("[data-run-action='capture']")?.click();
     await flushPromises();
-    expect(recovery(inProgressRoot, "capture_in_progress")?.textContent).toContain("Capture already running.");
+    expect(recovery(inProgressRoot, "capture_in_progress")?.textContent).toContain("Capture in progress");
+    expect(inProgressRoot.querySelector<HTMLButtonElement>("[data-run-action='capture']")?.disabled).toBe(true);
 
     const failedRoot = document.createElement("div");
     mountOperatorApp(
@@ -176,6 +215,40 @@ describe("browser-safe recovery states", () => {
     await flushPromises();
     expect(recovery(failedRoot, "capture_failed")?.textContent).toContain("Capture failed");
     expectSafe(failedRoot);
+  });
+
+  it("blocks input after session-inactive input rejection", async () => {
+    vi.spyOn(document, "hasFocus").mockReturnValue(true);
+    const socketClient = mockSocketClient();
+    const root = document.createElement("div");
+    document.body.append(root);
+
+    try {
+      mountOperatorApp(
+        root,
+        config,
+        mockClient({
+          sessionStatus: vi.fn().mockResolvedValue(activeSessionResponse()),
+          runStatus: vi.fn().mockResolvedValue(runStatusResponse({ preview_stale: false })),
+          currentFrame: vi.fn().mockResolvedValue(frameCurrentResponse(12, false))
+        }),
+        socketClient.client
+      );
+      await flushPromises();
+
+      socketClient.emitInput(inputReject("session_inactive", "Session is no longer active."));
+      await flushPromises();
+
+      expect(recovery(root, "session_inactive")?.textContent).toContain("Session is no longer active");
+      const button = root.querySelector<HTMLButtonElement>("[data-pad-button='A']");
+      expect(button?.disabled).toBe(true);
+      const sendsAfterReject = socketClient.sendInput.mock.calls.length;
+      button?.click();
+      expect(socketClient.sendInput).toHaveBeenCalledTimes(sendsAfterReject);
+    } finally {
+      root.remove();
+      vi.restoreAllMocks();
+    }
   });
 });
 
@@ -276,21 +349,34 @@ function mockClient(overrides: Partial<MockRuntimeClient> = {}): MockRuntimeClie
 
 function mockSocketClient(): {
   client: RuntimeEventClient & RuntimeInputClient;
+  sendInput: ReturnType<typeof vi.fn>;
   triggerReconnect: () => void;
+  emitEvent: (message: RuntimeWsMessage) => void;
+  emitInput: (message: RuntimeWsMessage) => void;
 } {
+  let onEventMessage: ((message: RuntimeWsMessage) => void) | undefined;
+  let onInputMessage: ((message: RuntimeWsMessage) => void) | undefined;
   let onInputReconnect: (() => void) | undefined;
+  const sendInput = vi.fn();
   return {
     client: {
-      eventSocket: vi.fn(() => ({ close: vi.fn() }) as unknown as ReturnType<RuntimeEventClient["eventSocket"]>),
+      eventSocket: vi.fn((handlers = {}) => {
+        onEventMessage = handlers.onMessage;
+        return { close: vi.fn() } as unknown as ReturnType<RuntimeEventClient["eventSocket"]>;
+      }),
       inputSocket: vi.fn((_, __, handlers = {}) => {
+        onInputMessage = handlers.onMessage;
         onInputReconnect = handlers.onReconnect;
         return {
           close: vi.fn(),
-          sendInput: vi.fn()
+          sendInput
         } as unknown as ReturnType<RuntimeInputClient["inputSocket"]>;
       })
     },
-    triggerReconnect: () => onInputReconnect?.()
+    sendInput,
+    triggerReconnect: () => onInputReconnect?.(),
+    emitEvent: (message) => onEventMessage?.(message),
+    emitInput: (message) => onInputMessage?.(message)
   };
 }
 
@@ -306,11 +392,11 @@ function activeSessionResponse() {
   };
 }
 
-function runStatusResponse(overrides: Partial<ReturnType<typeof baseRunStatusResponse>> = {}) {
+function runStatusResponse(overrides: Partial<RunStatusResponse> = {}): RunStatusResponse {
   return { ...baseRunStatusResponse(), ...overrides };
 }
 
-function baseRunStatusResponse() {
+function baseRunStatusResponse(): RunStatusResponse {
   return {
     schema_version: 1,
     session_id: "session-001",
@@ -337,6 +423,55 @@ function frameCurrentResponse(frame = 21, stale = false) {
     format: "image/png",
     image_url: `/api/frame/current/image?frame=${frame}`,
     preview_hash: "sha256:0123456789abcdef"
+  };
+}
+
+function captureJobResponse(overrides: Partial<CaptureJobResponse> = {}): CaptureJobResponse {
+  return {
+    schema_version: 1,
+    job_id: "job-001",
+    status: "capturing",
+    requested_frame: 12,
+    scheduled_frame: 13,
+    captured_frame: null,
+    capture_id: null,
+    labelable: false,
+    has_preview: false,
+    error: null,
+    ...overrides
+  };
+}
+
+function runUpdated(overrides: Partial<Extract<RuntimeWsMessage, { type: "run_updated" }>["payload"]> = {}): RuntimeWsMessage {
+  return {
+    schema_version: 1,
+    type: "run_updated",
+    session_id: "session-001",
+    client_seq: null,
+    source_id: "server",
+    server_seq: 1,
+    payload: {
+      state: "running",
+      current_frame: 13,
+      preview_stale: false,
+      active_capture_job_id: null,
+      ...overrides
+    }
+  };
+}
+
+function inputReject(code: RuntimeErrorCode, message: string): RuntimeWsMessage {
+  return {
+    schema_version: 1,
+    type: "input_reject",
+    session_id: "session-001",
+    client_seq: 1,
+    source_id: "combined",
+    server_seq: null,
+    payload: {
+      schema_version: 1,
+      error: errorDisplay(code, message)
+    }
   };
 }
 
