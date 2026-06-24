@@ -9,5 +9,6 @@ pub mod labels;
 pub mod private_config;
 pub mod sanitization;
 pub mod telemetry;
+pub mod verifier;
 pub mod ws_events;
 pub mod ws_input;
