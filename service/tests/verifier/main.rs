@@ -1,5 +1,5 @@
 use rom_operator_bridge_service::{
-    config::ServiceConfig,
+    config::{ENV_BIND_ADDR, ServiceConfig},
     labels::{
         ChangedOffsetRange, DedupGroup, DedupRelation, DedupStatus, LabelSnapshot,
         LabelTargetSnapshot, StatusLabelRole, StatusLabelSnapshot,
@@ -27,6 +27,11 @@ fn score_plan_inputs_cover_required_target_labels() {
     assert_eq!(inputs.score_plan.first_boss, "capture-first");
     assert_eq!(inputs.score_plan.goal_positive, "capture-positive");
     assert_eq!(inputs.score_plan.goal_negative, "capture-negative");
+    assert_eq!(inputs.score_plan.command_class, "phase4-score-plan");
+    assert_eq!(
+        inputs.score_plan.working_directory.relative_path(),
+        Path::new(".")
+    );
     assert_eq!(
         inputs.score_plan.arguments,
         [
@@ -42,15 +47,29 @@ fn score_plan_inputs_cover_required_target_labels() {
             "capture-negative",
         ]
     );
+    let resolved_arguments = inputs.score_plan.resolved_arguments(&private_root);
+    assert_eq!(resolved_arguments[0], "phase4-score-plan");
+    assert_eq!(resolved_arguments[1], "--captures");
+    assert!(resolved_arguments[2].contains(&private_root.display().to_string()));
+    assert!(resolved_arguments[2].ends_with("captures/index.jsonl"));
+    assert_eq!(resolved_arguments[3], "--out");
+    assert!(resolved_arguments[4].contains(&private_root.display().to_string()));
+    assert!(resolved_arguments[4].ends_with("validation/score-plan.json"));
 
     let score_plan_input = read_json(private_root.join("validation/phase4-score-plan-input.json"));
     assert_eq!(score_plan_input["schema_version"], 1);
     assert_eq!(score_plan_input["kind"], "phase4-score-plan-input");
     assert_eq!(score_plan_input["command_class"], "phase4-score-plan");
     assert_eq!(score_plan_input["label_revision"], 7);
-    assert_eq!(score_plan_input["first_boss"], "capture-first");
-    assert_eq!(score_plan_input["goal_positive"], "capture-positive");
-    assert_eq!(score_plan_input["goal_negative"], "capture-negative");
+    assert_eq!(score_plan_input["labels"]["first_boss"], "capture-first");
+    assert_eq!(
+        score_plan_input["labels"]["goal_positive"],
+        "capture-positive"
+    );
+    assert_eq!(
+        score_plan_input["labels"]["goal_negative"],
+        "capture-negative"
+    );
     assert_eq!(score_plan_input["captures"], "captures/index.jsonl");
     assert_eq!(score_plan_input["out"], "validation/score-plan.json");
     assert_eq!(
@@ -76,6 +95,7 @@ fn dedup_artifact_generation_writes_private_jsonl() {
         .map(|line| serde_json::from_str(line).expect("dedup row parses"))
         .collect();
     assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["schema_version"], 1);
     assert_eq!(rows[0]["group_id"], "dedup-same");
     assert_eq!(rows[0]["expected_relation"], "same_canonical_state");
     assert_eq!(
@@ -83,10 +103,13 @@ fn dedup_artifact_generation_writes_private_jsonl() {
         json!(["capture-first", "capture-positive"])
     );
     assert_eq!(rows[0]["changed_features"], json!(["volatile_rng"]));
+    assert!(rows[0].get("status").is_none());
+    assert_eq!(rows[1]["schema_version"], 1);
     assert_eq!(rows[1]["group_id"], "dedup-distinct");
     assert_eq!(rows[1]["expected_relation"], "distinct_stable_state");
     assert_eq!(rows[1]["changed_offset_ranges"][0]["start"], 16);
     assert_eq!(rows[1]["changed_offset_ranges"][0]["len"], 4);
+    assert!(rows[1].get("status").is_none());
 
     for row in rows {
         assert_no_private_root(&row, &private_root);
@@ -140,7 +163,8 @@ fn conflicting_labels_are_reported_before_artifact_generation() {
 
     let error = write_phase4_verifier_inputs(config.private_config(), &snapshot)
         .expect_err("conflicting labels fail");
-    let VerifierTransformError::ConflictingLabels(conflicts) = error else {
+    assert_private_error_is_redacted(&error, &["capture-shared", "capture-negative"]);
+    let VerifierTransformError::ConflictingLabels(conflicts) = &error else {
         panic!("expected conflicting labels error");
     };
     assert_eq!(conflicts.len(), 2);
@@ -186,10 +210,119 @@ fn private_config_and_report_paths_stay_server_side() {
     );
     assert_private_path_display_is_redacted(&inputs.private_artifacts.score_plan_input);
     assert_private_path_display_is_redacted(&inputs.private_artifacts.score_plan_report);
+    let private_artifacts_debug = format!("{:?}", inputs.private_artifacts);
+    assert!(!private_artifacts_debug.contains(&private_root.display().to_string()));
+    assert!(!private_artifacts_debug.contains("validation/score-plan.json"));
+    let inputs_debug = format!("{inputs:?}");
+    for private_detail in [
+        private_root.display().to_string(),
+        "captures/index.jsonl".to_string(),
+        "validation/score-plan.json".to_string(),
+        "validation/phase4-score-plan.json".to_string(),
+        "dedup-groups.jsonl".to_string(),
+        "capture-first".to_string(),
+        "capture-positive".to_string(),
+        "capture-negative".to_string(),
+    ] {
+        assert!(!inputs_debug.contains(&private_detail));
+    }
+}
+
+#[test]
+fn placeholder_private_config_is_rejected() {
+    let config = ServiceConfig::from_pairs([(ENV_BIND_ADDR, "127.0.0.1:0")]).expect("config loads");
+
+    let error = write_phase4_verifier_inputs(config.private_config(), &verifier_snapshot())
+        .expect_err("placeholder private config fails");
+
+    assert!(matches!(
+        error,
+        VerifierTransformError::MissingPrivateConfig
+    ));
+}
+
+#[test]
+fn invalid_dedup_groups_are_reported_without_writing_outputs() {
+    let (_workspace, config, private_root) = private_config();
+    let mut snapshot = verifier_snapshot();
+    snapshot.dedup_groups = vec![
+        DedupGroup {
+            group_id: "dedup-invalid".to_string(),
+            expected_relation: DedupRelation::SameCanonicalState,
+            capture_ids: vec!["capture-first".to_string()],
+            changed_features: Vec::new(),
+            changed_offset_ranges: Vec::new(),
+            status: Some(DedupStatus::Conflict),
+        },
+        DedupGroup {
+            group_id: "dedup-invalid".to_string(),
+            expected_relation: DedupRelation::DistinctStableState,
+            capture_ids: vec![
+                "capture-positive".to_string(),
+                "capture-positive".to_string(),
+            ],
+            changed_features: vec!["stable_goal".to_string(), "stable_goal".to_string()],
+            changed_offset_ranges: vec![ChangedOffsetRange { start: 16, len: 0 }],
+            status: Some(DedupStatus::Candidate),
+        },
+    ];
+
+    let error = write_phase4_verifier_inputs(config.private_config(), &snapshot)
+        .expect_err("invalid dedup groups fail");
+    assert_private_error_is_redacted(&error, &["dedup-invalid", "capture-positive"]);
+    let VerifierTransformError::InvalidDedupGroups(conflicts) = &error else {
+        panic!("expected invalid dedup groups error");
+    };
+    for expected_code in [
+        "dedup_conflict_status",
+        "dedup_duplicate_group",
+        "dedup_too_small",
+        "dedup_missing_change",
+        "dedup_duplicate_capture",
+        "dedup_duplicate_changed_feature",
+        "dedup_empty_offset_range",
+        "dedup_missing_same_canonical_state",
+    ] {
+        assert!(
+            conflicts
+                .iter()
+                .any(|conflict| conflict.code == expected_code),
+            "missing conflict code {expected_code}"
+        );
+    }
     assert!(
-        !format!("{:?}", inputs.private_artifacts).contains(&private_root.display().to_string())
+        !private_root
+            .join("validation/phase4-score-plan-input.json")
+            .exists()
     );
-    assert!(!format!("{:?}", inputs.private_artifacts).contains("validation/score-plan.json"));
+    assert!(!private_root.join("dedup-groups.jsonl").exists());
+}
+
+#[test]
+fn dedup_artifact_requires_both_relation_classes() {
+    let (_workspace, config, private_root) = private_config();
+    let mut snapshot = verifier_snapshot();
+    snapshot
+        .dedup_groups
+        .retain(|group| group.expected_relation == DedupRelation::SameCanonicalState);
+
+    let error = write_phase4_verifier_inputs(config.private_config(), &snapshot)
+        .expect_err("missing relation class fails");
+
+    let VerifierTransformError::InvalidDedupGroups(conflicts) = &error else {
+        panic!("expected invalid dedup groups error");
+    };
+    assert!(
+        conflicts
+            .iter()
+            .any(|conflict| conflict.code == "dedup_missing_distinct_stable_state")
+    );
+    assert!(
+        !private_root
+            .join("validation/phase4-score-plan-input.json")
+            .exists()
+    );
+    assert!(!private_root.join("dedup-groups.jsonl").exists());
 }
 
 fn verifier_snapshot() -> LabelSnapshot {
@@ -258,4 +391,13 @@ fn assert_no_private_root(value: &Value, private_root: &Path) {
 fn assert_private_path_display_is_redacted(path: &PrivateVerifierPath) {
     assert_eq!(format!("{path}"), "[private verifier path]");
     assert_eq!(format!("{path:?}"), "[private verifier path]");
+}
+
+fn assert_private_error_is_redacted(error: &VerifierTransformError, private_details: &[&str]) {
+    let display = error.to_string();
+    let debug = format!("{error:?}");
+    for private_detail in private_details {
+        assert!(!display.contains(private_detail));
+        assert!(!debug.contains(private_detail));
+    }
 }

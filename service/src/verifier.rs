@@ -1,13 +1,15 @@
 use crate::{
     artifacts::ARTIFACT_SCHEMA_VERSION,
-    labels::{DedupGroup, LabelSnapshot, StatusLabelRole},
+    labels::{
+        ChangedOffsetRange, DedupGroup, DedupRelation, DedupStatus, LabelSnapshot, StatusLabelRole,
+    },
     private_config::{BridgePrivateConfig, PrivateConfigError},
 };
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 use thiserror::Error;
 
@@ -29,14 +31,15 @@ pub fn write_phase4_verifier_inputs(
     let dedup_groups = validate_dedup_groups(&snapshot.dedup_groups)?;
     let request = Phase4ScorePlanInputFile::new(snapshot.label_revision, &targets);
     let input_bytes = serde_json::to_vec_pretty(&request)?;
-    private_config.write_private_file_atomic(SCORE_PLAN_INPUT_PATH, &input_bytes)?;
 
     let mut dedup_bytes = Vec::new();
     for group in dedup_groups {
-        serde_json::to_writer(&mut dedup_bytes, group)?;
+        serde_json::to_writer(&mut dedup_bytes, &DedupArtifactRow::from(group))?;
         dedup_bytes.push(b'\n');
     }
+
     private_config.write_private_file_atomic(DEDUP_GROUPS_PATH, &dedup_bytes)?;
+    private_config.write_private_file_atomic(SCORE_PLAN_INPUT_PATH, &input_bytes)?;
 
     Ok(Phase4VerifierInputs {
         score_plan: Phase4ScorePlanInvocation::new(targets),
@@ -44,14 +47,26 @@ pub fn write_phase4_verifier_inputs(
     })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Phase4VerifierInputs {
     pub score_plan: Phase4ScorePlanInvocation,
     pub private_artifacts: Phase4PrivateArtifacts,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl fmt::Debug for Phase4VerifierInputs {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Phase4VerifierInputs")
+            .field("score_plan", &self.score_plan)
+            .field("private_artifacts", &self.private_artifacts)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct Phase4ScorePlanInvocation {
+    pub command_class: &'static str,
+    pub working_directory: PrivateVerifierPath,
     pub arguments: Vec<String>,
     pub first_boss: String,
     pub goal_positive: String,
@@ -61,6 +76,8 @@ pub struct Phase4ScorePlanInvocation {
 impl Phase4ScorePlanInvocation {
     fn new(targets: RequiredTargets) -> Self {
         Self {
+            command_class: "phase4-score-plan",
+            working_directory: PrivateVerifierPath::new("."),
             arguments: vec![
                 "--captures".to_string(),
                 CAPTURES_INDEX_PATH.to_string(),
@@ -77,6 +94,38 @@ impl Phase4ScorePlanInvocation {
             goal_positive: targets.goal_positive,
             goal_negative: targets.goal_negative,
         }
+    }
+
+    pub fn resolved_arguments(&self, private_root: impl AsRef<Path>) -> Vec<String> {
+        let private_root = private_root.as_ref();
+        vec![
+            self.command_class.to_string(),
+            "--captures".to_string(),
+            private_root.join(CAPTURES_INDEX_PATH).display().to_string(),
+            "--out".to_string(),
+            private_root
+                .join(SCORE_PLAN_OUTPUT_PATH)
+                .display()
+                .to_string(),
+            "--first-boss".to_string(),
+            self.first_boss.clone(),
+            "--goal-positive".to_string(),
+            self.goal_positive.clone(),
+            "--goal-negative".to_string(),
+            self.goal_negative.clone(),
+        ]
+    }
+}
+
+impl fmt::Debug for Phase4ScorePlanInvocation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Phase4ScorePlanInvocation")
+            .field("command_class", &self.command_class)
+            .field("working_directory", &self.working_directory)
+            .field("argument_count", &self.arguments.len())
+            .field("targets", &"[private capture ids]")
+            .finish()
     }
 }
 
@@ -121,9 +170,14 @@ pub struct PrivateVerifierPath {
 
 impl PrivateVerifierPath {
     fn new(path: impl Into<PathBuf>) -> Self {
-        Self {
-            relative_path: path.into(),
-        }
+        let relative_path = path.into();
+        debug_assert!(
+            relative_path.is_relative()
+                && !relative_path
+                    .components()
+                    .any(|component| matches!(component, Component::ParentDir))
+        );
+        Self { relative_path }
     }
 
     pub fn relative_path(&self) -> &Path {
@@ -147,11 +201,11 @@ impl fmt::Display for PrivateVerifierPath {
 pub enum VerifierTransformError {
     #[error("private verifier config is not configured")]
     MissingPrivateConfig,
-    #[error("required verifier labels are missing: {0:?}")]
+    #[error("required verifier labels are missing")]
     MissingRequiredLabels(Vec<&'static str>),
-    #[error("verifier labels conflict: {0:?}")]
+    #[error("verifier labels conflict")]
     ConflictingLabels(Vec<VerifierLabelConflict>),
-    #[error("dedup groups are invalid: {0:?}")]
+    #[error("dedup groups are invalid")]
     InvalidDedupGroups(Vec<VerifierLabelConflict>),
     #[error("private verifier artifact write failed")]
     PrivateWrite(#[from] PrivateConfigError),
@@ -168,12 +222,12 @@ impl fmt::Debug for VerifierTransformError {
                 .field(labels)
                 .finish(),
             Self::ConflictingLabels(conflicts) => formatter
-                .debug_tuple("ConflictingLabels")
-                .field(conflicts)
+                .debug_struct("ConflictingLabels")
+                .field("count", &conflicts.len())
                 .finish(),
             Self::InvalidDedupGroups(conflicts) => formatter
-                .debug_tuple("InvalidDedupGroups")
-                .field(conflicts)
+                .debug_struct("InvalidDedupGroups")
+                .field("count", &conflicts.len())
                 .finish(),
             Self::PrivateWrite(_) => formatter.write_str("PrivateWrite([redacted])"),
             Self::Json(_) => formatter.write_str("Json([redacted])"),
@@ -303,7 +357,31 @@ fn validate_target_conflicts(
 
 fn validate_dedup_groups(groups: &[DedupGroup]) -> Result<&[DedupGroup], VerifierTransformError> {
     let mut conflicts = Vec::new();
+    let mut group_ids = BTreeSet::new();
+    let mut saw_same_canonical_state = false;
+    let mut saw_distinct_stable_state = false;
+
     for group in groups {
+        if !group_ids.insert(group.group_id.as_str()) {
+            conflicts.push(VerifierLabelConflict::new(
+                "dedup_duplicate_group",
+                &group.group_id,
+                "Dedup artifact contains the same group more than once.",
+            ));
+        }
+        if matches!(group.status, Some(DedupStatus::Conflict)) {
+            conflicts.push(VerifierLabelConflict::new(
+                "dedup_conflict_status",
+                &group.group_id,
+                "Conflict dedup groups must not be emitted to verifier artifacts.",
+            ));
+        } else {
+            match group.expected_relation {
+                DedupRelation::SameCanonicalState => saw_same_canonical_state = true,
+                DedupRelation::DistinctStableState => saw_distinct_stable_state = true,
+            }
+        }
+
         let mut capture_ids = BTreeSet::new();
         for capture_id in &group.capture_ids {
             if !capture_ids.insert(capture_id) {
@@ -311,6 +389,25 @@ fn validate_dedup_groups(groups: &[DedupGroup]) -> Result<&[DedupGroup], Verifie
                     "dedup_duplicate_capture",
                     capture_id,
                     "Dedup group contains the same capture more than once.",
+                ));
+            }
+        }
+        let mut changed_features = BTreeSet::new();
+        for feature in &group.changed_features {
+            if !changed_features.insert(feature) {
+                conflicts.push(VerifierLabelConflict::new(
+                    "dedup_duplicate_changed_feature",
+                    &group.group_id,
+                    "Dedup group contains the same changed feature more than once.",
+                ));
+            }
+        }
+        for range in &group.changed_offset_ranges {
+            if range.len == 0 {
+                conflicts.push(VerifierLabelConflict::new(
+                    "dedup_empty_offset_range",
+                    &group.group_id,
+                    "Dedup group changed offset ranges must have non-zero length.",
                 ));
             }
         }
@@ -329,11 +426,50 @@ fn validate_dedup_groups(groups: &[DedupGroup]) -> Result<&[DedupGroup], Verifie
             ));
         }
     }
+    if !saw_same_canonical_state {
+        conflicts.push(VerifierLabelConflict::new(
+            "dedup_missing_same_canonical_state",
+            "dedup-groups",
+            "Dedup artifact requires at least one same_canonical_state group.",
+        ));
+    }
+    if !saw_distinct_stable_state {
+        conflicts.push(VerifierLabelConflict::new(
+            "dedup_missing_distinct_stable_state",
+            "dedup-groups",
+            "Dedup artifact requires at least one distinct_stable_state group.",
+        ));
+    }
 
     if conflicts.is_empty() {
         Ok(groups)
     } else {
         Err(VerifierTransformError::InvalidDedupGroups(conflicts))
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct DedupArtifactRow<'a> {
+    schema_version: u16,
+    group_id: &'a str,
+    expected_relation: DedupRelation,
+    capture_ids: &'a Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    changed_features: &'a Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    changed_offset_ranges: &'a Vec<ChangedOffsetRange>,
+}
+
+impl<'a> From<&'a DedupGroup> for DedupArtifactRow<'a> {
+    fn from(group: &'a DedupGroup) -> Self {
+        Self {
+            schema_version: ARTIFACT_SCHEMA_VERSION,
+            group_id: &group.group_id,
+            expected_relation: group.expected_relation,
+            capture_ids: &group.capture_ids,
+            changed_features: &group.changed_features,
+            changed_offset_ranges: &group.changed_offset_ranges,
+        }
     }
 }
 
@@ -346,11 +482,15 @@ struct Phase4ScorePlanInputFile<'a> {
     captures: &'static str,
     out: &'static str,
     report: &'static str,
+    dedup_groups: &'static str,
+    labels: Phase4ScorePlanLabels<'a>,
+}
+
+#[derive(Debug, Serialize)]
+struct Phase4ScorePlanLabels<'a> {
     first_boss: &'a str,
     goal_positive: &'a str,
     goal_negative: &'a str,
-    dedup_groups: &'static str,
-    arguments: Vec<String>,
 }
 
 impl<'a> Phase4ScorePlanInputFile<'a> {
@@ -363,11 +503,12 @@ impl<'a> Phase4ScorePlanInputFile<'a> {
             captures: CAPTURES_INDEX_PATH,
             out: SCORE_PLAN_OUTPUT_PATH,
             report: SCORE_PLAN_REPORT_PATH,
-            first_boss: &targets.first_boss,
-            goal_positive: &targets.goal_positive,
-            goal_negative: &targets.goal_negative,
             dedup_groups: DEDUP_GROUPS_PATH,
-            arguments: Phase4ScorePlanInvocation::new(targets.clone()).arguments,
+            labels: Phase4ScorePlanLabels {
+                first_boss: &targets.first_boss,
+                goal_positive: &targets.goal_positive,
+                goal_negative: &targets.goal_negative,
+            },
         }
     }
 }
