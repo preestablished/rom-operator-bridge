@@ -2305,7 +2305,7 @@ impl From<crate::backend::RunStatus> for RunStatusResponse {
             current_frame: status.current_frame,
             last_applied_input_frame: status.last_applied_input_frame,
             last_preview_frame: status.last_preview_frame,
-            preview_stale: status.last_preview_frame < status.current_frame,
+            preview_stale: status.preview_stale,
             active_capture_job_id: status.active_capture_job_id,
             capabilities: status.capabilities,
         }

@@ -466,6 +466,12 @@ impl BridgeBackend for FrameBackend {
     }
 
     fn status(&self, _session_id: SessionId) -> BackendResult<RunStatus> {
+        let last_preview_frame = *self
+            .preview_frames
+            .lock()
+            .expect("preview mutex poisoned")
+            .front()
+            .expect("preview frame exists");
         Ok(RunStatus {
             session_id: self.status_session_id.clone(),
             run_id: RUN_ID.to_string(),
@@ -474,12 +480,8 @@ impl BridgeBackend for FrameBackend {
             current_frame: self.current_frame,
             capabilities: self.capabilities(),
             last_applied_input_frame: 0,
-            last_preview_frame: *self
-                .preview_frames
-                .lock()
-                .expect("preview mutex poisoned")
-                .front()
-                .expect("preview frame exists"),
+            last_preview_frame,
+            preview_stale: last_preview_frame < self.current_frame,
             active_capture_job_id: None,
         })
     }
@@ -489,6 +491,7 @@ impl BridgeBackend for FrameBackend {
             session_id,
             state: SessionState::Paused,
             current_frame: self.current_frame,
+            preview_stale: true,
         })
     }
 
@@ -497,6 +500,7 @@ impl BridgeBackend for FrameBackend {
             session_id,
             state: SessionState::Running,
             current_frame: self.current_frame,
+            preview_stale: true,
         })
     }
 

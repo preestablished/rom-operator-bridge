@@ -572,6 +572,7 @@ impl BridgeBackend for EventBackend {
             capabilities: self.capabilities(),
             last_applied_input_frame: 12,
             last_preview_frame: 17,
+            preview_stale: 17 < 18,
             active_capture_job_id: self.active_capture_job_id.clone(),
         })
     }
@@ -582,6 +583,7 @@ impl BridgeBackend for EventBackend {
             session_id,
             state: SessionState::Paused,
             current_frame: 18,
+            preview_stale: true,
         })
     }
 
@@ -591,6 +593,7 @@ impl BridgeBackend for EventBackend {
             session_id,
             state: SessionState::Running,
             current_frame: 18,
+            preview_stale: true,
         })
     }
 

@@ -2,7 +2,10 @@ use axum::{
     body::{Body, to_bytes},
     http::{
         Method, Request, StatusCode,
-        header::{ORIGIN, SET_COOKIE},
+        header::{
+            ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, CONTENT_TYPE, ORIGIN, PRAGMA, SET_COOKIE,
+            VARY,
+        },
     },
 };
 use dh_proto::v1 as dh;
@@ -16,8 +19,10 @@ use rom_operator_bridge_service::{
         ENV_OPERATOR_CREDENTIAL, ENV_PRIVATE_ROOT, ENV_REAL_SNAPSHOT_REF,
         ENV_REFERENCE_WORKLOAD_CHECKOUT, ENV_SESSION_SECRET, ENV_WORKLOAD_IMAGE_REF,
     },
+    sanitization::PublicSanitizer,
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -121,7 +126,7 @@ async fn real_restore_snapshot_lifecycle_calls_worker_and_stays_sanitized() {
     assert_eq!(start_body["state"], "paused");
     assert_eq!(start_body["current_frame"], 12);
     assert_eq!(start_body["capabilities"]["input"], false);
-    assert_eq!(start_body["capabilities"]["preview"], false);
+    assert_eq!(start_body["capabilities"]["preview"], true);
     assert_eq!(start_body["capabilities"]["capture"], false);
     assert_public_json_sanitized(&start_body, &private_root, &reference_checkout, &server);
 
@@ -162,6 +167,7 @@ async fn real_restore_snapshot_lifecycle_calls_worker_and_stays_sanitized() {
     assert_eq!(status_body["backend_mode"], "real");
     assert_eq!(status_body["state"], "paused");
     assert_eq!(status_body["current_frame"], 12);
+    assert_eq!(status_body["preview_stale"], true);
 
     let stop = send_request(
         &mut app,
@@ -309,6 +315,280 @@ async fn real_create_vm_start_parses_private_config_and_stops_worker_slot() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_framebuffer_preview_routes_return_schema_safe_png() {
+    let workspace = tempfile::tempdir().expect("tempdir creates");
+    let private_root = workspace.path().join("bridge-private");
+    let reference_checkout = workspace.path().join("reference-workload");
+    let worker = MockWorker::new();
+    let server = WorkerServer::start(worker.clone()).await;
+    let config = real_config_with_start(
+        &private_root,
+        &reference_checkout,
+        &format!("unix://{}", server.uds_path.display()),
+        Some((ENV_REAL_SNAPSHOT_REF, SNAPSHOT_REF.to_string())),
+    );
+    let mut app = router(AppState::from_config(config));
+
+    let start = send_request(
+        &mut app,
+        runtime_request(
+            Method::POST,
+            "/api/session/start",
+            Body::from(start_body("real")),
+        ),
+    )
+    .await;
+    assert_eq!(start.status(), StatusCode::OK);
+    let cookie = response_cookie(&start);
+    let start_body = body_json(start).await;
+    assert_eq!(start_body["capabilities"]["preview"], true);
+
+    let metadata_response = send_request(
+        &mut app,
+        runtime_request_with_cookie(Method::GET, "/api/frame/current", &cookie, Body::empty()),
+    )
+    .await;
+    assert_eq!(metadata_response.status(), StatusCode::OK);
+    assert_no_store_headers(metadata_response.headers());
+    let metadata_body = to_bytes(metadata_response.into_body(), 16 * 1024)
+        .await
+        .expect("metadata body reads");
+    let metadata: Value = serde_json::from_slice(&metadata_body).expect("metadata json parses");
+    assert_matches_runtime_schema(&metadata);
+    assert_eq!(metadata["frame"], 12);
+    assert_eq!(metadata["stale"], false);
+    assert_eq!(metadata["width"], 256);
+    assert_eq!(metadata["height"], 224);
+    assert_eq!(metadata["format"], "image/png");
+    assert_public_json_sanitized_with_worker_text(
+        &metadata,
+        &private_root,
+        &reference_checkout,
+        &server,
+        "private framebuffer worker failure",
+    );
+
+    let image_url = metadata["image_url"]
+        .as_str()
+        .expect("image url is a string");
+    let image_response = send_request(
+        &mut app,
+        runtime_request_with_cookie(Method::GET, image_url, &cookie, Body::empty()),
+    )
+    .await;
+    assert_eq!(image_response.status(), StatusCode::OK);
+    assert_no_store_headers(image_response.headers());
+    assert_eq!(
+        image_response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("image/png")
+    );
+    let image = to_bytes(image_response.into_body(), 512 * 1024)
+        .await
+        .expect("image body reads");
+    assert!(image.starts_with(b"\x89PNG\r\n\x1a\n"));
+    assert_eq!(metadata["preview_hash"], sha256_ref(&image));
+    assert!(worker.calls().iter().any(|call| *call == "get_framebuffer"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_framebuffer_failure_is_sanitized_and_keeps_session_active() {
+    let workspace = tempfile::tempdir().expect("tempdir creates");
+    let private_root = workspace.path().join("bridge-private");
+    let reference_checkout = workspace.path().join("reference-workload");
+    let worker = MockWorker::new();
+    worker
+        .state
+        .lock()
+        .expect("mock worker mutex poisoned")
+        .framebuffer_status = Some(tonic::Code::FailedPrecondition);
+    let server = WorkerServer::start(worker.clone()).await;
+    let config = real_config_with_start(
+        &private_root,
+        &reference_checkout,
+        &format!("unix://{}", server.uds_path.display()),
+        Some((ENV_REAL_SNAPSHOT_REF, SNAPSHOT_REF.to_string())),
+    );
+    let mut app = router(AppState::from_config(config));
+
+    let start = send_request(
+        &mut app,
+        runtime_request(
+            Method::POST,
+            "/api/session/start",
+            Body::from(start_body("real")),
+        ),
+    )
+    .await;
+    assert_eq!(start.status(), StatusCode::OK);
+    let cookie = response_cookie(&start);
+
+    let preview = send_request(
+        &mut app,
+        runtime_request_with_cookie(Method::GET, "/api/frame/current", &cookie, Body::empty()),
+    )
+    .await;
+    assert_eq!(preview.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_ne!(
+        preview
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("image/png")
+    );
+    let body = body_json(preview).await;
+    assert_eq!(body["error"]["code"], "backend_unavailable");
+    assert_eq!(body["error"]["details"], serde_json::json!({}));
+    assert_public_json_sanitized_with_worker_text(
+        &body,
+        &private_root,
+        &reference_checkout,
+        &server,
+        "private framebuffer worker failure",
+    );
+
+    let session = send_request(
+        &mut app,
+        runtime_request_with_cookie(Method::GET, "/api/session", &cookie, Body::empty()),
+    )
+    .await;
+    assert_eq!(session.status(), StatusCode::OK);
+    let session_body = body_json(session).await;
+    assert_eq!(session_body["active"], true);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_framebuffer_rejects_non_schema_dimensions() {
+    let workspace = tempfile::tempdir().expect("tempdir creates");
+    let private_root = workspace.path().join("bridge-private");
+    let reference_checkout = workspace.path().join("reference-workload");
+    let worker = MockWorker::new();
+    {
+        let mut state = worker.state.lock().expect("mock worker mutex poisoned");
+        state.framebuffer_response.width = 8;
+        state.framebuffer_response.height = 4;
+        state.framebuffer_response.stride = 32;
+        state.framebuffer_response.pixels = vec![0; 32 * 4];
+    }
+    let server = WorkerServer::start(worker.clone()).await;
+    let config = real_config_with_start(
+        &private_root,
+        &reference_checkout,
+        &format!("unix://{}", server.uds_path.display()),
+        Some((ENV_REAL_SNAPSHOT_REF, SNAPSHOT_REF.to_string())),
+    );
+    let mut app = router(AppState::from_config(config));
+
+    let start = send_request(
+        &mut app,
+        runtime_request(
+            Method::POST,
+            "/api/session/start",
+            Body::from(start_body("real")),
+        ),
+    )
+    .await;
+    assert_eq!(start.status(), StatusCode::OK);
+    let cookie = response_cookie(&start);
+
+    let preview = send_request(
+        &mut app,
+        runtime_request_with_cookie(Method::GET, "/api/frame/current", &cookie, Body::empty()),
+    )
+    .await;
+    assert_eq!(preview.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = body_json(preview).await;
+    assert_eq!(body["error"]["code"], "backend_unavailable");
+    assert_eq!(body["error"]["details"], serde_json::json!({}));
+    assert_public_json_sanitized(&body, &private_root, &reference_checkout, &server);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_start_without_preview_request_keeps_preview_capability_ungranted() {
+    let workspace = tempfile::tempdir().expect("tempdir creates");
+    let private_root = workspace.path().join("bridge-private");
+    let reference_checkout = workspace.path().join("reference-workload");
+    let worker = MockWorker::new();
+    let server = WorkerServer::start(worker.clone()).await;
+    let config = real_config_with_start(
+        &private_root,
+        &reference_checkout,
+        &format!("unix://{}", server.uds_path.display()),
+        Some((ENV_REAL_SNAPSHOT_REF, SNAPSHOT_REF.to_string())),
+    );
+    let mut app = router(AppState::from_config(config));
+
+    let start = send_request(
+        &mut app,
+        runtime_request(
+            Method::POST,
+            "/api/session/start",
+            Body::from(start_body_with_capabilities("real", &["input"])),
+        ),
+    )
+    .await;
+    assert_eq!(start.status(), StatusCode::OK);
+    let cookie = response_cookie(&start);
+    let start_body = body_json(start).await;
+    assert_eq!(start_body["capabilities"]["input"], false);
+    assert_eq!(start_body["capabilities"]["preview"], false);
+
+    let status = send_request(
+        &mut app,
+        runtime_request_with_cookie(Method::GET, "/api/run/status", &cookie, Body::empty()),
+    )
+    .await;
+    assert_eq!(status.status(), StatusCode::OK);
+    let status_body = body_json(status).await;
+    assert_eq!(status_body["capabilities"]["preview"], false);
+
+    let metadata_response = send_request(
+        &mut app,
+        runtime_request_with_cookie(Method::GET, "/api/frame/current", &cookie, Body::empty()),
+    )
+    .await;
+    assert_eq!(metadata_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_ne!(
+        metadata_response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("image/png")
+    );
+    let metadata_body = body_json(metadata_response).await;
+    assert_eq!(metadata_body["error"]["code"], "backend_unavailable");
+    assert_eq!(metadata_body["error"]["details"], serde_json::json!({}));
+    assert_public_json_sanitized(&metadata_body, &private_root, &reference_checkout, &server);
+
+    let image_response = send_request(
+        &mut app,
+        runtime_request_with_cookie(
+            Method::GET,
+            "/api/frame/current/image",
+            &cookie,
+            Body::empty(),
+        ),
+    )
+    .await;
+    assert_eq!(image_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_ne!(
+        image_response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("image/png")
+    );
+    let image_body = body_json(image_response).await;
+    assert_eq!(image_body["error"]["code"], "backend_unavailable");
+    assert_eq!(image_body["error"]["details"], serde_json::json!({}));
+    assert_public_json_sanitized(&image_body, &private_root, &reference_checkout, &server);
+
+    assert!(!worker.calls().contains(&"get_framebuffer"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_stop_destroy_failure_clears_public_session_with_sanitized_error() {
     let workspace = tempfile::tempdir().expect("tempdir creates");
     let private_root = workspace.path().join("bridge-private");
@@ -447,11 +727,15 @@ async fn send_request(app: &mut axum::Router, request: Request<Body>) -> axum::r
 }
 
 fn start_body(backend_mode: &str) -> String {
+    start_body_with_capabilities(backend_mode, &["input", "preview", "capture"])
+}
+
+fn start_body_with_capabilities(backend_mode: &str, capabilities: &[&str]) -> String {
     json!({
         "schema_version": 1,
         "operator_credential": GOOD_CREDENTIAL,
         "backend_mode": backend_mode,
-        "requested_capabilities": ["input", "preview", "capture"]
+        "requested_capabilities": capabilities
     })
     .to_string()
 }
@@ -512,6 +796,76 @@ fn assert_public_json_sanitized(
             "public response leaked private value: {forbidden}"
         );
     }
+}
+
+fn assert_public_json_sanitized_with_worker_text(
+    value: &Value,
+    private_root: &Path,
+    reference_checkout: &Path,
+    server: &WorkerServer,
+    worker_text: &str,
+) {
+    assert_public_json_sanitized(value, private_root, reference_checkout, server);
+    let endpoint = format!("unix://{}", server.uds_path.display());
+    let lease_token = String::from_utf8(LEASE_TOKEN.to_vec()).expect("lease token utf8");
+    PublicSanitizer::new()
+        .with_private_root(private_root)
+        .with_forbidden_literal(GOOD_CREDENTIAL)
+        .with_forbidden_literal(SESSION_SECRET)
+        .with_forbidden_literal(worker_text)
+        .with_forbidden_literal(endpoint)
+        .with_forbidden_literal(lease_token)
+        .inspect_json(value)
+        .expect("json is public-safe");
+}
+
+fn assert_no_store_headers(headers: &axum::http::HeaderMap) {
+    assert_eq!(
+        headers
+            .get(CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+    assert_eq!(
+        headers.get(PRAGMA).and_then(|value| value.to_str().ok()),
+        Some("no-cache")
+    );
+    assert_eq!(
+        headers
+            .get("x-content-type-options")
+            .and_then(|value| value.to_str().ok()),
+        Some("nosniff")
+    );
+    assert_eq!(
+        headers
+            .get(ACCESS_CONTROL_ALLOW_ORIGIN)
+            .and_then(|value| value.to_str().ok()),
+        Some(ALLOWED_ORIGIN)
+    );
+    assert_eq!(
+        headers.get(VARY).and_then(|value| value.to_str().ok()),
+        Some("Origin")
+    );
+}
+
+fn assert_matches_runtime_schema(json: &Value) {
+    let schema: Value =
+        serde_json::from_str(include_str!("../../../contracts/runtime-api.schema.json"))
+            .expect("runtime schema parses");
+    let validator = jsonschema::validator_for(&schema).expect("runtime schema compiles");
+    validator.validate(json).unwrap_or_else(|error| {
+        panic!("runtime schema validation failed: {error}");
+    });
+}
+
+fn sha256_ref(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write;
+        write!(&mut hex, "{byte:02x}").expect("hex write succeeds");
+    }
+    format!("sha256:{hex}")
 }
 
 fn assert_private_artifacts_do_not_contain_lease(private_root: &Path) {
@@ -603,14 +957,30 @@ struct MockWorker {
     state: Arc<Mutex<MockWorkerState>>,
 }
 
-#[derive(Default)]
 struct MockWorkerState {
     calls: Vec<&'static str>,
     active_slot: Option<dh::SlotInfo>,
     restore_hash: Option<Vec<u8>>,
     create_vm: Option<dh::CreateVmRequest>,
     destroy_fails: bool,
+    framebuffer_status: Option<tonic::Code>,
+    framebuffer_response: dh::GetFramebufferResponse,
     icount: u64,
+}
+
+impl Default for MockWorkerState {
+    fn default() -> Self {
+        Self {
+            calls: Vec::new(),
+            active_slot: None,
+            restore_hash: None,
+            create_vm: None,
+            destroy_fails: false,
+            framebuffer_status: None,
+            framebuffer_response: MockWorker::framebuffer_response(12, 0),
+            icount: 0,
+        }
+    }
 }
 
 impl MockWorker {
@@ -640,6 +1010,30 @@ impl MockWorker {
             icount,
             base: None,
             live_children: 0,
+        }
+    }
+
+    fn framebuffer_response(frame_counter: u32, icount: u64) -> dh::GetFramebufferResponse {
+        let width = 256_u32;
+        let height = 224_u32;
+        let stride = width * 4;
+        let mut pixels = Vec::with_capacity((stride * height) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                pixels.push(y as u8);
+                pixels.push((x ^ y) as u8);
+                pixels.push(x as u8);
+                pixels.push(0xaa);
+            }
+        }
+        dh::GetFramebufferResponse {
+            width,
+            height,
+            stride,
+            format: dh::PixelFormat::Xrgb8888 as i32,
+            frame_counter,
+            icount,
+            pixels,
         }
     }
 }
@@ -766,7 +1160,15 @@ impl HypervisorWorker for MockWorker {
         &self,
         _request: TonicRequest<dh::GetFramebufferRequest>,
     ) -> Result<TonicResponse<dh::GetFramebufferResponse>, Status> {
-        Err(Status::unimplemented("not used by bridge bp8"))
+        let mut state = self.state.lock().expect("mock worker mutex poisoned");
+        state.calls.push("get_framebuffer");
+        if let Some(code) = state.framebuffer_status {
+            return Err(Status::new(
+                code,
+                "private framebuffer worker failure at /private/framebuffer",
+            ));
+        }
+        Ok(TonicResponse::new(state.framebuffer_response.clone()))
     }
 
     type StreamGuestEventsStream = ReceiverStream<Result<dh::GuestEvent, Status>>;

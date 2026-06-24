@@ -75,7 +75,7 @@ impl WsEventState {
                 json!(RunUpdatedPayload {
                     state: boundary.state,
                     current_frame: boundary.current_frame,
-                    preview_stale: boundary.current_frame > 0,
+                    preview_stale: boundary.preview_stale,
                     active_capture_job_id,
                 }),
                 sanitizer,
@@ -228,7 +228,7 @@ impl WsEventState {
             json!(RunUpdatedPayload {
                 state: status.state,
                 current_frame: status.current_frame,
-                preview_stale: status.last_preview_frame < status.current_frame,
+                preview_stale: status.preview_stale,
                 active_capture_job_id: status.active_capture_job_id.clone(),
             }),
             sanitizer,

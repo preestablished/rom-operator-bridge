@@ -16,7 +16,10 @@ use tower::service_fn;
 use crate::{
     api::RUNTIME_API_SCHEMA_VERSION,
     artifacts::{BridgeEventRow, PadLogEventRow, PrivateArtifactStore, RunManifest},
-    framebuffer::{SYNTHETIC_FRAME_HEIGHT, SYNTHETIC_FRAME_WIDTH, synthetic_frame_png},
+    framebuffer::{
+        RawFramebuffer, RawFramebufferFormat, SYNTHETIC_FRAME_HEIGHT, SYNTHETIC_FRAME_WIDTH,
+        framebuffer_png, synthetic_frame_png,
+    },
     input::{AppliedInputFrame, PadLog, PadWord},
     private_config::{BridgePrivateConfig, RealRuntimeConfig},
 };
@@ -78,6 +81,17 @@ impl BackendCapabilities {
         Self {
             input: false,
             preview: false,
+            capture: false,
+            labels: false,
+            privileged_features: false,
+            validation_runner: false,
+        }
+    }
+
+    pub const fn real_preview_mvp() -> Self {
+        Self {
+            input: false,
+            preview: true,
             capture: false,
             labels: false,
             privileged_features: false,
@@ -153,6 +167,7 @@ pub struct RunStatus {
     pub capabilities: BackendCapabilities,
     pub last_applied_input_frame: FrameCounter,
     pub last_preview_frame: FrameCounter,
+    pub preview_stale: bool,
     pub active_capture_job_id: Option<CaptureJobId>,
 }
 
@@ -161,6 +176,7 @@ pub struct RunBoundary {
     pub session_id: SessionId,
     pub state: SessionState,
     pub current_frame: FrameCounter,
+    pub preview_stale: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -387,6 +403,7 @@ impl BridgeBackend for SyntheticBackend {
                 session_id: session.session_id.clone(),
                 state: SessionState::Paused,
                 current_frame: session.current_frame,
+                preview_stale: session.last_preview_frame < session.current_frame,
             };
             (
                 session.run_id.clone(),
@@ -431,6 +448,7 @@ impl BridgeBackend for SyntheticBackend {
                 session_id: session.session_id.clone(),
                 state: SessionState::Running,
                 current_frame: next_frame,
+                preview_stale: session.last_preview_frame < next_frame,
             };
             (
                 session.run_id.clone(),
@@ -521,6 +539,9 @@ impl BridgeBackend for SyntheticBackend {
             .as_mut()
             .filter(|session| session.session_id == session_id)
             .ok_or(BackendError::BackendUnavailable)?;
+        if !session.capabilities.preview {
+            return Err(BackendError::BackendUnavailable);
+        }
         let frame = session.current_frame;
         session.last_preview_frame = frame;
 
@@ -675,6 +696,7 @@ impl SyntheticSession {
             capabilities: self.capabilities,
             last_applied_input_frame: self.last_applied_input_frame,
             last_preview_frame: self.last_preview_frame,
+            preview_stale: self.last_preview_frame < self.current_frame,
             active_capture_job_id: None,
         }
     }
@@ -808,10 +830,10 @@ impl BridgeBackend for RealBackend {
     }
 
     fn capabilities(&self) -> BackendCapabilities {
-        BackendCapabilities::unavailable_real()
+        BackendCapabilities::real_preview_mvp()
     }
 
-    fn start_session(&self, _request: StartBackendSession) -> BackendResult<BackendSession> {
+    fn start_session(&self, request: StartBackendSession) -> BackendResult<BackendSession> {
         let (sequence, session_id, run_id) = {
             let mut inner = self.inner.lock().expect("real backend mutex poisoned");
             if inner.active.is_some() || inner.starting {
@@ -854,8 +876,9 @@ impl BridgeBackend for RealBackend {
             current_frame: outcome.current_frame,
             current_icount: outcome.current_icount,
             last_preview_frame: 0,
+            preview_stale: outcome.current_frame > 0,
             last_applied_input_frame: 0,
-            capabilities: BackendCapabilities::unavailable_real(),
+            capabilities: request.requested_capabilities,
         };
         let backend_session = session.backend_session();
         let mut inner = self.inner.lock().expect("real backend mutex poisoned");
@@ -1037,6 +1060,9 @@ impl BridgeBackend for RealBackend {
             active.current_icount = outcome.current_icount;
             if let Some(frame) = outcome.current_frame {
                 active.current_frame = frame;
+                active.preview_stale = active.last_preview_frame < active.current_frame;
+            } else {
+                active.preview_stale = true;
             }
         }
         self.append_real_event(
@@ -1058,8 +1084,40 @@ impl BridgeBackend for RealBackend {
         Err(BackendError::BackendUnavailable)
     }
 
-    fn framebuffer(&self, _session_id: SessionId) -> BackendResult<FramePreview> {
-        Err(BackendError::BackendUnavailable)
+    fn framebuffer(&self, session_id: SessionId) -> BackendResult<FramePreview> {
+        let session = {
+            let inner = self.inner.lock().expect("real backend mutex poisoned");
+            inner
+                .active
+                .as_ref()
+                .filter(|session| session.session_id == session_id)
+                .cloned()
+                .ok_or(BackendError::BackendUnavailable)?
+        };
+        if !session.capabilities.preview || session.state != SessionState::Paused {
+            return Err(BackendError::BackendUnavailable);
+        }
+
+        let outcome = self.worker.framebuffer(session.lease.clone())?;
+        let mut inner = self.inner.lock().expect("real backend mutex poisoned");
+        let active = inner
+            .active
+            .as_mut()
+            .filter(|active| active.session_id == session.session_id)
+            .filter(|active| active.capabilities.preview && active.state == SessionState::Paused)
+            .ok_or(BackendError::BackendUnavailable)?;
+        active.last_preview_frame = outcome.frame;
+        active.current_frame = active.current_frame.max(outcome.frame);
+        active.current_icount = outcome.icount;
+        active.preview_stale = active.last_preview_frame < active.current_frame;
+
+        Ok(FramePreview {
+            session_id,
+            frame: outcome.frame,
+            width: outcome.width,
+            height: outcome.height,
+            png_bytes: outcome.png_bytes,
+        })
     }
 
     fn trigger_capture(&self, _request: CaptureRequest) -> BackendResult<CaptureJob> {
@@ -1088,6 +1146,7 @@ struct RealSession {
     current_frame: FrameCounter,
     current_icount: u64,
     last_preview_frame: FrameCounter,
+    preview_stale: bool,
     last_applied_input_frame: FrameCounter,
     capabilities: BackendCapabilities,
 }
@@ -1113,6 +1172,7 @@ impl RealSession {
             capabilities: self.capabilities,
             last_applied_input_frame: self.last_applied_input_frame,
             last_preview_frame: self.last_preview_frame,
+            preview_stale: self.preview_stale,
             active_capture_job_id: None,
         }
     }
@@ -1122,6 +1182,7 @@ impl RealSession {
             session_id: self.session_id.clone(),
             state: self.state,
             current_frame: self.current_frame,
+            preview_stale: self.preview_stale,
         }
     }
 }
@@ -1185,6 +1246,15 @@ impl RealWorkerThread {
         rx.recv()
             .map_err(|_| RealWorkerFailure::BackendUnavailable)?
     }
+
+    fn framebuffer(&self, lease: dh::Lease) -> RealWorkerResult<RealFramebufferOutcome> {
+        let (reply, rx) = mpsc::channel();
+        self.tx
+            .send(RealWorkerCommand::Framebuffer { lease, reply })
+            .map_err(|_| RealWorkerFailure::BackendUnavailable)?;
+        rx.recv()
+            .map_err(|_| RealWorkerFailure::BackendUnavailable)?
+    }
 }
 
 type RealWorkerResult<T> = Result<T, RealWorkerFailure>;
@@ -1210,6 +1280,10 @@ enum RealWorkerCommand {
     Status {
         slot_id: u64,
         reply: mpsc::Sender<RealWorkerResult<RealSlotStatus>>,
+    },
+    Framebuffer {
+        lease: dh::Lease,
+        reply: mpsc::Sender<RealWorkerResult<RealFramebufferOutcome>>,
     },
 }
 
@@ -1254,6 +1328,14 @@ struct RealRunOutcome {
 
 struct RealSlotStatus {
     icount: u64,
+}
+
+struct RealFramebufferOutcome {
+    frame: FrameCounter,
+    icount: u64,
+    width: u32,
+    height: u32,
+    png_bytes: Vec<u8>,
 }
 
 #[derive(Default)]
@@ -1308,6 +1390,9 @@ fn run_real_worker_thread(
             RealWorkerCommand::Status { slot_id, reply } => {
                 let _ = reply.send(runtime.block_on(state.status(slot_id)));
             }
+            RealWorkerCommand::Framebuffer { lease, reply } => {
+                let _ = reply.send(runtime.block_on(state.framebuffer(lease)));
+            }
         }
     }
 }
@@ -1327,6 +1412,9 @@ fn reply_unavailable(command: RealWorkerCommand) {
             let _ = reply.send(Err(RealWorkerFailure::BackendUnavailable));
         }
         RealWorkerCommand::Status { reply, .. } => {
+            let _ = reply.send(Err(RealWorkerFailure::BackendUnavailable));
+        }
+        RealWorkerCommand::Framebuffer { reply, .. } => {
             let _ = reply.send(Err(RealWorkerFailure::BackendUnavailable));
         }
     }
@@ -1472,6 +1560,39 @@ impl RealWorkerState {
             | dh::SlotState::Frozen
             | dh::SlotState::FaultedS => Err(RealWorkerFailure::BackendUnavailable),
         }
+    }
+
+    async fn framebuffer(&mut self, lease: dh::Lease) -> RealWorkerResult<RealFramebufferOutcome> {
+        let response = self
+            .client()
+            .await?
+            .get_framebuffer(dh::GetFramebufferRequest { lease: Some(lease) })
+            .await
+            .map_err(|_| RealWorkerFailure::BackendUnavailable)?
+            .into_inner();
+        let format = match dh::PixelFormat::try_from(response.format)
+            .map_err(|_| RealWorkerFailure::BackendUnavailable)?
+        {
+            dh::PixelFormat::Xrgb8888 => RawFramebufferFormat::Xrgb8888,
+            dh::PixelFormat::PfUnspecified | dh::PixelFormat::Rgb565 => {
+                return Err(RealWorkerFailure::BackendUnavailable);
+            }
+        };
+        let png_bytes = framebuffer_png(RawFramebuffer {
+            width: response.width,
+            height: response.height,
+            stride: response.stride,
+            format,
+            pixels: &response.pixels,
+        })
+        .map_err(|_| RealWorkerFailure::BackendUnavailable)?;
+        Ok(RealFramebufferOutcome {
+            frame: u64::from(response.frame_counter),
+            icount: response.icount,
+            width: response.width,
+            height: response.height,
+            png_bytes,
+        })
     }
 }
 

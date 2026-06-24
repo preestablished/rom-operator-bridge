@@ -1090,6 +1090,7 @@ impl BridgeBackend for CaptureBackend {
             capabilities: self.capabilities(),
             last_applied_input_frame: 0,
             last_preview_frame: self.current_frame(),
+            preview_stale: false,
             active_capture_job_id: None,
         })
     }
@@ -1099,6 +1100,7 @@ impl BridgeBackend for CaptureBackend {
             session_id,
             state: SessionState::Paused,
             current_frame: self.current_frame(),
+            preview_stale: false,
         })
     }
 
@@ -1107,6 +1109,7 @@ impl BridgeBackend for CaptureBackend {
             session_id,
             state: SessionState::Running,
             current_frame: self.current_frame(),
+            preview_stale: false,
         })
     }
 

@@ -793,6 +793,7 @@ impl BridgeBackend for RecordingBackend {
             capabilities: self.capabilities(),
             last_applied_input_frame: 0,
             last_preview_frame: 0,
+            preview_stale: false,
             active_capture_job_id: None,
         })
     }
@@ -803,6 +804,7 @@ impl BridgeBackend for RecordingBackend {
             session_id,
             state: SessionState::Paused,
             current_frame: 0,
+            preview_stale: false,
         })
     }
 
@@ -812,6 +814,7 @@ impl BridgeBackend for RecordingBackend {
             session_id,
             state: SessionState::Running,
             current_frame: 0,
+            preview_stale: false,
         })
     }
 
