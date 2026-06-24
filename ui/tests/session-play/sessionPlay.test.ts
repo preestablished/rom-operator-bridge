@@ -2,9 +2,14 @@
 
 import { describe, expect, it, vi } from "vitest";
 import { mountOperatorApp } from "../../src/app";
-import type { RuntimeEventClient, RuntimePreviewClient, RuntimeRunClient } from "../../src/app";
+import type {
+  RuntimeEventClient,
+  RuntimeInputClient,
+  RuntimePreviewClient,
+  RuntimeRunClient
+} from "../../src/app";
 import type { RuntimeSessionClient } from "../../src/authSession";
-import type { RuntimeWsMessage } from "../../src/runtimeClient";
+import type { RunStatusResponse, RuntimeWsMessage } from "../../src/runtimeClient";
 import type { RuntimeConfig } from "../../src/runtimeConfig";
 
 const config: RuntimeConfig = {
@@ -75,6 +80,37 @@ describe("session and play surface", () => {
     expect(client.triggerCapture).not.toHaveBeenCalled();
   });
 
+  it("uses live stale runtime events to disable controls before preview refresh resolves", async () => {
+    const socketClient = mockSocketClient();
+    const pendingPreview = deferred(frameCurrentResponse(22, false));
+    const client = mockClient({
+      sessionStatus: vi.fn().mockResolvedValue(activeSessionResponse()),
+      runStatus: vi.fn().mockResolvedValue(runStatusResponse({ preview_stale: false })),
+      currentFrame: vi
+        .fn()
+        .mockResolvedValueOnce(frameCurrentResponse(21, false))
+        .mockReturnValueOnce(pendingPreview.promise)
+    });
+    const root = document.createElement("div");
+
+    mountOperatorApp(root, config, client, socketClient.client);
+    await flushPromises();
+    socketClient.emitEvent(runUpdated(1, { preview_stale: true, current_frame: 22 }));
+    await flushPromises();
+
+    expect(root.textContent).toContain("stale");
+    expect(root.querySelector<HTMLButtonElement>("[data-run-action='capture']")?.disabled).toBe(
+      true
+    );
+    expect(
+      Array.from(root.querySelectorAll<HTMLButtonElement>("[data-pad-button]")).every(
+        (button) => button.disabled
+      )
+    ).toBe(true);
+    root.querySelector<HTMLButtonElement>("[data-run-action='capture']")?.click();
+    expect(client.triggerCapture).not.toHaveBeenCalled();
+  });
+
   it("triggers capture with the observed preview frame and renders sanitized job status", async () => {
     const client = mockClient({
       sessionStatus: vi.fn().mockResolvedValue(activeSessionResponse()),
@@ -102,7 +138,7 @@ describe("session and play surface", () => {
   });
 
   it("renders current pressed buttons and an in-memory padlog tail from input acknowledgements", async () => {
-    const eventClient = mockEventClient();
+    const socketClient = mockSocketClient();
     const client = mockClient({
       sessionStatus: vi.fn().mockResolvedValue(activeSessionResponse()),
       runStatus: vi.fn().mockResolvedValue(runStatusResponse({ preview_stale: false })),
@@ -110,15 +146,52 @@ describe("session and play surface", () => {
     });
     const root = document.createElement("div");
 
-    mountOperatorApp(root, config, client, eventClient.client);
+    mountOperatorApp(root, config, client, socketClient.client);
     await flushPromises();
-    eventClient.emit(inputAck(1, 1025));
+    root
+      .querySelector<HTMLButtonElement>("[data-pad-button='A']")
+      ?.dispatchEvent(new Event("pointerdown", { bubbles: true, cancelable: true }));
+    socketClient.emitInput(inputAck(1, 1));
     await flushPromises();
 
-    expect(root.textContent).toContain("Pressed: A, Start");
+    expect(socketClient.sendInput).toHaveBeenCalledWith(
+      expect.objectContaining({ source: "combined", buttons: ["A"] })
+    );
+    expect(root.textContent).toContain("Pressed: A");
     expect(root.textContent).toContain("#30 applied");
-    expect(root.textContent).toContain("0401");
+    expect(root.textContent).toContain("0001");
     expect(root.textContent).not.toMatch(/localStorage|sessionStorage|indexedDB/i);
+  });
+
+  it("hydrates active capture jobs from run status and blocks duplicate triggers", async () => {
+    const client = mockClient({
+      sessionStatus: vi.fn().mockResolvedValue(activeSessionResponse()),
+      runStatus: vi
+        .fn()
+        .mockResolvedValue(runStatusResponse({ active_capture_job_id: "job-009" })),
+      currentFrame: vi.fn().mockResolvedValue(frameCurrentResponse(12, false)),
+      captureJob: vi.fn().mockResolvedValue({
+        ...captureJobResponse(),
+        job_id: "job-009",
+        status: "capturing",
+        capture_id: null,
+        captured_frame: null,
+        labelable: false,
+        has_preview: false
+      })
+    });
+    const root = document.createElement("div");
+
+    mountOperatorApp(root, config, client, null);
+    await flushPromises();
+
+    expect(client.captureJob).toHaveBeenCalledWith("job-009");
+    expect(root.textContent).toContain("job-009");
+    expect(root.querySelector<HTMLButtonElement>("[data-run-action='capture']")?.disabled).toBe(
+      true
+    );
+    root.querySelector<HTMLButtonElement>("[data-run-action='capture']")?.click();
+    expect(client.triggerCapture).not.toHaveBeenCalled();
   });
 });
 
@@ -139,19 +212,32 @@ function mockClient(overrides: Partial<MockRuntimeClient> = {}): MockRuntimeClie
   } as MockRuntimeClient;
 }
 
-function mockEventClient(): {
-  client: RuntimeEventClient;
-  emit: (message: RuntimeWsMessage) => void;
+function mockSocketClient(): {
+  client: RuntimeEventClient & RuntimeInputClient;
+  sendInput: ReturnType<typeof vi.fn>;
+  emitEvent: (message: RuntimeWsMessage) => void;
+  emitInput: (message: RuntimeWsMessage) => void;
 } {
-  let onMessage: ((message: RuntimeWsMessage) => void) | undefined;
+  let onEventMessage: ((message: RuntimeWsMessage) => void) | undefined;
+  let onInputMessage: ((message: RuntimeWsMessage) => void) | undefined;
+  const sendInput = vi.fn();
   return {
     client: {
       eventSocket: vi.fn((handlers = {}) => {
-        onMessage = handlers.onMessage;
+        onEventMessage = handlers.onMessage;
         return { close: vi.fn() } as unknown as ReturnType<RuntimeEventClient["eventSocket"]>;
+      }),
+      inputSocket: vi.fn((_, __, handlers = {}) => {
+        onInputMessage = handlers.onMessage;
+        return {
+          close: vi.fn(),
+          sendInput
+        } as unknown as ReturnType<RuntimeInputClient["inputSocket"]>;
       })
     },
-    emit: (message) => onMessage?.(message)
+    sendInput,
+    emitEvent: (message) => onEventMessage?.(message),
+    emitInput: (message) => onInputMessage?.(message)
   };
 }
 
@@ -167,11 +253,11 @@ function activeSessionResponse() {
   };
 }
 
-function runStatusResponse(overrides: Partial<ReturnType<typeof baseRunStatusResponse>> = {}) {
+function runStatusResponse(overrides: Partial<RunStatusResponse> = {}): RunStatusResponse {
   return { ...baseRunStatusResponse(), ...overrides };
 }
 
-function baseRunStatusResponse() {
+function baseRunStatusResponse(): RunStatusResponse {
   return {
     schema_version: 1,
     session_id: "session-001",
@@ -229,7 +315,7 @@ function inputAck(serverSeq: number, padWord: number): RuntimeWsMessage {
     type: "input_ack",
     session_id: "session-001",
     client_seq: 1,
-    source_id: "keyboard",
+    source_id: "combined",
     server_seq: serverSeq,
     payload: {
       client_event_id: "00000000-0000-0000-0000-000000000001",
@@ -237,6 +323,41 @@ function inputAck(serverSeq: number, padWord: number): RuntimeWsMessage {
       pad_word: padWord,
       status: "applied"
     }
+  };
+}
+
+function runUpdated(
+  serverSeq: number,
+  overrides: Partial<Extract<RuntimeWsMessage, { type: "run_updated" }>["payload"]> = {}
+): RuntimeWsMessage {
+  return {
+    schema_version: 1,
+    type: "run_updated",
+    session_id: "session-001",
+    client_seq: null,
+    source_id: "server",
+    server_seq: serverSeq,
+    payload: {
+      state: "running",
+      current_frame: 12,
+      preview_stale: false,
+      active_capture_job_id: null,
+      ...overrides
+    }
+  };
+}
+
+function deferred<T>(defaultValue: T): {
+  promise: Promise<T>;
+  resolve: (value?: T) => void;
+} {
+  let resolvePromise: (value: T) => void = () => undefined;
+  const promise = new Promise<T>((resolve) => {
+    resolvePromise = resolve;
+  });
+  return {
+    promise,
+    resolve: (value = defaultValue) => resolvePromise(value)
   };
 }
 

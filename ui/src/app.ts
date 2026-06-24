@@ -65,12 +65,14 @@ type OperatorRuntimeViewState = {
 };
 
 export type RuntimeEventClient = Pick<RuntimeWebSocketClient, "eventSocket">;
+export type RuntimeInputClient = Pick<RuntimeWebSocketClient, "inputSocket">;
 export type RuntimePreviewClient = Pick<RuntimeApiClient, "currentFrame">;
 export type RuntimeRunClient = Pick<
   RuntimeApiClient,
   "runStatus" | "pauseRun" | "resumeRun" | "triggerCapture" | "captureJob"
 >;
 type OperatorRuntimeClient = RuntimeSessionClient & Partial<RuntimePreviewClient & RuntimeRunClient>;
+type OperatorSocketClient = RuntimeEventClient & Partial<RuntimeInputClient>;
 
 type FocusState = "focused" | "blurred" | "hidden";
 type SessionActionState = "idle" | "pausing" | "resuming";
@@ -136,7 +138,7 @@ export function renderOperatorApp(
     auth.status !== "active" ||
     auth.session.state !== "running" ||
     view.focusState === "hidden" ||
-    Boolean(view.preview?.stale ?? auth.session.preview_stale);
+    Boolean(auth.session.preview_stale || view.preview?.stale);
   const model: OperatorViewModel = {
     ...INITIAL_VIEW_MODEL,
     backendMode: auth.session.backend_mode,
@@ -146,13 +148,11 @@ export function renderOperatorApp(
     lastPreviewFrame: view.preview?.frame ?? auth.session.last_preview_frame,
     activeCaptureJobId: auth.session.active_capture_job_id,
     previewState: auth.session.active
-      ? view.preview
-        ? view.preview.stale
+      ? auth.session.preview_stale || view.preview?.stale
           ? "stale"
-          : "fresh"
-        : auth.session.preview_stale
-          ? "stale"
-          : "waiting"
+          : view.preview
+            ? "fresh"
+            : "waiting"
       : "waiting",
     validationState: view.validationState,
     focusState: view.focusState,
@@ -269,7 +269,7 @@ export function mountOperatorApp(
   root: HTMLElement,
   config: RuntimeConfig,
   client: OperatorRuntimeClient = new RuntimeApiClient(config),
-  eventClient: RuntimeEventClient | null =
+  eventClient: OperatorSocketClient | null =
     typeof globalThis.WebSocket === "function" ? new RuntimeWebSocketClient(config) : null
 ): void {
   let auth = initialAuthSessionState();
@@ -288,6 +288,8 @@ export function mountOperatorApp(
   let padlogTail: PadlogTailEntry[] = [];
   let eventSocket: ReturnType<RuntimeEventClient["eventSocket"]> | null = null;
   let eventSessionId: string | null = null;
+  let inputSocket: ReturnType<RuntimeInputClient["inputSocket"]> | null = null;
+  let inputSessionId: string | null = null;
   root.innerHTML = '<div data-operator-app></div><p class="session-live" aria-live="polite"></p>';
   const appRegion = root.querySelector<HTMLElement>("[data-operator-app]");
   const liveRegion = root.querySelector<HTMLElement>(".session-live");
@@ -318,8 +320,12 @@ export function mountOperatorApp(
       return;
     }
     const previousSessionId = auth.session.session_id;
+    const sessionWillReset = !next.session.active || next.session.session_id !== previousSessionId;
+    if (sessionWillReset) {
+      closeInputStream(true);
+    }
     auth = next;
-    if (!auth.session.active || auth.session.session_id !== previousSessionId) {
+    if (sessionWillReset) {
       preview = null;
       previewRequestSeq += 1;
       captureJob = null;
@@ -331,6 +337,7 @@ export function mountOperatorApp(
     }
     sessionAction = "idle";
     syncEventStream();
+    syncInputStream();
     render(focusTargetForAuth(auth));
     refreshRunStatus();
     refreshPreview();
@@ -340,6 +347,15 @@ export function mountOperatorApp(
     eventSocket?.close();
     eventSocket = null;
     eventSessionId = null;
+  }
+
+  function closeInputStream(sendRelease = false) {
+    if (sendRelease && pressedButtons.length > 0) {
+      sendInputState([]);
+    }
+    inputSocket?.close();
+    inputSocket = null;
+    inputSessionId = null;
   }
 
   function syncEventStream() {
@@ -361,6 +377,28 @@ export function mountOperatorApp(
     closeEventStream();
     eventSessionId = nextSessionId;
     eventSocket = eventClient.eventSocket({
+      onMessage: handleRuntimeEvent,
+      onError: () => undefined
+    });
+  }
+
+  function syncInputStream() {
+    if (!eventClient?.inputSocket) {
+      return;
+    }
+    const nextSessionId =
+      auth.status === "active" && auth.session.session_id ? auth.session.session_id : null;
+    if (!nextSessionId) {
+      closeInputStream(true);
+      return;
+    }
+    if (inputSocket && inputSessionId === nextSessionId) {
+      return;
+    }
+
+    closeInputStream(true);
+    inputSessionId = nextSessionId;
+    inputSocket = eventClient.inputSocket(nextSessionId, "combined", {
       onMessage: handleRuntimeEvent,
       onError: () => undefined
     });
@@ -423,6 +461,7 @@ export function mountOperatorApp(
         },
         error: null
       };
+      syncCaptureFromActiveJob(message.payload.active_capture_job_id);
     }
 
     if (message.type === "capture_updated") {
@@ -445,6 +484,7 @@ export function mountOperatorApp(
 
     if (!auth.session.active) {
       closeEventStream();
+      closeInputStream(true);
       auth = initialAuthSessionState();
       validationState = INITIAL_VIEW_MODEL.validationState;
       preview = null;
@@ -462,6 +502,7 @@ export function mountOperatorApp(
 
     render();
     if (message.type === "session_updated" || message.type === "run_updated") {
+      syncInputStream();
       refreshPreview();
     }
   }
@@ -507,9 +548,31 @@ export function mountOperatorApp(
           return;
         }
         auth = { ...auth, session: applyRunStatus(auth.session, status), error: null };
+        syncCaptureFromActiveJob(status.active_capture_job_id);
         render();
       })
       .catch(() => undefined);
+  }
+
+  function syncCaptureFromActiveJob(jobId: string | null) {
+    if (!jobId) {
+      if (captureJob && isActiveCaptureStatus(captureJob.status)) {
+        captureJob = null;
+      }
+      capturePending = false;
+      return;
+    }
+
+    capturePending = true;
+    captureError = null;
+    if (captureJob?.job_id !== jobId) {
+      captureJob = mergeCaptureUpdate(null, {
+        job_id: jobId,
+        status: "capturing",
+        capture_id: null
+      });
+    }
+    void refreshCaptureJob(jobId);
   }
 
   function refreshPreview() {
@@ -613,6 +676,7 @@ export function mountOperatorApp(
 
     const stateToStop = auth;
     const requestSeq = ++authRequestSeq;
+    closeInputStream(true);
     auth = { ...auth, status: "stopping", error: null };
     sessionAction = "idle";
     preview = null;
@@ -643,6 +707,32 @@ export function mountOperatorApp(
       void triggerCapture();
     }
   });
+
+  root.addEventListener("pointerdown", (event) => {
+    const target = event.target instanceof Element ? event.target : null;
+    const button = target?.closest<HTMLButtonElement>("[data-pad-button]");
+    const padButton = button?.dataset.padButton;
+    if (!button || button.disabled || !isPadButton(padButton) || inputControlsDisabled()) {
+      return;
+    }
+
+    event.preventDefault();
+    pressedButtons = appendPadButton(pressedButtons, padButton);
+    sendInputState(pressedButtons);
+    render();
+  });
+
+  const releasePadButtons = () => {
+    if (pressedButtons.length === 0) {
+      return;
+    }
+    pressedButtons = [];
+    sendInputState([]);
+    render();
+  };
+  root.addEventListener("pointercancel", releasePadButtons);
+  root.addEventListener("pointerleave", releasePadButtons);
+  globalThis.addEventListener?.("pointerup", releasePadButtons);
 
   async function transitionRun(
     nextAction: Exclude<SessionActionState, "idle">,
@@ -703,6 +793,8 @@ export function mountOperatorApp(
       capturePending ||
       auth.status !== "active" ||
       !auth.session.session_id ||
+      auth.session.active_capture_job_id !== null ||
+      auth.session.preview_stale ||
       !preview ||
       preview.stale ||
       focusState === "hidden"
@@ -748,6 +840,28 @@ export function mountOperatorApp(
     }
   }
 
+  function inputControlsDisabled(): boolean {
+    return (
+      auth.status !== "active" ||
+      auth.session.state !== "running" ||
+      auth.session.preview_stale ||
+      focusState === "hidden" ||
+      Boolean(preview?.stale)
+    );
+  }
+
+  function sendInputState(buttons: PadButton[]) {
+    if (!inputSocket || auth.status !== "active" || !auth.session.session_id) {
+      return;
+    }
+    inputSocket.sendInput({
+      clientEventId: createIdempotencyKey(),
+      clientTimeMs: Date.now(),
+      source: "combined",
+      buttons
+    });
+  }
+
   root.addEventListener(
     "error",
     (event) => {
@@ -773,6 +887,7 @@ export function mountOperatorApp(
     }
     focusState = nextFocusState;
     if (focusState === "hidden") {
+      sendInputState([]);
       pressedButtons = [];
     }
     render();
@@ -918,6 +1033,14 @@ function displayErrorMessage(error: unknown): string {
 
 function padWordButtons(padWord: number): PadButton[] {
   return PAD_BUTTONS.filter((_button, index) => (padWord & (1 << index)) !== 0);
+}
+
+function isPadButton(value: string | undefined): value is PadButton {
+  return typeof value === "string" && (PAD_BUTTONS as readonly string[]).includes(value);
+}
+
+function appendPadButton(buttons: PadButton[], button: PadButton): PadButton[] {
+  return buttons.includes(button) ? buttons : [...buttons, button];
 }
 
 function padWordHex(padWord: number): string {
@@ -1068,7 +1191,7 @@ function renderCaptureJob(model: OperatorViewModel): string {
 }
 
 function capturePanelTitle(model: OperatorViewModel): string {
-  if (model.capturePending) {
+  if (model.capturePending || model.activeCaptureJobId) {
     return "capturing";
   }
   if (model.captureJob) {
@@ -1084,13 +1207,14 @@ function captureButtonDisabled(model: OperatorViewModel): boolean {
   return (
     model.controlsDisabled ||
     model.capturePending ||
+    model.activeCaptureJobId !== null ||
     !model.preview ||
     !model.auth.session.capabilities?.capture
   );
 }
 
 function captureStatusSummary(model: OperatorViewModel): string {
-  if (model.capturePending) {
+  if (model.capturePending || model.activeCaptureJobId) {
     return model.captureJob?.job_id ?? model.activeCaptureJobId ?? "capturing";
   }
   return model.captureJob ? statusLabel(model.captureJob.status) : "idle";
