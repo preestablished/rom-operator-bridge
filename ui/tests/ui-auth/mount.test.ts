@@ -2,7 +2,7 @@
 
 import { describe, expect, it, vi } from "vitest";
 import { mountOperatorApp } from "../../src/app";
-import type { RuntimeEventClient, RuntimePreviewClient } from "../../src/app";
+import type { RuntimeEventClient, RuntimePreviewClient, RuntimeRunClient } from "../../src/app";
 import type { RuntimeSessionClient } from "../../src/authSession";
 import { RuntimeApiError } from "../../src/runtimeClient";
 import type { RuntimeWsMessage } from "../../src/runtimeClient";
@@ -35,7 +35,7 @@ describe("mounted auth/session screen", () => {
     await flushPromises();
 
     expect(client.sessionStatus).toHaveBeenCalledTimes(1);
-    expect(root.textContent).toContain("Logout");
+    expect(root.textContent).toContain("Stop");
     expect(root.textContent).toContain("session-001");
   });
 
@@ -173,7 +173,7 @@ describe("mounted auth/session screen", () => {
 
     const image = root.querySelector<HTMLImageElement>("[data-preview-image]");
     expect(client.currentFrame).toHaveBeenCalledTimes(1);
-    expect(root.textContent).toContain("#21");
+    expect(root.textContent).toContain("Preview frame21");
     expect(root.textContent).toContain("fresh");
     expect(image?.getAttribute("src")).toBe("/api/frame/current/image?frame=21");
     expect(image?.dataset.previewHash).toBe(frameCurrentResponse().preview_hash);
@@ -202,15 +202,20 @@ describe("mounted auth/session screen", () => {
   });
 });
 
-type MockRuntimeClient = RuntimeSessionClient & Partial<RuntimePreviewClient>;
+type MockRuntimeClient = RuntimeSessionClient & Partial<RuntimePreviewClient & RuntimeRunClient>;
 
 function mockClient(overrides: Partial<MockRuntimeClient> = {}): MockRuntimeClient {
   return {
     startSession: vi.fn().mockResolvedValue(startSessionResponse()),
     sessionStatus: vi.fn().mockResolvedValue({ schema_version: 1, active: false, state: "idle" }),
     stopSession: vi.fn().mockResolvedValue(stopSessionResponse()),
+    runStatus: vi.fn().mockResolvedValue(runStatusResponse()),
+    pauseRun: vi.fn(),
+    resumeRun: vi.fn(),
+    triggerCapture: vi.fn(),
+    captureJob: vi.fn(),
     ...overrides
-  } as RuntimeSessionClient;
+  } as MockRuntimeClient;
 }
 
 function mockEventClient(): {
@@ -286,6 +291,22 @@ function startSessionResponse(sessionId = "session-001") {
     state: "running",
     current_frame: 12,
     pad_layout: { layout_id: "console16-12btn-v1", layout_version: 1 },
+    capabilities
+  };
+}
+
+function runStatusResponse() {
+  return {
+    schema_version: 1,
+    session_id: "session-001",
+    run_id: "run-001",
+    state: "running",
+    backend_mode: "synthetic",
+    current_frame: 12,
+    last_applied_input_frame: 10,
+    last_preview_frame: 11,
+    preview_stale: true,
+    active_capture_job_id: null,
     capabilities
   };
 }

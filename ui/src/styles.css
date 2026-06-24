@@ -144,7 +144,7 @@ h2 {
 }
 
 .workspace {
-  grid-template-columns: minmax(280px, 0.9fr) minmax(340px, 1.2fr);
+  grid-template-columns: minmax(250px, 0.8fr) minmax(360px, 1.25fr) minmax(260px, 0.9fr);
   align-items: stretch;
   padding-top: 18px;
 }
@@ -252,7 +252,7 @@ h2 {
 }
 
 .preview-panel {
-  grid-row: span 2;
+  grid-row: span 3;
 }
 
 .preview-surface {
@@ -283,13 +283,48 @@ h2 {
   object-fit: contain;
 }
 
+.preview-meta,
+.capture-job {
+  display: grid;
+  gap: 8px;
+  margin: 14px 0 0;
+}
+
+.preview-meta div,
+.capture-job div {
+  display: grid;
+  grid-template-columns: 112px minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
+  border-bottom: 1px solid #e0e5df;
+  padding-bottom: 8px;
+}
+
+.preview-meta dt,
+.capture-job dt {
+  color: #5a675f;
+  font-size: 0.76rem;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.preview-meta dd,
+.capture-job dd {
+  overflow: hidden;
+  margin: 0;
+  color: #17211c;
+  font-size: 0.9rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .pad-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 8px;
 }
 
-.pad-grid span {
+.pad-grid button {
   min-height: 34px;
   display: inline-flex;
   align-items: center;
@@ -300,6 +335,52 @@ h2 {
   background: #f7f8f5;
   font-size: 0.82rem;
   font-weight: 700;
+  padding: 0 8px;
+}
+
+.pad-grid button.pressed {
+  border-color: #245f8f;
+  color: #0f2d44;
+  background: #dceeff;
+}
+
+.pressed-summary {
+  min-height: 28px;
+  margin-top: 12px;
+  color: #24362f;
+  font-size: 0.86rem;
+  font-weight: 700;
+}
+
+.muted {
+  color: #66736d;
+}
+
+.padlog-tail {
+  display: grid;
+  gap: 8px;
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.padlog-tail li {
+  display: flex;
+  min-height: 30px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border: 1px solid #d4ddd5;
+  border-radius: 6px;
+  padding: 0 10px;
+  color: #3f4d45;
+  background: #fbfcfa;
+  font-size: 0.82rem;
+}
+
+.padlog-tail strong {
+  color: #0f2d44;
+  font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
 }
 
 .status-list {
@@ -335,6 +416,10 @@ h2 {
   .topbar,
   .workspace {
     grid-template-columns: 1fr;
+  }
+
+  .preview-panel {
+    grid-row: auto;
   }
 
   .runtime-grid {

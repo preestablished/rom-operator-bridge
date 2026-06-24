@@ -245,6 +245,7 @@ export type RuntimeSessionModel = {
   last_applied_input_frame: number;
   last_preview_frame: number;
   preview_stale: boolean;
+  active_capture_job_id: string | null;
   capabilities: RuntimeCapabilities | null;
 };
 
@@ -259,6 +260,7 @@ export function initialRuntimeSessionModel(): RuntimeSessionModel {
     last_applied_input_frame: 0,
     last_preview_frame: 0,
     preview_stale: true,
+    active_capture_job_id: null,
     capabilities: null
   };
 }
@@ -274,6 +276,7 @@ export function modelFromStartSession(response: StartSessionResponse): RuntimeSe
     last_applied_input_frame: 0,
     last_preview_frame: 0,
     preview_stale: true,
+    active_capture_job_id: null,
     capabilities: response.capabilities
   };
 }
@@ -293,6 +296,7 @@ export function applyRunStatus(
     last_applied_input_frame: status.last_applied_input_frame,
     last_preview_frame: status.last_preview_frame,
     preview_stale: status.preview_stale,
+    active_capture_job_id: status.active_capture_job_id,
     capabilities: status.capabilities
   };
 }
