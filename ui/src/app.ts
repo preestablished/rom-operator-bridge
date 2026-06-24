@@ -8,6 +8,7 @@ import {
 } from "./authSession";
 import {
   RuntimeApiClient,
+  RuntimeApiError,
   RuntimeWebSocketClient,
   applyRunStatus,
   type CaptureJobResponse,
@@ -17,6 +18,8 @@ import {
   type InputAckMessage,
   type InputRejectMessage,
   type PadButton,
+  type RuntimeErrorCode,
+  type RuntimeErrorDisplay,
   type RuntimeEventMessage,
   type RuntimeWsMessage,
   type ValidationUpdatedPayload
@@ -47,8 +50,10 @@ type OperatorViewModel = {
   previewState: "waiting" | "fresh" | "stale";
   validationState: "idle" | "queued" | "passed" | "failed";
   focusState: FocusState;
+  recoveryNotices: RecoveryNotice[];
   captureJob: CaptureJobView | null;
   captureError: string | null;
+  captureErrorCode: RuntimeErrorCode | null;
   sessionAction: SessionActionState;
   capturePending: boolean;
   controlsDisabled: boolean;
@@ -64,8 +69,10 @@ type OperatorRuntimeViewState = {
   validationState: OperatorViewModel["validationState"];
   preview: FrameCurrentResponse | null;
   focusState: FocusState;
+  recoveryEvents: RecoveryEvent[];
   captureJob: CaptureJobView | null;
   captureError: string | null;
+  captureErrorCode: RuntimeErrorCode | null;
   sessionAction: SessionActionState;
   capturePending: boolean;
   pressedButtons: PadButton[];
@@ -85,6 +92,17 @@ type OperatorSocketClient = RuntimeEventClient & Partial<RuntimeInputClient>;
 
 type FocusState = "focused" | "blurred" | "hidden";
 type SessionActionState = "idle" | "pausing" | "resuming";
+type RecoveryCode = RuntimeErrorCode | "bridge_unavailable" | "gamepad_disconnected" | "websocket_reconnect";
+type RecoveryNotice = {
+  code: RecoveryCode;
+  title: string;
+  message: string;
+  severity: "info" | "warning" | "critical";
+};
+type RecoveryEvent = {
+  code: RecoveryCode;
+  message?: string;
+};
 type CaptureJobView = Pick<
   CaptureJobResponse,
   | "job_id"
@@ -115,8 +133,10 @@ const INITIAL_VIEW_MODEL: Omit<OperatorViewModel, "config" | "auth"> = {
   previewState: "waiting",
   validationState: "idle",
   focusState: "focused",
+  recoveryNotices: [],
   captureJob: null,
   captureError: null,
+  captureErrorCode: null,
   sessionAction: "idle",
   capturePending: false,
   controlsDisabled: true,
@@ -130,8 +150,10 @@ const EMPTY_RUNTIME_VIEW: OperatorRuntimeViewState = {
   validationState: INITIAL_VIEW_MODEL.validationState,
   preview: null,
   focusState: INITIAL_VIEW_MODEL.focusState,
+  recoveryEvents: [],
   captureJob: null,
   captureError: null,
+  captureErrorCode: null,
   sessionAction: "idle",
   capturePending: false,
   pressedButtons: [],
@@ -149,6 +171,7 @@ export function renderOperatorApp(
     auth.status !== "active" ||
     auth.session.state !== "running" ||
     view.focusState === "hidden" ||
+    inputBlockingError(auth.error?.code) ||
     Boolean(auth.session.preview_stale || view.preview?.stale);
   const model: OperatorViewModel = {
     ...INITIAL_VIEW_MODEL,
@@ -167,8 +190,10 @@ export function renderOperatorApp(
       : "waiting",
     validationState: view.validationState,
     focusState: view.focusState,
+    recoveryNotices: [],
     captureJob: view.captureJob,
     captureError: view.captureError,
+    captureErrorCode: view.captureErrorCode,
     sessionAction: view.sessionAction,
     capturePending: view.capturePending,
     controlsDisabled,
@@ -179,6 +204,7 @@ export function renderOperatorApp(
     auth,
     preview: view.preview
   };
+  model.recoveryNotices = recoveryNoticesForModel(model, view.recoveryEvents);
 
   return `
     <main class="shell" aria-label="ROM Operator Bridge">
@@ -196,6 +222,7 @@ export function renderOperatorApp(
 
       <section class="workspace" aria-label="Operator workspace">
         ${renderSessionPanel(model)}
+        ${renderRecoveryPanel(model.recoveryNotices)}
 
         <article class="panel preview-panel">
           <div class="panel-header">
@@ -278,7 +305,7 @@ export function renderOperatorApp(
           </div>
           ${
             model.captureError
-              ? `<p class="session-alert" role="alert" tabindex="-1" data-capture-alert>${escapeHtml(model.captureError)}</p>`
+              ? `<p class="session-alert" role="alert" tabindex="-1" data-capture-alert>${escapeHtml(safeBrowserMessage(model.captureError))}</p>`
               : ""
           }
           ${renderCaptureJob(model)}
@@ -303,8 +330,10 @@ export function mountOperatorApp(
   let validationState: OperatorViewModel["validationState"] = INITIAL_VIEW_MODEL.validationState;
   let preview: FrameCurrentResponse | null = null;
   let focusState: FocusState = currentFocusState();
+  let recoveryEvents: RecoveryEvent[] = [];
   let captureJob: CaptureJobView | null = null;
   let captureError: string | null = null;
+  let captureErrorCode: RuntimeErrorCode | null = null;
   let capturePending = false;
   let captureRequestSeq = 0;
   let pressedButtons: PadButton[] = [];
@@ -336,8 +365,10 @@ export function mountOperatorApp(
       validationState,
       preview,
       focusState,
+      recoveryEvents,
       captureJob,
       captureError,
+      captureErrorCode,
       sessionAction,
       capturePending,
       pressedButtons,
@@ -367,8 +398,10 @@ export function mountOperatorApp(
       previewRequestSeq += 1;
       captureJob = null;
       captureError = null;
+      captureErrorCode = null;
       capturePending = false;
       captureRequestSeq += 1;
+      recoveryEvents = [];
       pressedButtons = [];
       manualButtons = [];
       keyboardButtons = [];
@@ -419,7 +452,16 @@ export function mountOperatorApp(
     eventSessionId = nextSessionId;
     eventSocket = eventClient.eventSocket({
       onMessage: handleRuntimeEvent,
-      onError: () => undefined
+      onError: (error) => {
+        recordRecoveryEvent({ code: error.display.code, message: error.display.message });
+        render();
+      },
+      onReconnect: () => {
+        recordRecoveryEvent({ code: "websocket_reconnect" });
+        refreshRunStatus();
+        refreshPreview();
+        render();
+      }
     });
   }
 
@@ -444,8 +486,10 @@ export function mountOperatorApp(
       onError: () => undefined,
       onClose: clearDisconnectedInputState,
       onReconnect: () => {
+        recordRecoveryEvent({ code: "websocket_reconnect" });
         clearDisconnectedInputState();
         syncInputCaptureLifecycle();
+        render();
       }
     });
     startGamepadPolling();
@@ -530,6 +574,7 @@ export function mountOperatorApp(
       capturePending =
         message.payload.status === "requested" || message.payload.status === "capturing";
       captureError = null;
+      captureErrorCode = null;
       void refreshCaptureJob(message.payload.job_id);
     }
 
@@ -543,8 +588,10 @@ export function mountOperatorApp(
       sessionAction = "idle";
       captureJob = null;
       captureError = null;
+      captureErrorCode = null;
       capturePending = false;
       captureRequestSeq += 1;
+      recoveryEvents = [];
       clearInputSources(false);
       padlogTail = [];
       render("credential");
@@ -602,7 +649,13 @@ export function mountOperatorApp(
         syncCaptureFromActiveJob(status.active_capture_job_id);
         render();
       })
-      .catch(() => undefined);
+      .catch((error) => {
+        if (requestSeq !== runStatusRequestSeq || auth.status !== "active" || auth.session.session_id !== sessionId) {
+          return;
+        }
+        auth = { ...auth, error: runtimeDisplayError(error, "backend_unavailable") };
+        render("alert");
+      });
   }
 
   function syncCaptureFromActiveJob(jobId: string | null) {
@@ -616,6 +669,7 @@ export function mountOperatorApp(
 
     capturePending = true;
     captureError = null;
+    captureErrorCode = null;
     if (captureJob?.job_id !== jobId) {
       captureJob = mergeCaptureUpdate(null, {
         job_id: jobId,
@@ -656,6 +710,7 @@ export function mountOperatorApp(
       .catch(() => {
         if (requestSeq === previewRequestSeq) {
           preview = null;
+          recordRecoveryEvent({ code: "backend_unavailable" });
           render();
         }
       });
@@ -674,7 +729,8 @@ export function mountOperatorApp(
         }
         captureJob = toCaptureJobView(nextJob);
         capturePending = isActiveCaptureStatus(nextJob.status);
-        captureError = nextJob.error?.message ?? null;
+        captureError = nextJob.error?.message ? safeBrowserMessage(nextJob.error.message) : null;
+        captureErrorCode = nextJob.error?.code ?? null;
         auth = {
           ...auth,
           session: {
@@ -689,7 +745,9 @@ export function mountOperatorApp(
           return;
         }
         capturePending = false;
-        captureError = displayErrorMessage(error);
+        const displayError = runtimeDisplayError(error, "capture_failed");
+        captureError = displayError.message;
+        captureErrorCode = displayError.code;
         render();
       });
   }
@@ -710,6 +768,7 @@ export function mountOperatorApp(
     const requestSeq = ++authRequestSeq;
     auth = { ...auth, status: "starting", error: null };
     validationState = INITIAL_VIEW_MODEL.validationState;
+    recoveryEvents = [];
     preview = null;
     previewRequestSeq += 1;
     render();
@@ -856,7 +915,9 @@ export function mountOperatorApp(
   globalThis.addEventListener?.("gamepadconnected", () => startGamepadPolling());
   globalThis.addEventListener?.("gamepaddisconnected", () => {
     stopGamepadPolling();
+    recordRecoveryEvent({ code: "gamepad_disconnected" });
     if (gamepadButtons.length === 0) {
+      render();
       return;
     }
     gamepadButtons = [];
@@ -902,14 +963,10 @@ export function mountOperatorApp(
         return;
       }
       sessionAction = "idle";
+      const displayError = runtimeDisplayError(error, "backend_unavailable");
       auth = {
         ...auth,
-        error: {
-          code: "backend_unavailable",
-          message: displayErrorMessage(error),
-          retryable: true,
-          details: {}
-        }
+        error: displayError
       };
       render("alert");
     }
@@ -934,6 +991,7 @@ export function mountOperatorApp(
     const sessionId = auth.session.session_id;
     capturePending = true;
     captureError = null;
+    captureErrorCode = null;
     render();
     try {
       const response = await trigger({
@@ -950,6 +1008,7 @@ export function mountOperatorApp(
       }
       captureJob = captureJobFromTrigger(response);
       capturePending = isActiveCaptureStatus(response.status);
+      captureErrorCode = null;
       auth = {
         ...auth,
         session: {
@@ -964,7 +1023,9 @@ export function mountOperatorApp(
         return;
       }
       capturePending = false;
-      captureError = displayErrorMessage(error);
+      const displayError = runtimeDisplayError(error, "capture_failed");
+      captureError = displayError.message;
+      captureErrorCode = displayError.code;
       render();
     }
   }
@@ -975,6 +1036,7 @@ export function mountOperatorApp(
       auth.session.state !== "running" ||
       auth.session.preview_stale ||
       focusState === "hidden" ||
+      inputBlockingError(auth.error?.code) ||
       Boolean(preview?.stale)
     );
   }
@@ -1022,6 +1084,13 @@ export function mountOperatorApp(
     if (hadInput) {
       render();
     }
+  }
+
+  function recordRecoveryEvent(event: RecoveryEvent) {
+    recoveryEvents = [
+      ...recoveryEvents.filter((current) => current.code !== event.code),
+      { code: event.code, message: event.message ? safeBrowserMessage(event.message) : undefined }
+    ].slice(-4);
   }
 
   function clearInputSources(sendRelease = true): boolean {
@@ -1184,6 +1253,171 @@ function operatorFocusState(): FocusState {
     : "blurred";
 }
 
+function recoveryNoticesForModel(
+  model: OperatorViewModel,
+  recoveryEvents: RecoveryEvent[]
+): RecoveryNotice[] {
+  const notices: RecoveryNotice[] = [];
+  const addNotice = (notice: RecoveryNotice) => {
+    if (!notices.some((current) => current.code === notice.code)) {
+      notices.push(notice);
+    }
+  };
+
+  if (model.auth.error) {
+    addNotice(recoveryNoticeFromError(model.auth.error, model.auth.status === "faulted"));
+  } else {
+    const authNotice = recoveryNoticeFromAuthStatus(model.auth.status);
+    if (authNotice) {
+      addNotice(authNotice);
+    }
+  }
+
+  if (model.previewState === "stale") {
+    addNotice(recoveryNotice("frame_stale"));
+  }
+  if (model.capturePending || model.activeCaptureJobId) {
+    addNotice(recoveryNotice("capture_in_progress"));
+  }
+  if (model.captureError || model.captureJob?.status === "failed") {
+    addNotice(
+      recoveryNotice(model.captureErrorCode ?? "capture_failed", model.captureError ?? model.captureJob?.error?.message)
+    );
+  }
+  if (model.validationState === "failed") {
+    addNotice(recoveryNotice("validation_failed"));
+  }
+
+  for (const event of recoveryEvents) {
+    addNotice(recoveryNotice(event.code, event.message));
+  }
+
+  return notices;
+}
+
+function recoveryNoticeFromAuthStatus(status: AuthSessionState["status"]): RecoveryNotice | null {
+  switch (status) {
+    case "auth_rejected":
+      return recoveryNotice("auth_rejected");
+    case "origin_rejected":
+      return recoveryNotice("origin_rejected");
+    case "session_active_elsewhere":
+      return recoveryNotice("session_active_elsewhere");
+    case "faulted":
+      return recoveryNotice("bridge_unavailable");
+    default:
+      return null;
+  }
+}
+
+function recoveryNoticeFromError(error: RuntimeErrorDisplay, bridgeContext = false): RecoveryNotice {
+  if (bridgeContext && error.code === "backend_unavailable") {
+    return recoveryNotice("bridge_unavailable", error.message);
+  }
+  return recoveryNotice(error.code, error.message);
+}
+
+function recoveryNotice(code: RecoveryCode, message?: string): RecoveryNotice {
+  const defaultMessage = recoveryDefaultMessage(code);
+  return {
+    code,
+    title: recoveryTitle(code),
+    message: safeBrowserMessage(message ?? defaultMessage, defaultMessage),
+    severity: recoverySeverity(code)
+  };
+}
+
+function recoveryTitle(code: RecoveryCode): string {
+  switch (code) {
+    case "bridge_unavailable":
+      return "Bridge unavailable";
+    case "auth_rejected":
+      return "Authentication rejected";
+    case "origin_rejected":
+      return "Origin rejected";
+    case "session_active_elsewhere":
+      return "Session active elsewhere";
+    case "backend_unavailable":
+      return "Backend unavailable";
+    case "frame_stale":
+      return "Framebuffer stale";
+    case "capture_in_progress":
+      return "Capture in progress";
+    case "capture_failed":
+      return "Capture failed";
+    case "label_conflict":
+      return "Label conflict";
+    case "validation_failed":
+      return "Validation failed";
+    case "gamepad_disconnected":
+      return "Gamepad disconnected";
+    case "websocket_reconnect":
+      return "WebSocket reconnect";
+    case "bad_request":
+      return "Request rejected";
+    case "session_inactive":
+      return "Session expired";
+  }
+}
+
+function recoveryDefaultMessage(code: RecoveryCode): string {
+  switch (code) {
+    case "bridge_unavailable":
+      return "Keep the UI open and retry session status when the bridge is reachable.";
+    case "auth_rejected":
+      return "Return to the locked screen and start a new authenticated session.";
+    case "origin_rejected":
+      return "Open the operator UI from an allowed origin.";
+    case "session_active_elsewhere":
+      return "Another operator session is active; this UI will not overwrite it.";
+    case "backend_unavailable":
+      return "Controls are disabled while the backend is unavailable; retry status when it recovers.";
+    case "frame_stale":
+      return "Preview and input are paused until a fresh frame is available.";
+    case "capture_in_progress":
+      return "The active capture is still running; duplicate capture requests are disabled.";
+    case "capture_failed":
+      return "Keep the failed capture visible and retry with a new request when ready.";
+    case "label_conflict":
+      return "Resolve the conflicting label role before saving the draft.";
+    case "validation_failed":
+      return "Validation failed; inspect the private server-side report.";
+    case "gamepad_disconnected":
+      return "Gamepad input was cleared; keyboard input remains available.";
+    case "websocket_reconnect":
+      return "Input was cleared and the UI will resume from current runtime status.";
+    case "bad_request":
+      return "The request was rejected without exposing private details.";
+    case "session_inactive":
+      return "The session is no longer active; return to the locked screen.";
+  }
+}
+
+function recoverySeverity(code: RecoveryCode): RecoveryNotice["severity"] {
+  switch (code) {
+    case "auth_rejected":
+    case "origin_rejected":
+    case "session_active_elsewhere":
+    case "backend_unavailable":
+    case "bridge_unavailable":
+    case "frame_stale":
+    case "capture_failed":
+    case "label_conflict":
+    case "validation_failed":
+      return "critical";
+    case "capture_in_progress":
+    case "gamepad_disconnected":
+    case "websocket_reconnect":
+    case "bad_request":
+    case "session_inactive":
+      return "warning";
+  }
+}
+
+function inputBlockingError(code: RuntimeErrorCode | undefined): boolean {
+  return code === "backend_unavailable" || code === "frame_stale";
+}
+
 function applyInputAckToState(
   message: InputAckMessage,
   currentTail: PadlogTailEntry[]
@@ -1314,8 +1548,26 @@ function isActiveCaptureStatus(status: CaptureStatus): boolean {
   return status === "requested" || status === "capturing";
 }
 
-function displayErrorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : "Runtime unavailable.";
+const UNSAFE_BROWSER_TEXT_PATTERN =
+  /credential|password|secret|token|private|\/home\/|\/run\/|\.env|[A-Za-z]:\\|raw payload|raw command|command output|feature bytes|validation report|screenshot/i;
+
+function runtimeDisplayError(error: unknown, fallbackCode: RuntimeErrorCode): RuntimeErrorDisplay {
+  if (error instanceof RuntimeApiError) {
+    return {
+      ...error.display,
+      message: safeBrowserMessage(error.display.message, recoveryDefaultMessage(error.display.code))
+    };
+  }
+  return {
+    code: fallbackCode,
+    message: recoveryDefaultMessage(fallbackCode),
+    retryable: true,
+    details: {}
+  };
+}
+
+function safeBrowserMessage(message: string, fallback = "Request failed."): string {
+  return UNSAFE_BROWSER_TEXT_PATTERN.test(message) ? fallback : message;
 }
 
 function padWordButtons(padWord: number): PadButton[] {
@@ -1367,6 +1619,33 @@ function createIdempotencyKey(): string {
   return globalThis.crypto?.randomUUID?.() ?? "00000000-0000-4000-8000-000000000000";
 }
 
+function renderRecoveryPanel(notices: RecoveryNotice[]): string {
+  if (notices.length === 0) {
+    return "";
+  }
+  return `
+    <article class="panel recovery-panel" aria-label="Recovery states">
+      <div class="panel-header">
+        <div>
+          <p class="eyebrow">Recovery</p>
+          <h2>${notices.length === 1 ? notices[0]?.title : "attention needed"}</h2>
+        </div>
+        <span class="status-pill">${notices.length}</span>
+      </div>
+      <ul class="recovery-list">
+        ${notices
+          .map(
+            (notice) => `<li data-recovery-code="${escapeHtml(notice.code)}" data-recovery-severity="${notice.severity}">
+              <strong>${escapeHtml(notice.title)}</strong>
+              <span>${escapeHtml(notice.message)}</span>
+            </li>`
+          )
+          .join("")}
+      </ul>
+    </article>
+  `;
+}
+
 function renderSessionPanel(model: OperatorViewModel): string {
   const auth = model.auth;
   const showSession = auth.status === "active" || auth.status === "stopping";
@@ -1388,7 +1667,7 @@ function renderSessionPanel(model: OperatorViewModel): string {
       </div>
       ${
         auth.error
-          ? `<p class="session-alert" role="alert" tabindex="-1" data-session-alert>${escapeHtml(auth.error.message)}</p>`
+          ? `<p class="session-alert" role="alert" tabindex="-1" data-session-alert>${escapeHtml(safeBrowserMessage(auth.error.message))}</p>`
           : ""
       }
       ${
