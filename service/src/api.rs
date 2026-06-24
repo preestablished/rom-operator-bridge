@@ -12,6 +12,10 @@ use crate::{
     },
     config::ServiceConfig,
     input::{PAD_LAYOUT_ID, PAD_LAYOUT_VERSION},
+    labels::{
+        LabelApplyOutcome, LabelApplyRequest, LabelConflict, LabelConflictKind, LabelSnapshot,
+        LabelState, LabelStoreError, LabelUpdate,
+    },
     ws_events::{WsEventState, serve_event_socket},
     ws_input::{WsInputState, serve_input_socket},
 };
@@ -49,6 +53,7 @@ pub struct AppState {
     auth: AuthState,
     runtime_session: Arc<Mutex<Option<String>>>,
     captures: CaptureState,
+    labels: LabelState,
     frame_previews: FramePreviewState,
     ws_events: WsEventState,
     ws_input: WsInputState,
@@ -69,6 +74,7 @@ impl AppState {
             auth: AuthState::new(),
             runtime_session: Arc::new(Mutex::new(None)),
             captures: CaptureState::new(),
+            labels: LabelState::new(),
             frame_previews: FramePreviewState::new(),
             ws_events: WsEventState::new(),
             ws_input: WsInputState::new(),
@@ -87,6 +93,7 @@ impl AppState {
             auth,
             runtime_session: Arc::new(Mutex::new(None)),
             captures: CaptureState::new(),
+            labels: LabelState::new(),
             frame_previews: FramePreviewState::new(),
             ws_events: WsEventState::new(),
             ws_input: WsInputState::new(),
@@ -104,6 +111,7 @@ impl AppState {
             auth,
             runtime_session: Arc::new(Mutex::new(None)),
             captures: CaptureState::new(),
+            labels: LabelState::new(),
             frame_previews: FramePreviewState::new(),
             ws_events: WsEventState::new(),
             ws_input: WsInputState::new(),
@@ -185,6 +193,20 @@ impl CaptureState {
             .values()
             .find(|job| job.session_id == session_id && job.status.is_active())
             .map(|job| job.job_id.clone())
+    }
+
+    fn is_labelable_capture(&self, session_id: &str, capture_id: &str) -> bool {
+        let inner = self.inner.lock().expect("capture mutex poisoned");
+        let Some(record) = inner.captures.get(capture_id) else {
+            return false;
+        };
+        let Some(job) = inner.jobs.get(&record.job_id) else {
+            return false;
+        };
+        job.session_id == session_id
+            && job.capture_id.as_deref() == Some(capture_id)
+            && job.status == CaptureStatus::Completed
+            && job.labelable
     }
 
     fn trigger(&self, input: CaptureTriggerInput) -> Result<CaptureJobView, CaptureTriggerError> {
@@ -612,6 +634,12 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/capture/{capture_id}/preview",
             get(capture_preview).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/labels",
+            get(labels_snapshot)
+                .post(labels_apply)
+                .fallback(method_not_allowed),
         )
         .route(
             "/ws/input",
@@ -1144,6 +1172,71 @@ async fn capture_preview(
     response
 }
 
+async fn labels_apply(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(request): Json<LabelsRequest>,
+) -> Response {
+    if let Err(response) = authenticate_runtime_request(&state, &headers, &uri) {
+        return response;
+    }
+    if request.schema_version != RUNTIME_API_SCHEMA_VERSION {
+        return bad_request("Unsupported schema version.").into_response();
+    }
+    if !is_contract_id(&request.session_id) || !is_contract_uuid(&request.idempotency_key) {
+        return bad_request("Invalid labels request.").into_response();
+    }
+    if request.updates.is_empty() {
+        return bad_request("Invalid labels request.").into_response();
+    }
+    if let Err(response) = ensure_active_session(&state, &request.session_id) {
+        return response;
+    }
+
+    let store = (!state.config.private_config().is_placeholder())
+        .then(|| PrivateArtifactStore::new(state.config.private_config()));
+    let apply = LabelApplyRequest {
+        session_id: request.session_id.clone(),
+        idempotency_key: request.idempotency_key,
+        updates: request.updates,
+    };
+    let outcome = match state.labels.apply(
+        apply,
+        |capture_id| {
+            state
+                .captures
+                .is_labelable_capture(&request.session_id, capture_id)
+        },
+        store.as_ref(),
+    ) {
+        Ok(outcome) => outcome,
+        Err(LabelStoreError::BackendUnavailable) => {
+            return backend_error(BackendError::BackendUnavailable).into_response();
+        }
+        Err(LabelStoreError::Conflict(conflicts)) => LabelApplyOutcome {
+            applied: false,
+            label_revision: state.labels.snapshot().label_revision,
+            conflicts,
+        },
+    };
+    publish_label_event(&state, outcome.label_revision, outcome.applied);
+
+    let mut response = Json(LabelsResponse::from(outcome)).into_response();
+    apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
+    response
+}
+
+async fn labels_snapshot(State(state): State<AppState>, headers: HeaderMap, uri: Uri) -> Response {
+    if let Err(response) = authenticate_runtime_request(&state, &headers, &uri) {
+        return response;
+    }
+
+    let mut response = Json(LabelsSnapshotResponse::from(state.labels.snapshot())).into_response();
+    apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
+    response
+}
+
 async fn pause_run(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1215,8 +1308,11 @@ async fn events_ws_handshake(
 
     let ws_events = state.ws_events.clone();
     let sanitizer = state.config.private_config().public_sanitizer();
+    let label_revision = state.labels.snapshot().label_revision;
     let mut response = ws
-        .on_upgrade(move |socket| serve_event_socket(socket, ws_events, sanitizer, status))
+        .on_upgrade(move |socket| {
+            serve_event_socket(socket, ws_events, sanitizer, status, label_revision)
+        })
         .into_response();
     apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
     response
@@ -1475,6 +1571,16 @@ fn publish_capture_event(state: &AppState, session_id: &str, view: &CaptureJobVi
         view.capture_id.clone(),
         &sanitizer,
     );
+}
+
+fn publish_label_event(state: &AppState, label_revision: u64, applied: bool) {
+    let Ok(session_id) = active_session_id(state) else {
+        return;
+    };
+    let sanitizer = state.config.private_config().public_sanitizer();
+    let _ = state
+        .ws_events
+        .publish_label(&session_id, label_revision, applied, &sanitizer);
 }
 
 fn project_active_capture(
@@ -1751,6 +1857,74 @@ pub struct SanitizedProvenance {
     pub layout_hash: &'static str,
     pub capture_spec_hash: &'static str,
     pub map_hash: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LabelsRequest {
+    pub schema_version: u16,
+    pub session_id: String,
+    pub idempotency_key: String,
+    pub updates: Vec<LabelUpdate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LabelsResponse {
+    pub schema_version: u16,
+    pub applied: bool,
+    pub label_revision: u64,
+    pub conflicts: Vec<ErrorObject>,
+}
+
+impl From<LabelApplyOutcome> for LabelsResponse {
+    fn from(outcome: LabelApplyOutcome) -> Self {
+        Self {
+            schema_version: RUNTIME_API_SCHEMA_VERSION,
+            applied: outcome.applied,
+            label_revision: outcome.label_revision,
+            conflicts: outcome
+                .conflicts
+                .into_iter()
+                .map(ErrorObject::from)
+                .collect(),
+        }
+    }
+}
+
+impl From<LabelConflict> for ErrorObject {
+    fn from(conflict: LabelConflict) -> Self {
+        let code = match conflict.kind {
+            LabelConflictKind::LabelConflict => ErrorCode::LabelConflict,
+            LabelConflictKind::BadRequest => ErrorCode::BadRequest,
+        };
+        Self {
+            code,
+            message: conflict.message.to_string(),
+            retryable: conflict.retryable,
+            details: json!({}),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LabelsSnapshotResponse {
+    pub schema_version: u16,
+    pub label_revision: u64,
+    pub target_labels: crate::labels::LabelTargetSnapshot,
+    pub status_labels: Vec<crate::labels::StatusLabelSnapshot>,
+    pub dedup_groups: Vec<crate::labels::DedupGroup>,
+}
+
+impl From<LabelSnapshot> for LabelsSnapshotResponse {
+    fn from(snapshot: LabelSnapshot) -> Self {
+        Self {
+            schema_version: RUNTIME_API_SCHEMA_VERSION,
+            label_revision: snapshot.label_revision,
+            target_labels: snapshot.target_labels,
+            status_labels: snapshot.status_labels,
+            dedup_groups: snapshot.dedup_groups,
+        }
+    }
 }
 
 impl From<crate::backend::RunStatus> for RunStatusResponse {

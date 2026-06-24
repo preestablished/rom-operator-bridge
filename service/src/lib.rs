@@ -5,6 +5,7 @@ pub mod backend;
 pub mod config;
 pub mod framebuffer;
 pub mod input;
+pub mod labels;
 pub mod private_config;
 pub mod sanitization;
 pub mod telemetry;
