@@ -1,5 +1,5 @@
 use axum::{
-    body::Body,
+    body::{Body, to_bytes},
     http::{
         Method, Request,
         header::{COOKIE, ORIGIN, SET_COOKIE},
@@ -15,12 +15,14 @@ use rom_operator_bridge_service::{
         RunStatus, SessionId, SessionState, StartBackendSession, StopReason, StoppedSession,
     },
     config::ServiceConfig,
+    input::{PAD_MASK, PadLog},
     private_config::{ENV_OPERATOR_CREDENTIAL, ENV_PRIVATE_ROOT, ENV_SESSION_SECRET},
 };
 use serde_json::{Value, json};
 use std::{
+    fs,
     net::SocketAddr,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -267,6 +269,195 @@ async fn reconnect_zero_input_is_acknowledged() {
     assert_eq!(backend.injected_requests().len(), 2);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn synthetic_ws_input_writes_padlog_and_private_diagnostics() {
+    let (_workspace, app, private_root) = synthetic_ws_app();
+    let (cookie, session) = login_session(app.clone()).await;
+    let session_id = session["session_id"]
+        .as_str()
+        .expect("session id is present");
+    let run_id = session["run_id"].as_str().expect("run id is present");
+    let server = WsServer::start(app).await;
+    let mut ws = server.connect(&cookie).await;
+    let all_buttons = [
+        "A", "B", "X", "Y", "L", "R", "Select", "Start", "Up", "Down", "Left", "Right",
+    ];
+    let expected_all_word = 0x0c3f_u16;
+    let button_cases = [
+        ("A", 0x0001_u16),
+        ("B", 0x0002_u16),
+        ("X", 0x0004_u16),
+        ("Y", 0x0008_u16),
+        ("L", 0x0010_u16),
+        ("R", 0x0020_u16),
+        ("Up", 0x0040_u16),
+        ("Down", 0x0080_u16),
+        ("Left", 0x0100_u16),
+        ("Right", 0x0200_u16),
+        ("Start", 0x0400_u16),
+        ("Select", 0x0800_u16),
+    ];
+
+    let all_pressed = send_input(&mut ws, input_message(1, "keyboard", &all_buttons)).await;
+    assert_eq!(all_pressed["type"], "input_ack");
+    assert_eq!(all_pressed["session_id"], session_id);
+    assert_eq!(all_pressed["payload"]["status"], "applied");
+    assert_eq!(all_pressed["payload"]["pad_word"], expected_all_word);
+    assert_ne!(expected_all_word, 0);
+    assert_eq!(u64::from(expected_all_word) & u64::from(!PAD_MASK), 0);
+
+    let duplicate_changed_payload = send_input(&mut ws, input_message(1, "keyboard", &["A"])).await;
+    assert_eq!(duplicate_changed_payload, all_pressed);
+
+    let mut expected_frames = vec![expected_all_word];
+    for (offset, (button, expected_word)) in button_cases.into_iter().enumerate() {
+        let ack = send_input(
+            &mut ws,
+            input_message(10 + offset as u64, "keyboard", &[button]),
+        )
+        .await;
+        assert_eq!(ack["type"], "input_ack");
+        assert_eq!(ack["payload"]["status"], "applied");
+        assert_eq!(ack["payload"]["pad_word"], expected_word);
+        assert_eq!(u64::from(expected_word) & u64::from(!PAD_MASK), 0);
+        expected_frames.push(expected_word);
+    }
+
+    let mut zero_frames = Vec::new();
+    for (client_seq, source_id) in [
+        (100, "focus"),
+        (101, "page-hidden"),
+        (102, "reconnect"),
+        (103, "gamepad-disconnect"),
+    ] {
+        let zero = send_input(&mut ws, input_message(client_seq, source_id, &[])).await;
+        assert_eq!(zero["type"], "input_ack");
+        assert_eq!(zero["source_id"], source_id);
+        assert_eq!(zero["payload"]["status"], "applied");
+        assert_eq!(zero["payload"]["pad_word"], 0);
+        zero_frames.push(
+            zero["payload"]["assigned_frame"]
+                .as_u64()
+                .expect("assigned frame is u64"),
+        );
+        expected_frames.push(0);
+    }
+    assert!(zero_frames.windows(2).all(|frames| frames[0] < frames[1]));
+
+    let run_root = private_root.join("runs").join(run_id);
+    let padlog_text = fs::read_to_string(run_root.join("input.padlog")).expect("padlog is written");
+    assert!(padlog_text.starts_with("padlog v1\n"));
+    assert!(padlog_text.ends_with("4x0000\n"));
+    let parsed = PadLog::parse(&padlog_text).expect("padlog parses");
+    assert_eq!(
+        parsed
+            .frames()
+            .iter()
+            .map(|word| word.raw())
+            .collect::<Vec<_>>(),
+        expected_frames
+    );
+
+    let event_lines = read_lines(&run_root.join("padlog-events.jsonl"));
+    assert_eq!(
+        event_lines.len(),
+        expected_frames.len(),
+        "duplicate client_seq must not append a second private event"
+    );
+    let events = event_lines
+        .iter()
+        .map(|line| serde_json::from_str::<Value>(line).expect("event row parses"))
+        .collect::<Vec<_>>();
+    assert_eq!(events[0]["schema_version"], 1);
+    assert_eq!(events[0]["run_id"], run_id);
+    assert_eq!(events[0]["frame_index"], 0);
+    assert_eq!(events[0]["client_seq"], 1);
+    assert_eq!(events[0]["source_id"], "keyboard");
+    assert_eq!(events[0]["pad_word"], expected_all_word);
+    assert_eq!(events[0]["status"], "applied");
+    assert_eq!(events[0]["message"], "input applied");
+
+    for (event, (button, expected_word)) in events.iter().skip(1).zip(button_cases) {
+        assert_eq!(event["source_id"], "keyboard");
+        assert_eq!(event["pad_word"], expected_word);
+        assert_eq!(
+            event["pad_word"].as_u64().unwrap() & u64::from(!PAD_MASK),
+            0
+        );
+        assert_eq!(
+            event["client_seq"],
+            10 + button_cases
+                .iter()
+                .position(|(name, _)| *name == button)
+                .expect("button is in cases") as u64
+        );
+    }
+
+    let zero_sources = ["focus", "page-hidden", "reconnect", "gamepad-disconnect"];
+    let first_zero_event = 1 + button_cases.len();
+    for ((event, source_id), acked_frame) in events
+        .iter()
+        .skip(first_zero_event)
+        .zip(zero_sources)
+        .zip(zero_frames)
+    {
+        assert_eq!(event["source_id"], source_id);
+        assert_eq!(event["pad_word"], 0);
+        assert_eq!(event["assigned_frame"], acked_frame);
+        assert_eq!(
+            event["pad_word"].as_u64().unwrap() & u64::from(!PAD_MASK),
+            0
+        );
+    }
+
+    let bridge_events = fs::read_to_string(run_root.join("bridge-events.jsonl"))
+        .expect("bridge event log is written");
+    assert!(bridge_events.contains("session_started"));
+    assert!(!bridge_events.contains(&private_root.display().to_string()));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn synthetic_ws_input_artifact_append_failure_rejects_without_advancing_padlog() {
+    let (_workspace, app, private_root) = synthetic_ws_app();
+    let (cookie, session) = login_session(app.clone()).await;
+    let run_id = session["run_id"].as_str().expect("run id is present");
+    let run_root = private_root.join("runs").join(run_id);
+    fs::create_dir(run_root.join("padlog-events.jsonl"))
+        .expect("directory blocks padlog event append");
+    let server = WsServer::start(app).await;
+    let mut ws = server.connect(&cookie).await;
+
+    let reject = send_input(&mut ws, input_message(1, "keyboard", &["A"])).await;
+
+    assert_eq!(reject["type"], "input_reject");
+    assert_eq!(reject["payload"]["error"]["code"], "backend_unavailable");
+    assert_eq!(reject["payload"]["error"]["message"], "Input rejected.");
+    let reject_text = reject.to_string();
+    for private in [
+        private_root.display().to_string(),
+        GOOD_CREDENTIAL.to_string(),
+        "input.padlog".to_string(),
+        "padlog-events.jsonl".to_string(),
+    ] {
+        assert!(
+            !reject_text.contains(&private),
+            "public reject leaked {private}"
+        );
+    }
+
+    let padlog_text = fs::read_to_string(run_root.join("input.padlog"))
+        .expect("rollback padlog snapshot is written");
+    assert_eq!(padlog_text, "padlog v1\n");
+    assert!(
+        PadLog::parse(&padlog_text)
+            .expect("rollback padlog parses")
+            .frames()
+            .is_empty()
+    );
+}
+
 struct WsServer {
     addr: SocketAddr,
     handle: tokio::task::JoinHandle<()>,
@@ -368,13 +559,17 @@ fn input_message(client_seq: u64, source_id: &str, buttons: &[&str]) -> Value {
         "payload": {
             "client_event_id": format!("00000000-0000-0000-0000-{client_seq:012}"),
             "client_time_ms": client_seq,
-            "source": "keyboard",
+            "source": payload_source(source_id),
             "buttons": buttons
         }
     })
 }
 
 async fn login_cookie(app: axum::Router) -> String {
+    login_session(app).await.0
+}
+
+async fn login_session(app: axum::Router) -> (String, Value) {
     let response = app
         .oneshot(
             Request::builder()
@@ -397,13 +592,27 @@ async fn login_cookie(app: axum::Router) -> String {
         .expect("login request runs");
     assert_eq!(response.status(), 200);
 
-    response
+    let cookie = response
         .headers()
         .get(SET_COOKIE)
         .and_then(|value| value.to_str().ok())
         .and_then(|cookie| cookie.split(';').next())
         .expect("session cookie pair exists")
-        .to_string()
+        .to_string();
+    let body = to_bytes(response.into_body(), 8192)
+        .await
+        .expect("login body reads");
+    let json = serde_json::from_slice(&body).expect("login response is json");
+
+    (cookie, json)
+}
+
+fn payload_source(source_id: &str) -> &'static str {
+    if source_id.contains("gamepad") {
+        "gamepad"
+    } else {
+        "keyboard"
+    }
 }
 
 fn runtime_json_request(method: Method, uri: &str, cookie: &str, body: Value) -> Request<Body> {
@@ -427,6 +636,21 @@ fn ws_app(state: SessionState) -> (tempfile::TempDir, axum::Router, Arc<Recordin
         backend.clone(),
     ));
     (workspace, app, backend)
+}
+
+fn synthetic_ws_app() -> (tempfile::TempDir, axum::Router, PathBuf) {
+    let workspace = tempfile::tempdir().expect("tempdir creates");
+    let private_root = workspace.path().join("bridge-private");
+    let app = router(AppState::synthetic_for_tests(config(&private_root)));
+    (workspace, app, private_root)
+}
+
+fn read_lines(path: &Path) -> Vec<String> {
+    fs::read_to_string(path)
+        .expect("jsonl file reads")
+        .lines()
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 fn config(private_root: &Path) -> ServiceConfig {

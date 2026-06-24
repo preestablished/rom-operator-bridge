@@ -383,7 +383,8 @@ impl IncomingEnvelope {
             self.client_seq,
             "1970-01-01T00:00:00Z",
             PadWord::from_buttons(buttons),
-        ))
+        )
+        .with_source_id(self.source_id.clone()))
     }
 
     fn client_event_id(&self) -> &str {

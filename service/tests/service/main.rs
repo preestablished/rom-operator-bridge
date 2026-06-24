@@ -183,6 +183,8 @@ fn backend_trait_surface_wires_synthetic_and_real_modes() {
             session_id: session.session_id.clone(),
             target_frame: 1,
             pad_word,
+            client_seq: 1,
+            source_id: "keyboard".to_string(),
         })
         .expect("synthetic input schedules");
 
