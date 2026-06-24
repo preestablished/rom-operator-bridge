@@ -112,7 +112,7 @@ export function renderOperatorApp(config: RuntimeConfig): string {
 }
 
 function runtimeStat(label: string, value: string): string {
-  return `<div><dt>${label}</dt><dd>${value}</dd></div>`;
+  return `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`;
 }
 
 function stateLabel(state: SessionState): string {
@@ -125,4 +125,23 @@ function previewLabel(state: OperatorViewModel["previewState"]): string {
 
 function validationLabel(state: OperatorViewModel["validationState"]): string {
   return state === "idle" ? "not queued" : state;
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, (character) => {
+    switch (character) {
+      case "&":
+        return "&amp;";
+      case "<":
+        return "&lt;";
+      case ">":
+        return "&gt;";
+      case '"':
+        return "&quot;";
+      case "'":
+        return "&#39;";
+      default:
+        return character;
+    }
+  });
 }

@@ -34,6 +34,15 @@ describe("runtime config", () => {
         allow_persistence: false
       })
     ).toEqual(DEFAULT_RUNTIME_CONFIG);
+
+    expect(
+      normalizeRuntimeConfig({
+        schema_version: 1,
+        api_base_path: "/api",
+        ws_base_path: "/ws",
+        private_root: "/operator/runtime"
+      })
+    ).toEqual(DEFAULT_RUNTIME_CONFIG);
   });
 
   it("keeps safe same-origin overrides", () => {
@@ -50,5 +59,60 @@ describe("runtime config", () => {
       ws_base_path: "/ws/events",
       allow_persistence: false
     });
+  });
+
+  it("rejects schema and persistence mismatches instead of coercing them", () => {
+    for (const unsafeConfig of [
+      {
+        api_base_path: "/api",
+        ws_base_path: "/ws",
+        allow_persistence: false
+      },
+      {
+        schema_version: 2,
+        api_base_path: "/api",
+        ws_base_path: "/ws",
+        allow_persistence: false
+      },
+      {
+        schema_version: 1,
+        api_base_path: "/api",
+        ws_base_path: "/ws"
+      },
+      {
+        schema_version: 1,
+        api_base_path: "/api",
+        ws_base_path: "/ws",
+        allow_persistence: true
+      }
+    ]) {
+      expect(normalizeRuntimeConfig(unsafeConfig)).toEqual(DEFAULT_RUNTIME_CONFIG);
+    }
+  });
+
+  it("rejects same-origin paths with markup or fragments", () => {
+    for (const unsafePath of ["/api/<img>", "/api/\"quoted\"", "/api#fragment", "/api?x=1"]) {
+      expect(
+        normalizeRuntimeConfig({
+          schema_version: 1,
+          api_base_path: unsafePath,
+          ws_base_path: "/ws",
+          allow_persistence: false
+        })
+      ).toEqual(DEFAULT_RUNTIME_CONFIG);
+    }
+  });
+
+  it("uses strict same-origin validation in the exported safety helper", () => {
+    for (const unsafePath of ["//example.invalid/api", "/api/../session", "/api?x=1"]) {
+      expect(
+        isRuntimeConfigSafe({
+          schema_version: 1,
+          api_base_path: unsafePath,
+          ws_base_path: "/ws",
+          allow_persistence: false
+        })
+      ).toBe(false);
+    }
   });
 });

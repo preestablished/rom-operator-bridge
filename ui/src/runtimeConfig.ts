@@ -26,14 +26,24 @@ export function normalizeRuntimeConfig(input: unknown): RuntimeConfig {
   if (!isRecord(input)) {
     return DEFAULT_RUNTIME_CONFIG;
   }
+  if (
+    containsForbiddenMaterial(input) ||
+    input.schema_version !== RUNTIME_API_SCHEMA_VERSION ||
+    input.allow_persistence !== false
+  ) {
+    return DEFAULT_RUNTIME_CONFIG;
+  }
+
+  const apiBasePath = sameOriginPath(input.api_base_path);
+  const wsBasePath = sameOriginPath(input.ws_base_path);
+  if (!apiBasePath || !wsBasePath) {
+    return DEFAULT_RUNTIME_CONFIG;
+  }
 
   const candidate: RuntimeConfig = {
-    schema_version:
-      input.schema_version === RUNTIME_API_SCHEMA_VERSION
-        ? RUNTIME_API_SCHEMA_VERSION
-        : DEFAULT_RUNTIME_CONFIG.schema_version,
-    api_base_path: sameOriginPath(input.api_base_path, "/api"),
-    ws_base_path: sameOriginPath(input.ws_base_path, "/ws"),
+    schema_version: RUNTIME_API_SCHEMA_VERSION,
+    api_base_path: apiBasePath,
+    ws_base_path: wsBasePath,
     allow_persistence: false
   };
 
@@ -61,22 +71,46 @@ export function isRuntimeConfigSafe(config: RuntimeConfig): boolean {
     !FORBIDDEN_CONFIG_KEYS.some((key) => serialized.includes(key)) &&
     config.allow_persistence === false &&
     config.schema_version === RUNTIME_API_SCHEMA_VERSION &&
-    config.api_base_path.startsWith("/") &&
-    config.ws_base_path.startsWith("/")
+    sameOriginPath(config.api_base_path) !== null &&
+    sameOriginPath(config.ws_base_path) !== null
   );
 }
 
-function sameOriginPath(value: unknown, fallback: string): string {
+function sameOriginPath(value: unknown): string | null {
   if (typeof value !== "string" || value.length === 0) {
-    return fallback;
+    return null;
   }
   if (!value.startsWith("/") || value.startsWith("//")) {
-    return fallback;
+    return null;
   }
-  if (value.includes("..") || value.includes("\\") || value.includes("?")) {
-    return fallback;
+  if (
+    value.includes("..") ||
+    value.includes("\\") ||
+    !/^\/[A-Za-z0-9/_:.-]*$/.test(value)
+  ) {
+    return null;
   }
   return value;
+}
+
+function containsForbiddenMaterial(value: unknown): boolean {
+  if (typeof value === "string") {
+    return includesForbidden(value);
+  }
+  if (Array.isArray(value)) {
+    return value.some(containsForbiddenMaterial);
+  }
+  if (isRecord(value)) {
+    return Object.entries(value).some(
+      ([key, entry]) => includesForbidden(key) || containsForbiddenMaterial(entry)
+    );
+  }
+  return false;
+}
+
+function includesForbidden(value: string): boolean {
+  const normalized = value.toLowerCase();
+  return FORBIDDEN_CONFIG_KEYS.some((key) => normalized.includes(key));
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
