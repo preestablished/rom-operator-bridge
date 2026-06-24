@@ -3,7 +3,10 @@ use crate::{
         ALLOWED_ORIGIN, AuthError, AuthState, expired_session_cookie_header, session_cookie_header,
         validate_runtime_request,
     },
-    backend::{BackendMode, BridgeBackend, RealBackendUnavailable, SyntheticBackend},
+    backend::{
+        BackendError, BackendMode, BridgeBackend, RealBackendUnavailable, StopReason,
+        SyntheticBackend,
+    },
     config::ServiceConfig,
     input::{PAD_LAYOUT_ID, PAD_LAYOUT_VERSION},
     ws_input::{WsInputState, serve_input_socket},
@@ -164,6 +167,11 @@ async fn start_session(
         Err(error) => return auth_error(error).into_response(),
     };
 
+    if let Err(error) = cleanup_runtime_session(&state, StopReason::SessionReplaced) {
+        state.auth.clear_session_token(&operator_session.token);
+        return backend_error(error).into_response();
+    }
+
     let backend_session = match state
         .backend
         .start_session(crate::backend::StartBackendSession {
@@ -212,10 +220,8 @@ async fn start_session(
 }
 
 async fn session_status(State(state): State<AppState>, headers: HeaderMap, uri: Uri) -> Response {
-    if let Err(error) = validate_runtime_request(&headers, &uri)
-        .and_then(|()| state.auth.authenticate_headers(&headers))
-    {
-        return auth_error(error).into_response();
+    if let Err(response) = authenticate_runtime_request(&state, &headers, &uri) {
+        return response;
     }
 
     let Some(session_id) = state
@@ -260,10 +266,8 @@ async fn stop_session(
     uri: Uri,
     Json(request): Json<StopSessionRequest>,
 ) -> Response {
-    if let Err(error) = validate_runtime_request(&headers, &uri)
-        .and_then(|()| state.auth.authenticate_headers(&headers))
-    {
-        return auth_error(error).into_response();
+    if let Err(response) = authenticate_runtime_request(&state, &headers, &uri) {
+        return response;
     }
     if request.schema_version != RUNTIME_API_SCHEMA_VERSION {
         return bad_request("Unsupported schema version.").into_response();
@@ -306,10 +310,8 @@ async fn stop_session(
 }
 
 async fn run_status(State(state): State<AppState>, headers: HeaderMap, uri: Uri) -> Response {
-    if let Err(error) = validate_runtime_request(&headers, &uri)
-        .and_then(|()| state.auth.authenticate_headers(&headers))
-    {
-        return auth_error(error).into_response();
+    if let Err(response) = authenticate_runtime_request(&state, &headers, &uri) {
+        return response;
     }
     let session_id = match active_session_id(&state) {
         Ok(session_id) => session_id,
@@ -350,10 +352,8 @@ async fn input_ws_handshake(
     headers: HeaderMap,
     uri: Uri,
 ) -> Response {
-    if let Err(error) = validate_runtime_request(&headers, &uri)
-        .and_then(|()| state.auth.authenticate_headers(&headers))
-    {
-        return auth_error(error).into_response();
+    if let Err(response) = authenticate_runtime_request(&state, &headers, &uri) {
+        return response;
     }
 
     let Some(session_id) = state
@@ -381,10 +381,8 @@ fn run_state_transition(
     request: SessionOnlyRequest,
     transition: RunTransition,
 ) -> Response {
-    if let Err(error) = validate_runtime_request(&headers, &uri)
-        .and_then(|()| state.auth.authenticate_headers(&headers))
-    {
-        return auth_error(error).into_response();
+    if let Err(response) = authenticate_runtime_request(&state, &headers, &uri) {
+        return response;
     }
     if request.schema_version != RUNTIME_API_SCHEMA_VERSION {
         return bad_request("Unsupported schema version.").into_response();
@@ -401,6 +399,14 @@ fn run_state_transition(
         Ok(boundary) => boundary,
         Err(error) => return backend_error(error).into_response(),
     };
+    if transition == RunTransition::Resume
+        && state
+            .ws_input
+            .flush_pending(state.backend.as_ref(), &boundary.session_id)
+            .is_err()
+    {
+        return backend_error(BackendError::BackendUnavailable).into_response();
+    }
 
     let mut response = Json(RunStateResponse {
         schema_version: RUNTIME_API_SCHEMA_VERSION,
@@ -410,6 +416,46 @@ fn run_state_transition(
     .into_response();
     apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
     response
+}
+
+fn authenticate_runtime_request(
+    state: &AppState,
+    headers: &HeaderMap,
+    uri: &Uri,
+) -> Result<(), Response> {
+    if let Err(error) = validate_runtime_request(headers, uri) {
+        return Err(auth_error(error).into_response());
+    }
+
+    match state.auth.authenticate_headers(headers) {
+        Ok(()) => Ok(()),
+        Err(AuthError::ExpiredSession) => {
+            if let Err(error) = cleanup_runtime_session(state, StopReason::SessionReplaced) {
+                return Err(backend_error(error).into_response());
+            }
+            Err(auth_error(AuthError::ExpiredSession).into_response())
+        }
+        Err(error) => Err(auth_error(error).into_response()),
+    }
+}
+
+fn cleanup_runtime_session(state: &AppState, reason: StopReason) -> Result<(), BackendError> {
+    let session_id = state
+        .runtime_session
+        .lock()
+        .expect("runtime session mutex poisoned")
+        .clone();
+    let Some(session_id) = session_id else {
+        return Ok(());
+    };
+
+    let stopped = state.backend.stop_session(session_id, reason)?;
+    *state
+        .runtime_session
+        .lock()
+        .expect("runtime session mutex poisoned") = None;
+    state.ws_input.reset_session(&stopped.session_id);
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -464,6 +510,7 @@ pub struct HealthResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StartSessionRequest {
     pub schema_version: u16,
     pub operator_credential: String,
@@ -483,6 +530,7 @@ pub struct StartSessionResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StopSessionRequest {
     pub schema_version: u16,
     pub session_id: String,
@@ -498,6 +546,7 @@ pub struct StopSessionResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionOnlyRequest {
     pub schema_version: u16,
     pub session_id: String,
@@ -696,11 +745,13 @@ fn auth_error(error: AuthError) -> AppError {
             "Session active elsewhere.",
             false,
         ),
-        AuthError::MissingSession | AuthError::BadSession => AppError::new(
-            StatusCode::UNAUTHORIZED,
-            ErrorCode::SessionInactive,
-            "Session inactive.",
-            false,
-        ),
+        AuthError::MissingSession | AuthError::ExpiredSession | AuthError::BadSession => {
+            AppError::new(
+                StatusCode::UNAUTHORIZED,
+                ErrorCode::SessionInactive,
+                "Session inactive.",
+                false,
+            )
+        }
     }
 }

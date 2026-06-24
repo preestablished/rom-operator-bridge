@@ -116,8 +116,11 @@ impl AuthState {
     pub fn authenticate_token(&self, token: &str) -> Result<(), AuthError> {
         let mut inner = self.inner.lock().expect("auth mutex poisoned");
         let now = self.clock.now_unix_seconds();
-        inner.clear_expired(now);
         let active = inner.active.as_ref().ok_or(AuthError::MissingSession)?;
+        if active.expires_at_unix_seconds <= now {
+            inner.active = None;
+            return Err(AuthError::ExpiredSession);
+        }
         if constant_time_eq(token.as_bytes(), active.token.as_bytes()) {
             Ok(())
         } else {
@@ -206,6 +209,8 @@ pub enum AuthError {
     SessionActiveElsewhere,
     #[error("session cookie is missing")]
     MissingSession,
+    #[error("session cookie is expired")]
+    ExpiredSession,
     #[error("session cookie is invalid")]
     BadSession,
     #[error(transparent)]

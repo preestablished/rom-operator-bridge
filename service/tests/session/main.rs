@@ -7,13 +7,13 @@ use axum::{
 };
 use rom_operator_bridge_service::{
     api::{AppState, router},
-    auth::{ALLOWED_ORIGIN, AuthState},
+    auth::{ALLOWED_ORIGIN, AuthState, SESSION_TTL_SECONDS},
     backend::{BridgeBackend, SessionState, SyntheticBackend},
     config::ServiceConfig,
     private_config::{ENV_OPERATOR_CREDENTIAL, ENV_PRIVATE_ROOT, ENV_SESSION_SECRET},
 };
 use serde_json::{Value, json};
-use std::{fs, path::Path, sync::Arc};
+use std::{fs, os::unix::fs::PermissionsExt, path::Path, sync::Arc};
 use tower::ServiceExt;
 
 const GOOD_CREDENTIAL: &str = "operator-credential-from-test-source";
@@ -205,6 +205,110 @@ async fn synthetic_backend_can_report_faulted_status() {
     assert_matches_runtime_schema(&faulted);
 }
 
+#[tokio::test]
+async fn faulted_synthetic_session_rejects_pause_resume_and_remains_faulted() {
+    let workspace = tempfile::tempdir().expect("tempdir creates");
+    let private_root = workspace.path().join("bridge-private");
+    let backend = Arc::new(SyntheticBackend::with_private_config(
+        config(&private_root).private_config().clone(),
+    ));
+    let app = router(AppState::for_tests_with_backend(
+        config(&private_root),
+        AuthState::new(),
+        backend.clone(),
+    ));
+    let (start, cookie) = start_session(app.clone()).await;
+    let session_id = start["session_id"].as_str().expect("session id is string");
+    backend
+        .fault_active_session_for_tests()
+        .expect("synthetic session faults");
+
+    for path in ["/api/run/pause", "/api/run/resume"] {
+        let response = app
+            .clone()
+            .oneshot(
+                runtime_request(
+                    Method::POST,
+                    path,
+                    Body::from(session_only_body(session_id)),
+                )
+                .with_header(COOKIE, &cookie),
+            )
+            .await
+            .expect("state transition request runs");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let status = request_json(
+            app.clone(),
+            runtime_request(Method::GET, "/api/run/status", Body::empty())
+                .with_header(COOKIE, &cookie),
+        )
+        .await;
+        assert_eq!(status["state"], "faulted");
+    }
+}
+
+#[tokio::test]
+async fn runtime_session_requests_reject_unknown_fields() {
+    let (_workspace, app, _private_root) = session_app();
+    let (start, cookie) = start_session(app.clone()).await;
+    let session_id = start["session_id"].as_str().expect("session id is string");
+
+    let response = app
+        .oneshot(
+            runtime_request(
+                Method::POST,
+                "/api/run/pause",
+                Body::from(
+                    json!({
+                        "schema_version": 1,
+                        "session_id": session_id,
+                        "private_root": "/tmp/should-not-be-accepted"
+                    })
+                    .to_string(),
+                ),
+            )
+            .with_header(COOKIE, &cookie),
+        )
+        .await
+        .expect("pause request runs");
+
+    assert!(matches!(
+        response.status(),
+        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
+    ));
+}
+
+#[tokio::test]
+async fn expired_auth_stops_stale_synthetic_run_before_replacement() {
+    let workspace = tempfile::tempdir().expect("tempdir creates");
+    let private_root = workspace.path().join("bridge-private");
+    let auth = AuthState::fixed_for_tests(1_000);
+    let app = router(AppState::synthetic_for_tests_with_auth(
+        config(&private_root),
+        auth.clone(),
+    ));
+
+    let (first, _first_cookie) = start_session(app.clone()).await;
+    let first_run_id = first["run_id"].as_str().expect("run id is string");
+    auth.advance_for_tests(SESSION_TTL_SECONDS + 1);
+
+    let (second, _second_cookie) = start_session(app).await;
+
+    assert_ne!(second["run_id"], first["run_id"]);
+    let events_path = private_root
+        .join("runs")
+        .join(first_run_id)
+        .join("bridge-events.jsonl");
+    let events = fs::read_to_string(events_path).expect("events read");
+    let event_types = events
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("event parses"))
+        .map(|event| event["event_type"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(event_types, vec!["session_started", "session_stopped"]);
+}
+
 #[test]
 fn synthetic_backend_trait_tracks_pause_resume_stop_state() {
     let backend = SyntheticBackend::new();
@@ -237,6 +341,35 @@ fn synthetic_backend_trait_tracks_pause_resume_stop_state() {
         .expect("session stops");
     assert_eq!(stopped.state, SessionState::Stopped);
     assert!(backend.status(session.session_id).is_err());
+}
+
+#[test]
+fn synthetic_backend_artifact_failure_does_not_activate_session() {
+    let workspace = tempfile::tempdir().expect("tempdir creates");
+    let private_root = workspace.path().join("bridge-private");
+    let service_config = config(&private_root);
+    fs::set_permissions(&private_root, fs::Permissions::from_mode(0o500))
+        .expect("private root permissions update");
+    let backend = SyntheticBackend::with_private_config(service_config.private_config().clone());
+
+    let start = backend.start_session(rom_operator_bridge_service::backend::StartBackendSession {
+        requested_capabilities: backend.capabilities(),
+    });
+
+    fs::set_permissions(&private_root, fs::Permissions::from_mode(0o700))
+        .expect("private root permissions restore");
+    assert!(start.is_err());
+    assert!(
+        backend
+            .status("synthetic-session-scaffold".to_string())
+            .is_err()
+    );
+    let session = backend
+        .start_session(rom_operator_bridge_service::backend::StartBackendSession {
+            requested_capabilities: backend.capabilities(),
+        })
+        .expect("session starts after permissions are restored");
+    assert_eq!(session.session_id, "synthetic-session-scaffold");
 }
 
 fn session_app() -> (tempfile::TempDir, axum::Router, std::path::PathBuf) {

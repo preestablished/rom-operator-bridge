@@ -251,13 +251,29 @@ impl SyntheticBackend {
 
     pub fn fault_active_session_for_tests(&self) -> BackendResult<RunStatus> {
         let mut inner = self.inner.lock().expect("synthetic backend mutex poisoned");
-        let session = inner
+        let (run_id, status) = {
+            let session = inner
+                .active
+                .as_ref()
+                .ok_or(BackendError::BackendUnavailable)?;
+            let mut faulted = session.clone();
+            faulted.state = SessionState::Faulted;
+            (
+                session.run_id.clone(),
+                faulted.status(self.mode(), self.capabilities()),
+            )
+        };
+        inner.append_event_for_run(
+            &self.private_config,
+            &run_id,
+            "session_faulted",
+            "session faulted",
+        )?;
+        inner
             .active
             .as_mut()
-            .ok_or(BackendError::BackendUnavailable)?;
-        session.state = SessionState::Faulted;
-        let status = session.status(self.mode(), self.capabilities());
-        inner.append_event(&self.private_config, "session_faulted", "session faulted")?;
+            .ok_or(BackendError::BackendUnavailable)?
+            .state = SessionState::Faulted;
         Ok(status)
     }
 }
@@ -273,8 +289,10 @@ impl BridgeBackend for SyntheticBackend {
 
     fn start_session(&self, _request: StartBackendSession) -> BackendResult<BackendSession> {
         let mut inner = self.inner.lock().expect("synthetic backend mutex poisoned");
+        if inner.active.is_some() {
+            return Err(BackendError::BackendUnavailable);
+        }
         let sequence = inner.next_sequence;
-        inner.next_sequence += 1;
         let session_id = synthetic_session_id(sequence);
         let run_id = synthetic_run_id(sequence);
         let session = SyntheticSession {
@@ -285,9 +303,15 @@ impl BridgeBackend for SyntheticBackend {
             last_preview_frame: 0,
             last_applied_input_frame: 0,
         };
-        inner.active = Some(session.clone());
         inner.write_manifest(&self.private_config, &run_id)?;
-        inner.append_event(&self.private_config, "session_started", "session started")?;
+        inner.append_event_for_run(
+            &self.private_config,
+            &run_id,
+            "session_started",
+            "session started",
+        )?;
+        inner.next_sequence += 1;
+        inner.active = Some(session.clone());
 
         Ok(session.backend_session(self.capabilities()))
     }
@@ -298,18 +322,27 @@ impl BridgeBackend for SyntheticBackend {
         _reason: StopReason,
     ) -> BackendResult<StoppedSession> {
         let mut inner = self.inner.lock().expect("synthetic backend mutex poisoned");
-        let session = inner
-            .active
-            .as_mut()
-            .filter(|session| session.session_id == session_id)
-            .ok_or(BackendError::BackendUnavailable)?;
-        session.state = SessionState::Stopped;
-        let stopped = StoppedSession {
-            session_id: session.session_id.clone(),
-            state: SessionState::Stopped,
-            final_frame: session.current_frame,
+        let (run_id, stopped) = {
+            let session = inner
+                .active
+                .as_ref()
+                .filter(|session| session.session_id == session_id)
+                .ok_or(BackendError::BackendUnavailable)?;
+            (
+                session.run_id.clone(),
+                StoppedSession {
+                    session_id: session.session_id.clone(),
+                    state: SessionState::Stopped,
+                    final_frame: session.current_frame,
+                },
+            )
         };
-        inner.append_event(&self.private_config, "session_stopped", "session stopped")?;
+        inner.append_event_for_run(
+            &self.private_config,
+            &run_id,
+            "session_stopped",
+            "session stopped",
+        )?;
         inner.active = None;
 
         Ok(stopped)
@@ -331,37 +364,84 @@ impl BridgeBackend for SyntheticBackend {
 
     fn pause(&self, session_id: SessionId) -> BackendResult<RunBoundary> {
         let mut inner = self.inner.lock().expect("synthetic backend mutex poisoned");
+        let (run_id, boundary, should_append_event) = {
+            let session = inner
+                .active
+                .as_ref()
+                .filter(|session| session.session_id == session_id)
+                .ok_or(BackendError::BackendUnavailable)?;
+            if session.state == SessionState::Faulted {
+                return Err(BackendError::BackendUnavailable);
+            }
+            let boundary = RunBoundary {
+                session_id: session.session_id.clone(),
+                state: SessionState::Paused,
+                current_frame: session.current_frame,
+            };
+            (
+                session.run_id.clone(),
+                boundary,
+                session.state != SessionState::Paused,
+            )
+        };
+        if should_append_event {
+            inner.append_event_for_run(
+                &self.private_config,
+                &run_id,
+                "session_paused",
+                "session paused",
+            )?;
+        }
         let session = inner
             .active
             .as_mut()
-            .filter(|session| session.session_id == session_id)
             .ok_or(BackendError::BackendUnavailable)?;
         session.state = SessionState::Paused;
-        let boundary = RunBoundary {
-            session_id: session.session_id.clone(),
-            state: session.state,
-            current_frame: session.current_frame,
-        };
-        inner.append_event(&self.private_config, "session_paused", "session paused")?;
 
         Ok(boundary)
     }
 
     fn resume(&self, session_id: SessionId) -> BackendResult<RunBoundary> {
         let mut inner = self.inner.lock().expect("synthetic backend mutex poisoned");
+        let (run_id, boundary, should_append_event) = {
+            let session = inner
+                .active
+                .as_ref()
+                .filter(|session| session.session_id == session_id)
+                .ok_or(BackendError::BackendUnavailable)?;
+            if session.state == SessionState::Faulted {
+                return Err(BackendError::BackendUnavailable);
+            }
+            let next_frame = if session.state == SessionState::Paused {
+                session.current_frame.saturating_add(1)
+            } else {
+                session.current_frame
+            };
+            let boundary = RunBoundary {
+                session_id: session.session_id.clone(),
+                state: SessionState::Running,
+                current_frame: next_frame,
+            };
+            (
+                session.run_id.clone(),
+                boundary,
+                session.state != SessionState::Running,
+            )
+        };
+        if should_append_event {
+            inner.append_event_for_run(
+                &self.private_config,
+                &run_id,
+                "session_resumed",
+                "session resumed",
+            )?;
+        }
         let session = inner
             .active
             .as_mut()
-            .filter(|session| session.session_id == session_id)
             .ok_or(BackendError::BackendUnavailable)?;
         session.state = SessionState::Running;
-        session.current_frame = session.current_frame.saturating_add(1);
-        let boundary = RunBoundary {
-            session_id: session.session_id.clone(),
-            state: session.state,
-            current_frame: session.current_frame,
-        };
-        inner.append_event(&self.private_config, "session_resumed", "session resumed")?;
+        session.current_frame = boundary.current_frame;
 
         Ok(boundary)
     }
@@ -373,6 +453,9 @@ impl BridgeBackend for SyntheticBackend {
             .as_mut()
             .filter(|session| session.session_id == request.session_id)
             .ok_or(BackendError::BackendUnavailable)?;
+        if session.state != SessionState::Running {
+            return Err(BackendError::BackendUnavailable);
+        }
         session.last_applied_input_frame = request.target_frame;
         session.current_frame = session.current_frame.max(request.target_frame);
         Ok(InputScheduleReceipt {
@@ -437,33 +520,33 @@ impl SyntheticBackendInner {
             .map_err(|_| BackendError::BackendUnavailable)
     }
 
-    fn append_event(
+    fn append_event_for_run(
         &mut self,
         private_config: &BridgePrivateConfig,
+        run_id: &str,
         event_type: &str,
         message: &str,
     ) -> BackendResult<()> {
         if private_config.is_placeholder() {
             return Ok(());
         }
-        let Some(session) = &self.active else {
-            return Ok(());
-        };
-        self.next_event_seq += 1;
+        let next_event_seq = self.next_event_seq + 1;
 
         PrivateArtifactStore::new(private_config)
             .append_bridge_event(
-                &session.run_id,
+                run_id,
                 &BridgeEventRow::new(
-                    &session.run_id,
-                    self.next_event_seq,
+                    run_id,
+                    next_event_seq,
                     synthetic_timestamp(),
                     event_type,
                     message,
                 ),
             )
             .map(|_| ())
-            .map_err(|_| BackendError::BackendUnavailable)
+            .map_err(|_| BackendError::BackendUnavailable)?;
+        self.next_event_seq = next_event_seq;
+        Ok(())
     }
 }
 

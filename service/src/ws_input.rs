@@ -44,6 +44,18 @@ impl WsInputState {
         inner.sources.clear();
     }
 
+    pub fn flush_pending(
+        &self,
+        backend: &dyn BridgeBackend,
+        session_id: &str,
+    ) -> Result<Vec<InputScheduleOutcome>, InputSchedulerError> {
+        let mut inner = self.inner.lock().expect("ws input mutex poisoned");
+        let mut rejection_sink = NoopInputRejectionSink;
+        inner
+            .scheduler
+            .flush_pending(backend, session_id, &mut rejection_sink)
+    }
+
     fn handle_text(
         &self,
         backend: &dyn BridgeBackend,

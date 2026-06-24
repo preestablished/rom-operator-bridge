@@ -2,7 +2,7 @@ use axum::{
     body::Body,
     http::{
         Method, Request,
-        header::{ORIGIN, SET_COOKIE},
+        header::{COOKIE, ORIGIN, SET_COOKIE},
     },
 };
 use futures_util::{SinkExt, StreamExt};
@@ -98,6 +98,52 @@ async fn queue_overflow_returns_sanitized_input_reject() {
     assert_eq!(overflow["payload"]["error"]["details"], json!({}));
     assert!(!overflow.to_string().contains(GOOD_CREDENTIAL));
     assert!(backend.injected_requests().is_empty());
+}
+
+#[tokio::test]
+async fn resume_route_flushes_queued_paused_input() {
+    let (_workspace, app, backend) = ws_app(SessionState::Running);
+    let cookie = login_cookie(app.clone()).await;
+    let pause = app
+        .clone()
+        .oneshot(runtime_json_request(
+            Method::POST,
+            "/api/run/pause",
+            &cookie,
+            json!({
+                "schema_version": 1,
+                "session_id": SESSION_ID
+            }),
+        ))
+        .await
+        .expect("pause request runs");
+    assert_eq!(pause.status(), 200);
+
+    let server = WsServer::start(app.clone()).await;
+    let mut ws = server.connect(&cookie).await;
+    let queued = send_input(&mut ws, input_message(1, "keyboard", &["A"])).await;
+    assert_eq!(queued["type"], "input_ack");
+    assert_eq!(queued["payload"]["status"], "queued");
+    assert!(backend.injected_requests().is_empty());
+
+    let resume = app
+        .oneshot(runtime_json_request(
+            Method::POST,
+            "/api/run/resume",
+            &cookie,
+            json!({
+                "schema_version": 1,
+                "session_id": SESSION_ID
+            }),
+        ))
+        .await
+        .expect("resume request runs");
+
+    assert_eq!(resume.status(), 200);
+    let injected = backend.injected_requests();
+    assert_eq!(injected.len(), 1);
+    assert_eq!(injected[0].session_id, SESSION_ID);
+    assert_eq!(injected[0].pad_word.raw(), 1);
 }
 
 #[tokio::test]
@@ -360,6 +406,17 @@ async fn login_cookie(app: axum::Router) -> String {
         .to_string()
 }
 
+fn runtime_json_request(method: Method, uri: &str, cookie: &str, body: Value) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(ORIGIN, ALLOWED_ORIGIN)
+        .header(COOKIE, cookie)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("runtime request builds")
+}
+
 fn ws_app(state: SessionState) -> (tempfile::TempDir, axum::Router, Arc<RecordingBackend>) {
     let workspace = tempfile::tempdir().expect("tempdir creates");
     let private_root = workspace.path().join("bridge-private");
@@ -389,16 +446,20 @@ fn config(private_root: &Path) -> ServiceConfig {
 
 #[derive(Debug)]
 struct RecordingBackend {
-    state: SessionState,
+    state: Mutex<SessionState>,
     injected: Mutex<Vec<InputScheduleRequest>>,
 }
 
 impl RecordingBackend {
     fn new(state: SessionState) -> Self {
         Self {
-            state,
+            state: Mutex::new(state),
             injected: Mutex::new(Vec::new()),
         }
+    }
+
+    fn state(&self) -> SessionState {
+        *self.state.lock().expect("state mutex poisoned")
     }
 
     fn injected_requests(&self) -> Vec<InputScheduleRequest> {
@@ -422,7 +483,7 @@ impl BridgeBackend for RecordingBackend {
         Ok(BackendSession {
             session_id: SESSION_ID.to_string(),
             run_id: RUN_ID.to_string(),
-            state: self.state,
+            state: self.state(),
             current_frame: 0,
             capabilities: self.capabilities(),
         })
@@ -444,7 +505,7 @@ impl BridgeBackend for RecordingBackend {
         Ok(RunStatus {
             session_id,
             run_id: RUN_ID.to_string(),
-            state: self.state,
+            state: self.state(),
             backend_mode: self.mode(),
             current_frame: 0,
             capabilities: self.capabilities(),
@@ -455,6 +516,7 @@ impl BridgeBackend for RecordingBackend {
     }
 
     fn pause(&self, session_id: SessionId) -> BackendResult<RunBoundary> {
+        *self.state.lock().expect("state mutex poisoned") = SessionState::Paused;
         Ok(RunBoundary {
             session_id,
             state: SessionState::Paused,
@@ -463,6 +525,7 @@ impl BridgeBackend for RecordingBackend {
     }
 
     fn resume(&self, session_id: SessionId) -> BackendResult<RunBoundary> {
+        *self.state.lock().expect("state mutex poisoned") = SessionState::Running;
         Ok(RunBoundary {
             session_id,
             state: SessionState::Running,
