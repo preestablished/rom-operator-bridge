@@ -1,7 +1,7 @@
 use crate::{
     auth::{
         ALLOWED_ORIGIN, AuthError, AuthState, expired_session_cookie_header, session_cookie_header,
-        validate_runtime_request,
+        validate_origin, validate_runtime_request,
     },
     backend::{
         BackendError, BackendMode, BridgeBackend, RealBackendUnavailable, StopReason,
@@ -14,16 +14,20 @@ use crate::{
 };
 use axum::{
     Json, Router,
+    body::Body,
     extract::{State, ws::WebSocketUpgrade},
     http::{
         HeaderMap, HeaderName, HeaderValue, StatusCode, Uri,
-        header::{ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, PRAGMA, SET_COOKIE, VARY},
+        header::{
+            ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, CONTENT_TYPE, PRAGMA, SET_COOKIE, VARY,
+        },
     },
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
 
 pub const RUNTIME_API_SCHEMA_VERSION: u16 = 1;
@@ -115,6 +119,14 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/run/resume",
             post(resume_run).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/frame/current",
+            get(frame_current).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/frame/current/image",
+            get(frame_current_image).fallback(method_not_allowed),
         )
         .route(
             "/ws/input",
@@ -340,6 +352,66 @@ async fn run_status(State(state): State<AppState>, headers: HeaderMap, uri: Uri)
     response
 }
 
+async fn frame_current(State(state): State<AppState>, headers: HeaderMap, uri: Uri) -> Response {
+    if let Err(response) = authenticate_runtime_request(&state, &headers, &uri) {
+        return response;
+    }
+    let session_id = match active_session_id(&state) {
+        Ok(session_id) => session_id,
+        Err(response) => return response,
+    };
+
+    let status = match state.backend.status(session_id.clone()) {
+        Ok(status) => status,
+        Err(error) => return backend_error(error).into_response(),
+    };
+    let preview = match state.backend.framebuffer(session_id) {
+        Ok(preview) => preview,
+        Err(error) => return backend_error(error).into_response(),
+    };
+
+    let mut response = Json(FrameCurrentResponse {
+        schema_version: RUNTIME_API_SCHEMA_VERSION,
+        frame: preview.frame,
+        captured_at: "1970-01-01T00:00:00Z",
+        stale: preview.frame < status.current_frame,
+        width: preview.width,
+        height: preview.height,
+        format: "image/png",
+        image_url: format!("/api/frame/current/image?frame={}", preview.frame),
+        preview_hash: sha256_ref(&preview.png_bytes),
+    })
+    .into_response();
+    apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
+    response
+}
+
+async fn frame_current_image(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    if let Err(response) = authenticate_runtime_request_allowing_frame_hint(&state, &headers, &uri)
+    {
+        return response;
+    }
+    let session_id = match active_session_id(&state) {
+        Ok(session_id) => session_id,
+        Err(response) => return response,
+    };
+    let preview = match state.backend.framebuffer(session_id) {
+        Ok(preview) => preview,
+        Err(error) => return backend_error(error).into_response(),
+    };
+
+    let mut response = Response::new(Body::from(preview.png_bytes));
+    apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("image/png"));
+    response
+}
+
 async fn pause_run(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -481,6 +553,37 @@ fn authenticate_runtime_request(
         }
         Err(error) => Err(auth_error(error).into_response()),
     }
+}
+
+fn authenticate_runtime_request_allowing_frame_hint(
+    state: &AppState,
+    headers: &HeaderMap,
+    uri: &Uri,
+) -> Result<(), Response> {
+    if uri.query().is_some_and(is_frame_hint_query) {
+        if let Err(error) = validate_origin(headers) {
+            return Err(auth_error(error).into_response());
+        }
+        match state.auth.authenticate_headers(headers) {
+            Ok(()) => Ok(()),
+            Err(AuthError::ExpiredSession) => {
+                if let Err(error) = cleanup_runtime_session(state, StopReason::SessionReplaced) {
+                    return Err(backend_error(error).into_response());
+                }
+                Err(auth_error(AuthError::ExpiredSession).into_response())
+            }
+            Err(error) => Err(auth_error(error).into_response()),
+        }
+    } else {
+        authenticate_runtime_request(state, headers, uri)
+    }
+}
+
+fn is_frame_hint_query(query: &str) -> bool {
+    let Some(frame) = query.strip_prefix("frame=") else {
+        return false;
+    };
+    !frame.is_empty() && frame.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn cleanup_runtime_session(state: &AppState, reason: StopReason) -> Result<(), BackendError> {
@@ -640,6 +743,19 @@ pub struct RunStatusResponse {
     pub capabilities: crate::backend::BackendCapabilities,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FrameCurrentResponse {
+    pub schema_version: u16,
+    pub frame: u64,
+    pub captured_at: &'static str,
+    pub stale: bool,
+    pub width: u32,
+    pub height: u32,
+    pub format: &'static str,
+    pub image_url: String,
+    pub preview_hash: String,
+}
+
 impl From<crate::backend::RunStatus> for RunStatusResponse {
     fn from(status: crate::backend::RunStatus) -> Self {
         Self {
@@ -777,6 +893,25 @@ fn backend_error(_error: crate::backend::BackendError) -> AppError {
         "Backend unavailable.",
         true,
     )
+}
+
+fn sha256_ref(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut output = String::with_capacity("sha256:".len() + digest.len() * 2);
+    output.push_str("sha256:");
+    for byte in digest {
+        output.push(hex_nibble(byte >> 4));
+        output.push(hex_nibble(byte & 0x0f));
+    }
+    output
+}
+
+fn hex_nibble(value: u8) -> char {
+    match value {
+        0..=9 => (b'0' + value) as char,
+        10..=15 => (b'a' + value - 10) as char,
+        _ => unreachable!("nibble is masked to four bits"),
+    }
 }
 
 fn auth_error(error: AuthError) -> AppError {
