@@ -79,6 +79,15 @@ describe("browser-safe recovery states", () => {
     expect(recovery(captureFailed, "capture_failed")?.textContent).toContain("Capture failed");
     expectSafe(captureFailed);
 
+    const captureFailedWithPath = render(activeState(), {
+      captureError: "layout mismatch at /var/tmp/operator-report.txt",
+      captureErrorCode: "capture_failed"
+    });
+    expect(recovery(captureFailedWithPath, "capture_failed")?.textContent).toContain(
+      "Keep the failed capture visible"
+    );
+    expect(captureFailedWithPath.textContent ?? "").not.toContain("/var/tmp/operator-report.txt");
+
     const labelConflict = render(activeState(errorDisplay("label_conflict", "first_boss conflicts with rejected")));
     expect(recovery(labelConflict, "label_conflict")?.textContent).toContain(
       "first_boss conflicts with rejected"
@@ -245,6 +254,26 @@ describe("browser-safe recovery states", () => {
       const sendsAfterReject = socketClient.sendInput.mock.calls.length;
       button?.click();
       expect(socketClient.sendInput).toHaveBeenCalledTimes(sendsAfterReject);
+
+      const requestAnimationFrame = vi.fn();
+      const getGamepads = vi.fn();
+      Object.defineProperty(globalThis, "requestAnimationFrame", {
+        configurable: true,
+        value: requestAnimationFrame
+      });
+      Object.defineProperty(globalThis, "cancelAnimationFrame", {
+        configurable: true,
+        value: vi.fn()
+      });
+      Object.defineProperty(navigator, "getGamepads", {
+        configurable: true,
+        value: getGamepads
+      });
+      root.querySelector<HTMLElement>("[data-input-focus-surface]")?.focus();
+      window.dispatchEvent(new Event("focus"));
+      window.dispatchEvent(new Event("gamepadconnected"));
+      expect(requestAnimationFrame).not.toHaveBeenCalled();
+      expect(getGamepads).not.toHaveBeenCalled();
     } finally {
       root.remove();
       vi.restoreAllMocks();

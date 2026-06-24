@@ -1189,6 +1189,7 @@ export function mountOperatorApp(
       auth.status === "active" &&
       auth.session.state === "running" &&
       !auth.session.preview_stale &&
+      !inputBlockingError(auth.error?.code) &&
       !preview?.stale &&
       currentFocusState() === "focused" &&
       inputSurfaceFocused()
@@ -1581,7 +1582,8 @@ function isActiveCaptureStatus(status: CaptureStatus): boolean {
 }
 
 const UNSAFE_BROWSER_TEXT_PATTERN =
-  /credential|password|secret|token|private|\/home\/|\/run\/|\.env|[A-Za-z]:\\|raw payload|raw command|command output|feature bytes|validation report|screenshot/i;
+  /credential|password|secret|token|private|(?:^|\s)\/[A-Za-z0-9._~/-]+|(?:^|\s)~\/|[A-Za-z]:\\|\.env|raw [a-z]+|command output|stdout|stderr|feature bytes|validation report|stack trace|traceback|screenshot|hex dump/i;
+const SAFE_BROWSER_MESSAGE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9 .,:;_()'-]{0,159}$/;
 
 function runtimeDisplayError(error: unknown, fallbackCode: RuntimeErrorCode): RuntimeErrorDisplay {
   if (error instanceof RuntimeApiError) {
@@ -1599,7 +1601,11 @@ function runtimeDisplayError(error: unknown, fallbackCode: RuntimeErrorCode): Ru
 }
 
 function safeBrowserMessage(message: string, fallback = "Request failed."): string {
-  return UNSAFE_BROWSER_TEXT_PATTERN.test(message) ? fallback : message;
+  const trimmedMessage = message.trim();
+  return !SAFE_BROWSER_MESSAGE_PATTERN.test(trimmedMessage) ||
+    UNSAFE_BROWSER_TEXT_PATTERN.test(trimmedMessage)
+    ? fallback
+    : trimmedMessage;
 }
 
 function padWordButtons(padWord: number): PadButton[] {
