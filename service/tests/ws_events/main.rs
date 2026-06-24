@@ -95,6 +95,62 @@ async fn authenticated_event_connection_emits_ordered_sanitized_snapshot() {
 }
 
 #[tokio::test]
+async fn event_websocket_handshake_includes_runtime_security_headers() {
+    let (_workspace, app, _private_root) = ws_app(EventBackend::new(
+        SESSION_ID,
+        SessionState::Running,
+        Some(CAPTURE_JOB_ID.to_string()),
+    ));
+    let cookie = login_cookie(app.clone()).await;
+    let server = WsServer::start(app).await;
+
+    let mut request = format!("ws://{}/ws/events", server.addr)
+        .into_client_request()
+        .expect("websocket request builds");
+    request
+        .headers_mut()
+        .insert("Origin", HeaderValue::from_static(ALLOWED_ORIGIN));
+    request.headers_mut().insert(
+        HeaderName::from_static("cookie"),
+        HeaderValue::from_str(&cookie).expect("cookie header parses"),
+    );
+
+    let (_socket, response) = connect_async(request).await.expect("websocket connects");
+    let headers = response.headers();
+
+    assert_eq!(
+        headers
+            .get(HeaderName::from_static("cache-control"))
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+    assert_eq!(
+        headers
+            .get(HeaderName::from_static("pragma"))
+            .and_then(|value| value.to_str().ok()),
+        Some("no-cache")
+    );
+    assert_eq!(
+        headers
+            .get(HeaderName::from_static("x-content-type-options"))
+            .and_then(|value| value.to_str().ok()),
+        Some("nosniff")
+    );
+    assert_eq!(
+        headers
+            .get(HeaderName::from_static("access-control-allow-origin"))
+            .and_then(|value| value.to_str().ok()),
+        Some(ALLOWED_ORIGIN)
+    );
+    assert_eq!(
+        headers
+            .get(HeaderName::from_static("vary"))
+            .and_then(|value| value.to_str().ok()),
+        Some("Origin")
+    );
+}
+
+#[tokio::test]
 async fn event_connection_requires_authenticated_browser_origin() {
     let (_workspace, app, _private_root) = ws_app(EventBackend::new(
         SESSION_ID,

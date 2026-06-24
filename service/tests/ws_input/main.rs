@@ -29,7 +29,11 @@ use std::{
 use tokio::{net::TcpListener, time::timeout};
 use tokio_tungstenite::{
     connect_async,
-    tungstenite::{Message, client::IntoClientRequest, http::HeaderValue},
+    tungstenite::{
+        Message,
+        client::IntoClientRequest,
+        http::{HeaderName, HeaderValue},
+    },
 };
 use tower::ServiceExt;
 
@@ -55,6 +59,27 @@ async fn duplicate_client_seq_returns_original_ack_and_applies_once() {
     assert_eq!(first["payload"]["assigned_frame"], 1);
     assert_eq!(first["payload"]["pad_word"], 1);
     assert_eq!(backend.injected_requests().len(), 1);
+}
+
+#[tokio::test]
+async fn input_websocket_handshake_includes_runtime_security_headers() {
+    let (_workspace, app, _backend) = ws_app(SessionState::Running);
+    let cookie = login_cookie(app.clone()).await;
+    let server = WsServer::start(app).await;
+
+    let mut request = format!("ws://{}/ws/input", server.addr)
+        .into_client_request()
+        .expect("websocket request builds");
+    request
+        .headers_mut()
+        .insert("Origin", HeaderValue::from_static(ALLOWED_ORIGIN));
+    request.headers_mut().insert(
+        HeaderName::from_static("cookie"),
+        HeaderValue::from_str(&cookie).expect("cookie header parses"),
+    );
+
+    let (_socket, response) = connect_async(request).await.expect("websocket connects");
+    assert_runtime_security_headers(response.headers());
 }
 
 #[tokio::test]
@@ -624,6 +649,39 @@ fn runtime_json_request(method: Method, uri: &str, cookie: &str, body: Value) ->
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .expect("runtime request builds")
+}
+
+fn assert_runtime_security_headers(headers: &tokio_tungstenite::tungstenite::http::HeaderMap) {
+    assert_eq!(
+        headers
+            .get(HeaderName::from_static("cache-control"))
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+    assert_eq!(
+        headers
+            .get(HeaderName::from_static("pragma"))
+            .and_then(|value| value.to_str().ok()),
+        Some("no-cache")
+    );
+    assert_eq!(
+        headers
+            .get(HeaderName::from_static("x-content-type-options"))
+            .and_then(|value| value.to_str().ok()),
+        Some("nosniff")
+    );
+    assert_eq!(
+        headers
+            .get(HeaderName::from_static("access-control-allow-origin"))
+            .and_then(|value| value.to_str().ok()),
+        Some(ALLOWED_ORIGIN)
+    );
+    assert_eq!(
+        headers
+            .get(HeaderName::from_static("vary"))
+            .and_then(|value| value.to_str().ok()),
+        Some("Origin")
+    );
 }
 
 fn ws_app(state: SessionState) -> (tempfile::TempDir, axum::Router, Arc<RecordingBackend>) {

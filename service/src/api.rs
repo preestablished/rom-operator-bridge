@@ -665,14 +665,17 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
-    Json(HealthResponse {
+async fn health(State(state): State<AppState>) -> Response {
+    let mut response = Json(HealthResponse {
         schema_version: RUNTIME_API_SCHEMA_VERSION,
         ok: true,
         service_version: state.config.service_version().to_string(),
         backend_mode: state.backend.mode(),
         runtime_api: RUNTIME_API_SCHEMA_VERSION,
     })
+    .into_response();
+    apply_no_store_headers(response.headers_mut());
+    response
 }
 
 async fn start_session(
@@ -2049,7 +2052,7 @@ impl IntoResponse for AppError {
     }
 }
 
-fn apply_no_store_headers(headers: &mut axum::http::HeaderMap) {
+fn apply_no_store_headers(headers: &mut HeaderMap) {
     headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
     headers.insert(PRAGMA, HeaderValue::from_static("no-cache"));
     headers.insert(
@@ -2058,7 +2061,7 @@ fn apply_no_store_headers(headers: &mut axum::http::HeaderMap) {
     );
 }
 
-fn apply_runtime_headers(headers: &mut axum::http::HeaderMap, origin: Option<&'static str>) {
+fn apply_runtime_headers(headers: &mut HeaderMap, origin: Option<&'static str>) {
     apply_no_store_headers(headers);
     if let Some(origin) = origin {
         headers.insert(

@@ -39,6 +39,7 @@ async fn health_route_returns_schema_v1_without_private_paths() {
         .expect("health request succeeds");
 
     assert_eq!(response.status(), StatusCode::OK);
+    assert_no_store_headers(response.headers());
 
     let body = to_bytes(response.into_body(), 4096)
         .await
@@ -88,7 +89,7 @@ async fn unimplemented_api_route_uses_common_error_envelope() {
     assert_eq!(json["error"]["retryable"], false);
     assert_eq!(json["error"]["details"], serde_json::json!({}));
     assert_matches_runtime_schema(&json);
-    assert_runtime_error_headers(&headers);
+    assert_no_store_headers(&headers);
 }
 
 #[tokio::test]
@@ -109,7 +110,7 @@ async fn unsupported_method_uses_common_error_envelope() {
         .expect("method mismatch request succeeds");
 
     assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
-    assert_runtime_error_headers(response.headers());
+    assert_no_store_headers(response.headers());
 
     let body = to_bytes(response.into_body(), 4096)
         .await
@@ -244,7 +245,7 @@ fn assert_matches_runtime_schema(json: &Value) {
     });
 }
 
-fn assert_runtime_error_headers(headers: &HeaderMap) {
+fn assert_no_store_headers(headers: &HeaderMap) {
     assert_eq!(
         headers
             .get(CACHE_CONTROL)
