@@ -293,6 +293,7 @@ async fn stop_session(
         Ok(stopped) => stopped,
         Err(error) => return backend_error(error).into_response(),
     };
+    publish_stopped_event(&state, &stopped);
 
     *state
         .runtime_session
@@ -449,6 +450,7 @@ fn run_state_transition(
     {
         return backend_error(BackendError::BackendUnavailable).into_response();
     }
+    publish_run_boundary_event(&state, &boundary);
 
     let mut response = Json(RunStateResponse {
         schema_version: RUNTIME_API_SCHEMA_VERSION,
@@ -492,6 +494,7 @@ fn cleanup_runtime_session(state: &AppState, reason: StopReason) -> Result<(), B
     };
 
     let stopped = state.backend.stop_session(session_id, reason)?;
+    publish_stopped_event(state, &stopped);
     *state
         .runtime_session
         .lock()
@@ -499,6 +502,26 @@ fn cleanup_runtime_session(state: &AppState, reason: StopReason) -> Result<(), B
     state.ws_events.reset_session(&stopped.session_id);
     state.ws_input.reset_session(&stopped.session_id);
     Ok(())
+}
+
+fn publish_run_boundary_event(state: &AppState, boundary: &crate::backend::RunBoundary) {
+    let sanitizer = state.config.private_config().public_sanitizer();
+    let _ = state.ws_events.publish_boundary(
+        boundary,
+        state.backend.mode(),
+        state.backend.capabilities(),
+        &sanitizer,
+    );
+}
+
+fn publish_stopped_event(state: &AppState, stopped: &crate::backend::StoppedSession) {
+    let sanitizer = state.config.private_config().public_sanitizer();
+    let _ = state.ws_events.publish_stopped(
+        stopped,
+        state.backend.mode(),
+        state.backend.capabilities(),
+        &sanitizer,
+    );
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

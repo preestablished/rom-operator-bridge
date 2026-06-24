@@ -2,7 +2,7 @@ use axum::{
     body::{Body, to_bytes},
     http::{
         Method, Request,
-        header::{ORIGIN, SET_COOKIE},
+        header::{COOKIE, ORIGIN, SET_COOKIE},
     },
 };
 use futures_util::StreamExt;
@@ -24,8 +24,9 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Mutex,
+    time::Duration,
 };
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, time::timeout};
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{
@@ -154,6 +155,45 @@ async fn event_snapshot_omits_capture_event_when_no_capture_is_active() {
     assert_eq!(messages[1]["payload"]["active_capture_job_id"], Value::Null);
 }
 
+#[tokio::test]
+async fn event_stream_publishes_live_run_updates_after_pause() {
+    let (_workspace, app, private_root) =
+        ws_app(EventBackend::new(SESSION_ID, SessionState::Running, None));
+    let cookie = login_cookie(app.clone()).await;
+    let server = WsServer::start(app.clone()).await;
+    let mut ws = server.connect(&cookie).await;
+
+    let snapshot = read_events(&mut ws, 4).await;
+    assert_sanitized_ordered_events(&snapshot, &private_root);
+    let last_snapshot_seq = snapshot
+        .last()
+        .and_then(|message| message["server_seq"].as_u64())
+        .expect("snapshot server_seq exists");
+
+    let pause = app
+        .oneshot(runtime_json_request(
+            Method::POST,
+            "/api/run/pause",
+            &cookie,
+            json!({
+                "schema_version": 1,
+                "session_id": SESSION_ID
+            }),
+        ))
+        .await
+        .expect("pause request runs");
+    assert_eq!(pause.status(), 200);
+
+    let updates = read_events(&mut ws, 2).await;
+
+    assert_eq!(event_types(&updates), ["session_updated", "run_updated"]);
+    assert_sanitized_ordered_events(&updates, &private_root);
+    assert!(updates[0]["server_seq"].as_u64().unwrap() > last_snapshot_seq);
+    assert_eq!(updates[0]["payload"]["state"], "paused");
+    assert_eq!(updates[1]["payload"]["state"], "paused");
+    assert_eq!(updates[1]["payload"]["preview_stale"], true);
+}
+
 struct WsServer {
     addr: SocketAddr,
     handle: tokio::task::JoinHandle<()>,
@@ -211,9 +251,10 @@ impl Drop for WsServer {
 async fn read_events(ws: &mut TestSocket, count: usize) -> Vec<Value> {
     let mut messages = Vec::with_capacity(count);
     for _ in 0..count {
-        let message = ws
-            .next()
+        let message = ws.next();
+        let message = timeout(Duration::from_secs(2), message)
             .await
+            .expect("event message is available before timeout")
             .expect("event message is available")
             .expect("event message succeeds");
         let Message::Text(text) = message else {
@@ -309,6 +350,17 @@ async fn login_cookie(app: axum::Router) -> String {
         .await
         .expect("login body reads");
     cookie
+}
+
+fn runtime_json_request(method: Method, uri: &str, cookie: &str, body: Value) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(ORIGIN, ALLOWED_ORIGIN)
+        .header(COOKIE, cookie)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("runtime request builds")
 }
 
 fn ws_app(backend: EventBackend) -> (tempfile::TempDir, axum::Router, PathBuf) {

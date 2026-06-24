@@ -1,19 +1,34 @@
 use crate::{
     api::RUNTIME_API_SCHEMA_VERSION,
-    backend::{BackendCapabilities, BackendMode, RunStatus, SessionState},
+    backend::{
+        BackendCapabilities, BackendMode, RunBoundary, RunStatus, SessionState, StoppedSession,
+    },
     sanitization::{PublicSanitizer, SanitizationError},
 };
 use axum::extract::ws::{Message, WebSocket};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
+use tokio::sync::broadcast;
 
 const JSON_SAFE_U64_MAX: u64 = 9_007_199_254_740_991;
 const SERVER_SOURCE_ID: &str = "server";
+const EVENT_BUFFER_CAPACITY: usize = 256;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct WsEventState {
     inner: Arc<Mutex<WsEventInner>>,
+    publisher: broadcast::Sender<String>,
+}
+
+impl Default for WsEventState {
+    fn default() -> Self {
+        let (publisher, _) = broadcast::channel(EVENT_BUFFER_CAPACITY);
+        Self {
+            inner: Arc::new(Mutex::new(WsEventInner::default())),
+            publisher,
+        }
+    }
 }
 
 impl WsEventState {
@@ -27,7 +42,95 @@ impl WsEventState {
         inner.server_seq = 0;
     }
 
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<String> {
+        self.publisher.subscribe()
+    }
+
+    pub(crate) fn publish_boundary(
+        &self,
+        boundary: &RunBoundary,
+        backend_mode: BackendMode,
+        capabilities: BackendCapabilities,
+        sanitizer: &PublicSanitizer,
+    ) -> Result<(), WsEventError> {
+        ensure_json_safe(boundary.current_frame)?;
+        let mut inner = self.inner.lock().expect("ws event mutex poisoned");
+        let messages = vec![
+            inner.message(
+                &boundary.session_id,
+                "session_updated",
+                json!(SessionUpdatedPayload {
+                    state: boundary.state,
+                    backend_mode,
+                    current_frame: boundary.current_frame,
+                    capabilities,
+                }),
+                sanitizer,
+            )?,
+            inner.message(
+                &boundary.session_id,
+                "run_updated",
+                json!(RunUpdatedPayload {
+                    state: boundary.state,
+                    current_frame: boundary.current_frame,
+                    preview_stale: boundary.current_frame > 0,
+                    active_capture_job_id: None,
+                }),
+                sanitizer,
+            )?,
+        ];
+        drop(inner);
+        self.publish(messages);
+        Ok(())
+    }
+
+    pub(crate) fn publish_stopped(
+        &self,
+        stopped: &StoppedSession,
+        backend_mode: BackendMode,
+        capabilities: BackendCapabilities,
+        sanitizer: &PublicSanitizer,
+    ) -> Result<(), WsEventError> {
+        ensure_json_safe(stopped.final_frame)?;
+        let mut inner = self.inner.lock().expect("ws event mutex poisoned");
+        let messages = vec![
+            inner.message(
+                &stopped.session_id,
+                "session_updated",
+                json!(SessionUpdatedPayload {
+                    state: stopped.state,
+                    backend_mode,
+                    current_frame: stopped.final_frame,
+                    capabilities,
+                }),
+                sanitizer,
+            )?,
+            inner.message(
+                &stopped.session_id,
+                "run_updated",
+                json!(RunUpdatedPayload {
+                    state: stopped.state,
+                    current_frame: stopped.final_frame,
+                    preview_stale: false,
+                    active_capture_job_id: None,
+                }),
+                sanitizer,
+            )?,
+        ];
+        drop(inner);
+        self.publish(messages);
+        Ok(())
+    }
+
     fn snapshot_messages(
+        &self,
+        status: &RunStatus,
+        sanitizer: &PublicSanitizer,
+    ) -> Result<Vec<String>, WsEventError> {
+        self.status_messages(status, sanitizer)
+    }
+
+    fn status_messages(
         &self,
         status: &RunStatus,
         sanitizer: &PublicSanitizer,
@@ -91,6 +194,12 @@ impl WsEventState {
 
         Ok(messages)
     }
+
+    fn publish(&self, messages: Vec<String>) {
+        for message in messages {
+            let _ = self.publisher.send(message);
+        }
+    }
 }
 
 pub async fn serve_event_socket(
@@ -99,6 +208,7 @@ pub async fn serve_event_socket(
     sanitizer: PublicSanitizer,
     status: RunStatus,
 ) {
+    let mut events = event_state.subscribe();
     let Ok(messages) = event_state.snapshot_messages(&status, &sanitizer) else {
         let _ = socket.send(Message::Close(None)).await;
         return;
@@ -110,12 +220,30 @@ pub async fn serve_event_socket(
         }
     }
 
-    while let Some(message) = socket.recv().await {
-        let Ok(message) = message else {
-            break;
-        };
-        if matches!(message, Message::Close(_)) {
-            break;
+    loop {
+        tokio::select! {
+            event = events.recv() => {
+                match event {
+                    Ok(message) => {
+                        if socket.send(Message::Text(message.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            message = socket.recv() => {
+                let Some(message) = message else {
+                    break;
+                };
+                let Ok(message) = message else {
+                    break;
+                };
+                if matches!(message, Message::Close(_)) {
+                    break;
+                }
+            }
         }
     }
 }
@@ -217,7 +345,7 @@ struct ValidationUpdatedPayload {
 }
 
 #[derive(Debug)]
-enum WsEventError {
+pub(crate) enum WsEventError {
     JsonSafeNumber,
     Sanitization,
 }
