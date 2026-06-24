@@ -42,7 +42,7 @@ async fn bad_credential_and_credential_in_query_are_rejected_without_leaks() {
         .clone()
         .oneshot(runtime_request(
             Method::POST,
-            "/api/session",
+            "/api/session/start",
             Body::from(start_session_body("wrong-credential")),
         ))
         .await
@@ -53,7 +53,7 @@ async fn bad_credential_and_credential_in_query_are_rejected_without_leaks() {
     let query_response = app
         .oneshot(runtime_request(
             Method::POST,
-            "/api/session?operator_credential=operator-credential-from-test-source",
+            "/api/session/start?operator_credential=operator-credential-from-test-source",
             Body::from(start_session_body(GOOD_CREDENTIAL)),
         ))
         .await
@@ -69,7 +69,7 @@ async fn unrelated_absent_and_null_origins_are_rejected() {
     for origin in [Some("https://example.invalid"), Some("null"), None] {
         let mut builder = Request::builder()
             .method("POST")
-            .uri("/api/session")
+            .uri("/api/session/start")
             .header("content-type", "application/json");
         if let Some(origin) = origin {
             builder = builder.header(ORIGIN, origin);
@@ -98,7 +98,7 @@ async fn successful_login_sets_strict_cookie_and_allows_session_status() {
         .clone()
         .oneshot(runtime_request(
             Method::POST,
-            "/api/session",
+            "/api/session/start",
             Body::from(start_session_body(GOOD_CREDENTIAL)),
         ))
         .await
@@ -165,7 +165,7 @@ async fn expired_session_cookie_is_rejected() {
         .clone()
         .oneshot(runtime_request(
             Method::POST,
-            "/api/session",
+            "/api/session/start",
             Body::from(start_session_body(GOOD_CREDENTIAL)),
         ))
         .await
@@ -199,7 +199,7 @@ async fn only_one_operator_session_can_be_active() {
         .clone()
         .oneshot(runtime_request(
             Method::POST,
-            "/api/session",
+            "/api/session/start",
             Body::from(start_session_body(GOOD_CREDENTIAL)),
         ))
         .await
@@ -209,7 +209,7 @@ async fn only_one_operator_session_can_be_active() {
     let second = app
         .oneshot(runtime_request(
             Method::POST,
-            "/api/session",
+            "/api/session/start",
             Body::from(start_session_body(GOOD_CREDENTIAL)),
         ))
         .await
@@ -228,7 +228,7 @@ async fn failed_auth_attempts_are_rate_limited() {
             app.clone()
                 .oneshot(runtime_request(
                     Method::POST,
-                    "/api/session",
+                    "/api/session/start",
                     Body::from(start_session_body("wrong-credential")),
                 ))
                 .await
@@ -251,7 +251,7 @@ async fn backend_start_failure_does_not_leave_session_locked() {
         .clone()
         .oneshot(runtime_request(
             Method::POST,
-            "/api/session",
+            "/api/session/start",
             Body::from(start_session_body_for_backend(GOOD_CREDENTIAL, "real")),
         ))
         .await
@@ -262,7 +262,7 @@ async fn backend_start_failure_does_not_leave_session_locked() {
     let second = app
         .oneshot(runtime_request(
             Method::POST,
-            "/api/session",
+            "/api/session/start",
             Body::from(start_session_body_for_backend(GOOD_CREDENTIAL, "real")),
         ))
         .await
@@ -289,7 +289,7 @@ async fn websocket_handshake_uses_same_origin_and_cookie_auth() {
         .clone()
         .oneshot(runtime_request(
             Method::POST,
-            "/api/session",
+            "/api/session/start",
             Body::from(start_session_body(GOOD_CREDENTIAL)),
         ))
         .await

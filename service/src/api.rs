@@ -12,7 +12,7 @@ use axum::{
         header::{ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, PRAGMA, SET_COOKIE, VARY},
     },
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -62,9 +62,11 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health).fallback(method_not_allowed))
         .route(
             "/api/session",
-            get(session_status)
-                .post(start_session)
-                .fallback(method_not_allowed),
+            get(session_status).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/session/start",
+            post(start_session).fallback(method_not_allowed),
         )
         .route(
             "/ws/input",
