@@ -116,9 +116,19 @@ export function mountOperatorApp(
 ): void {
   let auth = initialAuthSessionState();
   let authRequestSeq = 0;
+  root.innerHTML = '<div data-operator-app></div><p class="session-live" aria-live="polite"></p>';
+  const appRegion = root.querySelector<HTMLElement>("[data-operator-app]");
+  const liveRegion = root.querySelector<HTMLElement>(".session-live");
 
-  const render = () => {
-    root.innerHTML = renderOperatorApp(config, auth);
+  const render = (focusTarget?: "alert" | "credential" | "logout") => {
+    if (!appRegion || !liveRegion) {
+      return;
+    }
+    appRegion.innerHTML = renderOperatorApp(config, auth);
+    liveRegion.textContent = sessionStatusLabel(auth);
+    if (focusTarget) {
+      focusSessionTarget(appRegion, focusTarget);
+    }
   };
 
   const applyAuthResult = (requestSeq: number, next: AuthSessionState) => {
@@ -126,7 +136,7 @@ export function mountOperatorApp(
       return;
     }
     auth = next;
-    render();
+    render(focusTargetForAuth(auth));
   };
 
   root.addEventListener("submit", (event) => {
@@ -166,7 +176,7 @@ export function mountOperatorApp(
     });
   });
 
-  render();
+  render("credential");
   const refreshSeq = ++authRequestSeq;
   refreshSession(auth, client).then((next) => {
     applyAuthResult(refreshSeq, next);
@@ -185,8 +195,11 @@ function renderSessionPanel(auth: AuthSessionState, backendMode: BackendMode): s
         </div>
         <span class="status-pill">${escapeHtml(backendMode)}</span>
       </div>
-      <p class="session-live" aria-live="polite">${sessionStatusLabel(auth)}</p>
-      ${auth.error ? `<p class="session-alert" role="alert">${escapeHtml(auth.error.message)}</p>` : ""}
+      ${
+        auth.error
+          ? `<p class="session-alert" role="alert" tabindex="-1" data-session-alert>${escapeHtml(auth.error.message)}</p>`
+          : ""
+      }
       ${
         showSession
           ? `<dl class="session-meta" aria-label="Active session">
@@ -200,6 +213,7 @@ function renderSessionPanel(auth: AuthSessionState, backendMode: BackendMode): s
                 <input
                   type="password"
                   name="operator_credential"
+                  data-credential-input
                   autocomplete="one-time-code"
                   autocapitalize="none"
                   spellcheck="false"
@@ -227,6 +241,25 @@ function renderSessionPanel(auth: AuthSessionState, backendMode: BackendMode): s
       }
     </article>
   `;
+}
+
+function focusTargetForAuth(auth: AuthSessionState): "alert" | "credential" | "logout" {
+  if (auth.error) {
+    return "alert";
+  }
+  if (auth.status === "active") {
+    return "logout";
+  }
+  return "credential";
+}
+
+function focusSessionTarget(root: HTMLElement, target: "alert" | "credential" | "logout"): void {
+  const selector = {
+    alert: "[data-session-alert]",
+    credential: "[data-credential-input]",
+    logout: "[data-session-action='logout']"
+  }[target];
+  root.querySelector<HTMLElement>(selector)?.focus();
 }
 
 function runtimeStat(label: string, value: string): string {

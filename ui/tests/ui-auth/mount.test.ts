@@ -3,6 +3,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { mountOperatorApp } from "../../src/app";
 import type { RuntimeSessionClient } from "../../src/authSession";
+import { RuntimeApiError } from "../../src/runtimeClient";
 import type { RuntimeConfig } from "../../src/runtimeConfig";
 
 const config: RuntimeConfig = {
@@ -91,6 +92,38 @@ describe("mounted auth/session screen", () => {
     await flushPromises();
     expect(root.querySelector("form[data-session-form='start']")).not.toBeNull();
     expect(root.textContent).not.toContain("session-001");
+  });
+
+  it("keeps a stable live region and focuses auth errors for recovery", async () => {
+    const client = mockClient({
+      startSession: vi.fn().mockRejectedValue(
+        new RuntimeApiError({
+          code: "auth_rejected",
+          message: "Authentication rejected.",
+          retryable: false,
+          details: {}
+        })
+      )
+    });
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+
+    try {
+      mountOperatorApp(root, config, client);
+      const liveRegion = root.querySelector(".session-live");
+      const input = root.querySelector<HTMLInputElement>("input[name='operator_credential']");
+      const form = root.querySelector<HTMLFormElement>("form[data-session-form='start']");
+
+      input!.value = "bad-secret";
+      form!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      await flushPromises();
+
+      expect(root.querySelector(".session-live")).toBe(liveRegion);
+      expect(liveRegion?.textContent).toBe("authentication rejected");
+      expect(document.activeElement).toBe(root.querySelector("[data-session-alert]"));
+    } finally {
+      root.remove();
+    }
   });
 });
 
