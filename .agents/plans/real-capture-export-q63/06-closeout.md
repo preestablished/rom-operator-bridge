@@ -8,6 +8,10 @@ current evidence:
 - real capture returns sanitized job metadata;
 - private artifacts are durable before completed status;
 - `captures/index.jsonl` has the confirmed schema;
+- decoded values match feature-map order and payload hashes/lengths match stored
+  artifacts;
+- real preview/features endpoints do not expose raw payloads unless an approved
+  public derivative was implemented;
 - no raw captures, screenshots, feature bytes, private paths, refs, or worker
   endpoints leak to UI/API/websocket/bead notes;
 - tests cover worker success, worker failure, private write failure, idempotency,
@@ -72,10 +76,11 @@ that encode private values, screenshots, raw worker errors, or raw JSON.
 
 ## 4. Failed Or Blocked Outcome
 
-If the real exporter or schema is still absent:
+If the capture row contract, capture-spec resolver, or required private inputs
+are still absent:
 
 ```text
-q63 remains blocked on real capture exporter/schema availability.
+q63 remains blocked on real capture row contract or private capture input availability.
 
 Observed:
 - real backend lifecycle available: yes;
@@ -91,6 +96,8 @@ Next unblock step:
 Apply the blocked/deferred state explicitly:
 
 ```bash
+bd create --title="<sanitized missing q63 prerequisite>" --description="<why the prerequisite is needed, without private values>" --type=task --priority=1
+bd dep add rom-operator-bridge-q63 <new-blocking-bead-id>
 bd update rom-operator-bridge-q63 --status open --append-notes "<sanitized blocker summary>"
 bd defer rom-operator-bridge-q63 --until="+14d"
 bd dolt push
@@ -99,8 +106,23 @@ git status --short --branch
 
 If another repo or operator handoff must supply the missing contract, create or
 update an explicit bead dependency or human/private handoff bead. Create or
-update a narrow request under `~/.agents/projects/<repo-name>/requests/` only as
-supporting context. Keep the request sanitized and reference it from the bead.
+update a narrow request under `$PRIVATE_REQUEST_DIR` only as supporting context.
+Keep the request sanitized and reference it from the bead. Do not commit or copy
+concrete operator-private local paths into bead notes.
+
+If any code, docs, plan files, or request files changed while reaching the
+blocked outcome, run the applicable gates/sweeps for those changes, commit them,
+and push both Git and bead state:
+
+```bash
+git status --short
+git add <changed files>
+git commit -m "<sanitized blocked q63 handoff>"
+git pull --rebase
+bd dolt push
+git push
+git status --short --branch
+```
 
 ## 5. Repository Close Protocol
 

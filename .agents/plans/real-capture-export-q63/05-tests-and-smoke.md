@@ -17,17 +17,30 @@ Required test coverage:
   instead of staying on synthetic/API-only capture state;
 - real-mode `GET /api/capture/jobs/:id` polls backend job state and then updates
   only sanitized API projection state;
-- real backend trigger calls the mock worker capture RPC with the active lease;
+- real backend trigger calls the mock worker `TakeSnapshot` capture RPC with the
+  active lease, `capture: Some(spec)`, and explicit `seal_input_log = true`;
+- private capture-spec resolution maps layout ranges to `dh::ExtractRange`,
+  verifies layout hash/total length, sets framebuffer capture explicitly, and
+  fails closed for missing inputs;
 - completed real capture writes private payload artifacts;
 - completed real capture appends `captures/index.jsonl`;
 - the emitted `captures/index.jsonl` row contains matching payload
   hashes/lengths and no inline raw bytes;
+- decoded order and values are mandatory, match feature-map order, and reject
+  unsupported feature encodings;
+- feature bytes and framebuffer payloads are stored separately, with `fb_lz4`
+  encoding metadata and decompressed framebuffer length validation;
 - job is not completed when payload write fails;
 - job is not completed when index append fails;
+- payload-written/index-failed retry does not duplicate index rows, expose a
+  public projection, or make the capture labelable;
+- hash/length mismatch and missing `fb_info` keep the job non-completed;
 - idempotent replay returns the same job;
 - concurrent real capture is rejected or returns the existing active job
   according to existing API behavior;
 - public responses and websocket events contain no private values;
+- real capture preview and feature routes return unavailable/no public payloads
+  unless an approved public-safe derivative is explicitly implemented;
 - `CaptureState` becomes labelable only after durable index append;
 - completed real capture can receive a `needs_review` label draft;
 - stale capture ids from previous sessions are rejected.
@@ -38,8 +51,12 @@ Extend `service/tests/real-backend/main.rs` mock worker so it can assert:
 
 - the bridge requested capture for the same lease token/slot as the active
   session;
-- the configured capture spec ref is passed;
+- the bridge resolved the configured capture spec ref privately and sent the
+  expected concrete `dh::CaptureSpec` ranges/framebuffer flag;
+- `TakeSnapshotRequest.seal_input_log` is explicitly true;
 - the worker can return deterministic fake private payload bytes;
+- the worker can return missing `fb_info`, malformed framebuffer bytes, and
+  payload metadata mismatches for failure tests;
 - worker failures are converted into sanitized public failures.
 
 Mock payload bytes, lease tokens, slot ids, spec refs, endpoints, and worker
@@ -105,14 +122,8 @@ git diff --check
 set +e
 rg -q -F -f "$FORBIDDEN_LITERALS_FILE" service docs .agents
 source_sweep_status=$?
-git diff --cached --name-only --diff-filter=ACMRT > "$PRIVATE_RUN_ROOT/staged-files.private.txt"
-if [ -s "$PRIVATE_RUN_ROOT/staged-files.private.txt" ]; then
-  xargs -r rg -q -F -f "$FORBIDDEN_LITERALS_FILE" \
-    < "$PRIVATE_RUN_ROOT/staged-files.private.txt"
-  staged_sweep_status=$?
-else
-  staged_sweep_status=1
-fi
+git grep --cached -q -F -f "$FORBIDDEN_LITERALS_FILE" -- service docs .agents
+staged_sweep_status=$?
 set -e
 case "$source_sweep_status" in
   0) echo 'forbidden literal found in source/docs/agent plan files' >&2; exit 1 ;;
@@ -127,4 +138,5 @@ esac
 ```
 
 For private run evidence, use a private forbidden-literals file and quiet
-`rg -q -F -f` sweeps. Do not print matching lines.
+`rg -q -F -f` sweeps. Include captured public response bodies, websocket
+evidence, and service logs. Do not print matching lines.

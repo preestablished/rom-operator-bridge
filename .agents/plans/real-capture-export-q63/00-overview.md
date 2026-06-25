@@ -44,7 +44,8 @@ Still missing for `q63`:
 - Raw capture bytes, private paths, feature bytes, refs, worker endpoints, and
   private artifact refs never appear in public JSON, websocket events, logs, or
   bead notes.
-- If the real exporter contract is unavailable, the executing agent records a
+- If the capture row contract, capture-spec resolver, or operator-approved
+  private layout/map inputs are unavailable, the executing agent records a
   sanitized blocker and leaves `q63` deferred/open instead of faking acceptance.
 
 ## Non-Goals
@@ -59,7 +60,7 @@ Still missing for `q63`:
 | File | Purpose |
 |---|---|
 | `00-overview.md` | Target, scope, success criteria |
-| `01-contract-and-preflight.md` | Confirm real hypervisor/exporter contract before coding |
+| `01-contract-and-preflight.md` | Confirm real hypervisor and capture-row contracts before coding |
 | `02-private-artifact-writer.md` | Add durable capture payload/index writing |
 | `03-real-backend-capture.md` | Wire `RealBackend` capture lifecycle |
 | `04-api-state-and-privacy.md` | Align API job state, capabilities, and sanitization |
