@@ -124,6 +124,9 @@ KUBECONFIG=/etc/rancher/k3s/k3s.yaml \
 
 ## 5. Run Private Deployment Validation
 
+For a populated command template that starts from an operator-private env file,
+see `deploy/operator-kut-private-validation-reference.md`.
+
 Run the deployment-network checker with private evidence inputs:
 
 ```sh
@@ -138,13 +141,13 @@ ROM_BRIDGE_FORBID_FILE=<private-forbid-file> \
 scripts/deployment-network-check.sh
 ```
 
-If no `ROM_BRIDGE_RESOLVE_IP` is supplied, also provide reviewed private
-Host/SNI evidence:
+If no `ROM_BRIDGE_RESOLVE_IP` is supplied, add reviewed private Host/SNI
+evidence to the same deployment-network checker command:
 
 ```sh
+# Add these before the scripts/deployment-network-check.sh line above:
 ROM_BRIDGE_HOST_SNI_EVIDENCE_FILE=<private-host-sni-evidence-file> \
 ROM_BRIDGE_HOST_SNI_EVIDENCE_REVIEWED=1 \
-scripts/deployment-network-check.sh
 ```
 
 Run the redaction gate with the operator-private forbid file:
