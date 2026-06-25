@@ -1517,10 +1517,21 @@ impl BridgeBackend for RealBackend {
     }
 
     fn trigger_capture(&self, request: CaptureRequest) -> BackendResult<CaptureJob> {
+        let key = (request.session_id.clone(), request.idempotency_key.clone());
+        {
+            let inner = self.inner.lock().expect("real backend mutex poisoned");
+            if let Some(job_id) = inner.capture_idempotency.get(&key) {
+                let job = inner
+                    .capture_jobs
+                    .get(job_id)
+                    .ok_or(BackendError::BackendUnavailable)?;
+                return Ok(job.capture_job());
+            }
+        }
+
         let resolved = self.capture_spec()?;
         let (session, job_id, capture_id) = {
             let mut inner = self.inner.lock().expect("real backend mutex poisoned");
-            let key = (request.session_id.clone(), request.idempotency_key.clone());
             if let Some(job_id) = inner.capture_idempotency.get(&key) {
                 let job = inner
                     .capture_jobs

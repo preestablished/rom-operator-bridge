@@ -549,6 +549,118 @@ async fn real_capture_worker_failure_returns_sanitized_failed_job_without_index(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_capture_stale_preview_fails_without_take_snapshot() {
+    let workspace = tempfile::tempdir().expect("tempdir creates");
+    let private_root = workspace.path().join("bridge-private");
+    let reference_checkout = workspace.path().join("reference-workload");
+    write_capture_bundle(&reference_checkout);
+    let worker = MockWorker::new();
+    let server = WorkerServer::start(worker.clone()).await;
+    let config = real_config_with_start(
+        &private_root,
+        &reference_checkout,
+        &format!("unix://{}", server.uds_path.display()),
+        Some((ENV_REAL_SNAPSHOT_REF, SNAPSHOT_REF.to_string())),
+    );
+    let mut app = router(AppState::from_config(config));
+
+    let start = send_request(
+        &mut app,
+        runtime_request(
+            Method::POST,
+            "/api/session/start",
+            Body::from(start_body_with_capabilities(
+                "real",
+                &["input", "preview", "capture", "labels"],
+            )),
+        ),
+    )
+    .await;
+    assert_eq!(start.status(), StatusCode::OK);
+    let cookie = response_cookie(&start);
+
+    let trigger = send_request(
+        &mut app,
+        runtime_request_with_cookie(
+            Method::POST,
+            "/api/capture/trigger",
+            &cookie,
+            Body::from(
+                json!({
+                    "schema_version": 1,
+                    "session_id": "real-session-0000",
+                    "idempotency_key": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                    "observed_preview_frame": 11,
+                    "reason": "operator_mark"
+                })
+                .to_string(),
+            ),
+        ),
+    )
+    .await;
+    assert_eq!(trigger.status(), StatusCode::OK);
+    let trigger_body = body_json(trigger).await;
+    assert_eq!(trigger_body["status"], "failed");
+    assert_public_json_sanitized(&trigger_body, &private_root, &reference_checkout, &server);
+
+    let job = send_request(
+        &mut app,
+        runtime_request_with_cookie(
+            Method::GET,
+            &format!(
+                "/api/capture/jobs/{}",
+                trigger_body["job_id"].as_str().expect("job id is string")
+            ),
+            &cookie,
+            Body::empty(),
+        ),
+    )
+    .await;
+    assert_eq!(job.status(), StatusCode::OK);
+    let job_body = body_json(job).await;
+    assert_eq!(job_body["status"], "failed");
+    assert_eq!(job_body["capture_id"], Value::Null);
+    assert_eq!(job_body["error"]["code"], "frame_stale");
+    assert_eq!(job_body["error"]["details"], json!({}));
+    assert_public_json_sanitized(&job_body, &private_root, &reference_checkout, &server);
+
+    let replay = send_request(
+        &mut app,
+        runtime_request_with_cookie(
+            Method::POST,
+            "/api/capture/trigger",
+            &cookie,
+            Body::from(
+                json!({
+                    "schema_version": 1,
+                    "session_id": "real-session-0000",
+                    "idempotency_key": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                    "observed_preview_frame": 11,
+                    "reason": "operator_mark"
+                })
+                .to_string(),
+            ),
+        ),
+    )
+    .await;
+    assert_eq!(replay.status(), StatusCode::OK);
+    let replay_body = body_json(replay).await;
+    assert_eq!(replay_body["job_id"], trigger_body["job_id"]);
+    assert_eq!(replay_body["status"], "failed");
+
+    assert_eq!(
+        worker
+            .state
+            .lock()
+            .expect("mock worker mutex poisoned")
+            .take_snapshot_requests
+            .len(),
+        0
+    );
+    assert!(!private_root.join("captures/index.jsonl").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_capture_framebuffer_metadata_mismatch_fails_without_index() {
     let workspace = tempfile::tempdir().expect("tempdir creates");
     let private_root = workspace.path().join("bridge-private");
@@ -668,6 +780,8 @@ async fn real_capture_index_append_failure_keeps_job_failed_and_replay_idempoten
     let first = backend
         .trigger_capture(request.clone())
         .expect("failed capture job returns");
+    fs::remove_file(reference_checkout.join("layout.json"))
+        .expect("layout file removal makes capture spec unavailable");
     let replay = backend
         .trigger_capture(request)
         .expect("failed capture replay returns same job");

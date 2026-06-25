@@ -302,12 +302,7 @@ impl CaptureState {
 
         if input.observed_preview_frame < input.current_frame {
             job.status = CaptureStatus::Failed;
-            job.error = Some(ErrorObject {
-                code: ErrorCode::FrameStale,
-                message: "Capture failed.".to_string(),
-                retryable: true,
-                details: json!({}),
-            });
+            job.error = Some(frame_stale_error());
         }
 
         inner.idempotency.insert(key, job_id.clone());
@@ -317,6 +312,51 @@ impl CaptureState {
         if view.status == CaptureStatus::Failed {
             return Ok(view);
         }
+        Ok(view)
+    }
+
+    fn trigger_real_frame_stale(
+        &self,
+        input: RealFrameStaleInput,
+    ) -> Result<CaptureJobView, CaptureTriggerError> {
+        let mut inner = self.inner.lock().expect("capture mutex poisoned");
+        let key = (input.session_id.clone(), input.idempotency_key.clone());
+        if let Some(job_id) = inner.idempotency.get(&key)
+            && let Some(job) = inner.jobs.get(job_id)
+        {
+            return Ok(job.view());
+        }
+        if inner
+            .jobs
+            .values()
+            .any(|job| job.session_id == input.session_id && job.status.is_active())
+        {
+            return Err(CaptureTriggerError::InProgress);
+        }
+
+        inner.next_job_seq += 1;
+        let job_id = format!("real-capture-job-stale-{:04}", inner.next_job_seq);
+        let job = CaptureJobRecord {
+            job_id: job_id.clone(),
+            session_id: input.session_id.clone(),
+            source: CaptureSource::Real,
+            status: CaptureStatus::Failed,
+            requested_frame: input.observed_preview_frame,
+            scheduled_frame: input.current_frame,
+            captured_frame: None,
+            capture_id: None,
+            labelable: false,
+            has_preview: false,
+            error: Some(frame_stale_error()),
+            preview_png: Vec::new(),
+            durable: false,
+            features: None,
+            sanitized_provenance: real_provenance(),
+        };
+
+        inner.idempotency.insert(key, job_id.clone());
+        let view = job.view();
+        inner.jobs.insert(job_id, job);
         Ok(view)
     }
 
@@ -362,6 +402,18 @@ impl CaptureState {
         ))
     }
 
+    fn local_real_frame_stale_job(&self, job_id: &str) -> Option<CaptureJobView> {
+        let inner = self.inner.lock().expect("capture mutex poisoned");
+        let job = inner.jobs.get(job_id)?;
+        let is_local_stale_real_failure = job.source == CaptureSource::Real
+            && job.status == CaptureStatus::Failed
+            && job
+                .error
+                .as_ref()
+                .is_some_and(|error| error.code == ErrorCode::FrameStale);
+        is_local_stale_real_failure.then(|| job.view())
+    }
+
     fn upsert_real_job(
         &self,
         config: &ServiceConfig,
@@ -373,6 +425,9 @@ impl CaptureState {
         let status = capture_status_from_backend(backend_job.status);
         let capture_id = backend_job.capture_id.clone();
         let public = backend_job.public.clone();
+        if status == CaptureStatus::Completed && (capture_id.is_none() || public.is_none()) {
+            return Err(BackendError::BackendUnavailable);
+        }
         let labelable =
             status == CaptureStatus::Completed && capture_id.is_some() && public.is_some();
         let recent = if labelable {
@@ -771,6 +826,14 @@ struct CaptureTriggerInput {
     preview_png: Vec<u8>,
 }
 
+#[derive(Debug, Clone)]
+struct RealFrameStaleInput {
+    session_id: String,
+    idempotency_key: String,
+    observed_preview_frame: u64,
+    current_frame: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptureStatus {
@@ -803,6 +866,15 @@ fn capture_status_from_backend(status: CaptureJobStatus) -> CaptureStatus {
         CaptureJobStatus::Running => CaptureStatus::Capturing,
         CaptureJobStatus::Completed => CaptureStatus::Completed,
         CaptureJobStatus::Failed => CaptureStatus::Failed,
+    }
+}
+
+fn frame_stale_error() -> ErrorObject {
+    ErrorObject {
+        code: ErrorCode::FrameStale,
+        message: "Capture failed.".to_string(),
+        retryable: true,
+        details: json!({}),
     }
 }
 
@@ -1321,6 +1393,32 @@ async fn capture_trigger(
         if request.observed_preview_frame > status.current_frame {
             return bad_request("Preview frame unavailable.").into_response();
         }
+        if request.observed_preview_frame < status.current_frame {
+            let view = match state
+                .captures
+                .trigger_real_frame_stale(RealFrameStaleInput {
+                    session_id: request.session_id.clone(),
+                    idempotency_key: request.idempotency_key,
+                    observed_preview_frame: request.observed_preview_frame,
+                    current_frame: status.current_frame,
+                }) {
+                Ok(view) => view,
+                Err(CaptureTriggerError::InProgress) => {
+                    return AppError::new(
+                        StatusCode::CONFLICT,
+                        ErrorCode::CaptureInProgress,
+                        "Capture already in progress.",
+                        false,
+                    )
+                    .into_response();
+                }
+            };
+            publish_capture_event(&state, &request.session_id, &view);
+
+            let mut response = Json(CaptureTriggerResponse::from(view)).into_response();
+            apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
+            return response;
+        }
         let backend_job = match state
             .backend
             .trigger_capture(crate::backend::CaptureRequest {
@@ -1415,6 +1513,13 @@ async fn capture_job_status(
         return bad_request("Invalid capture job.").into_response();
     }
     let view = if state.backend.mode() == BackendMode::Real {
+        if let Some(view) = state.captures.local_real_frame_stale_job(&job_id) {
+            publish_capture_event(&state, &view.session_id, &view);
+
+            let mut response = Json(CaptureJobResponse::from(view)).into_response();
+            apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
+            return response;
+        }
         let (session_id, requested_frame, scheduled_frame) =
             match state.captures.real_job_context(&job_id) {
                 Ok(context) => context,
@@ -2760,5 +2865,34 @@ fn auth_error(error: AuthError) -> AppError {
                 false,
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::CaptureJobStatus;
+
+    #[test]
+    fn real_completed_job_without_public_projection_fails_closed() {
+        let captures = CaptureState::new();
+        let config = ServiceConfig::synthetic_for_addr("127.0.0.1:0".parse().unwrap());
+
+        let error = captures
+            .upsert_real_job(
+                &config,
+                "real-session-test",
+                CaptureJob {
+                    job_id: "real-capture-job-test".to_string(),
+                    status: CaptureJobStatus::Completed,
+                    capture_id: Some("real-capture-test".to_string()),
+                    public: None,
+                },
+                12,
+                12,
+            )
+            .expect_err("completed real jobs require public completion projection");
+
+        assert!(matches!(error, BackendError::BackendUnavailable));
     }
 }
