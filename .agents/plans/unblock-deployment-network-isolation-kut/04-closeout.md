@@ -34,7 +34,10 @@ Suggested sequence:
 
 ```sh
 git status --short
-git add docs/deployment-checks.md scripts/deployment-network-check.sh
+git add docs/deployment-checks.md
+if [[ -f scripts/deployment-network-check.sh ]]; then
+  git add scripts/deployment-network-check.sh
+fi
 git commit -m "Document deployment network isolation checks"
 git pull --rebase
 COMMIT="$(git rev-parse --short HEAD)"
@@ -45,7 +48,8 @@ git push
 git status --short --branch
 ```
 
-If no script is added, omit it from `git add`.
+If other files changed, include only intentional sanitized files. Do not commit
+raw private evidence.
 
 ## 3. Confirm `eqi` Is Unblocked
 
@@ -76,11 +80,21 @@ the full `eqi` publish-readiness checklist.
 Leave the bead deferred/open and make the blocker concrete:
 
 ```sh
+git status --short
+git add <sanitized changed files>
+git commit -m "Record blocked deployment network isolation handoff"
+git pull --rebase
 bd update rom-operator-bridge-kut --append-notes "Still blocked: <sanitized missing evidence>. No private command output or values were recorded."
 bd defer rom-operator-bridge-kut --until="+7d"
 bd dolt push
+git push
 git status --short --branch
 ```
+
+If no files changed, skip `git add` and `git commit`, but still run
+`git pull --rebase`, update/defer the bead, `bd dolt push`, `git push`, and the
+final status check. The final status must show the branch up to date with
+origin.
 
 Examples of acceptable sanitized blockers:
 

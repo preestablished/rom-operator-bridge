@@ -38,6 +38,8 @@ the remaining blocker is evidence collection on the expected deployment host.
 - unauthenticated runtime requests are rejected without private details;
 - runtime HTTP responses include `Cache-Control: no-store` and no-cache headers;
 - WebSocket access requires allowed origin plus authenticated session;
+- browser-facing deployment output has no mixed-content path back to `http://`
+  or `ws://` runtime endpoints;
 - outside-network access is unavailable or rejected, based on the selected
   deployment topology;
 - the public repo contains only sanitized summaries, placeholders, and pass/fail

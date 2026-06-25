@@ -47,17 +47,20 @@ placeholder command shapes.
 | Unauthenticated rejection | PASS | Runtime session endpoint rejects unauthenticated requests. |
 | Wrong origin rejection | PASS | Unrelated origins do not receive session state. |
 | Runtime no-store | PASS | Runtime routes include no-store/no-cache headers. |
-| WebSocket origin/auth | PASS | WSS requires allowed origin and authentication. |
+| WebSocket origin/auth | PASS | WSS requires allowed origin and authentication on both WebSocket routes. |
+| Mixed-content absence | PASS | Browser-facing assets use HTTPS/WSS runtime endpoints only. |
 | Outside-network access | PASS | Outside access unavailable or rejected. |
 
 ## Commands
 
-Show placeholder command shapes only.
+Show placeholder command shapes only, including the route/method matrix used for
+no-store and the WSS endpoint matrix used for WebSocket origin/auth.
 
 ## Residual Risks
 
 Record any non-blocking limitation, such as outside-network probing represented
-by firewall/proxy evidence instead of a remote probe.
+by firewall/proxy evidence instead of a remote probe. An operator statement alone
+is not enough for a PASS outside-network result.
 ```
 
 ## 3. Evidence References
@@ -85,10 +88,20 @@ Keep any repeated command examples placeholder-only.
 
 ## 5. Sanitization Checks Before Commit
 
-Run:
+Run against touched public deliverables only. Do not scan all of `scripts/`
+because `scripts/redaction-gate.sh` intentionally contains fixture literals.
+Write candidate filenames to the private validation directory and do not paste
+matching lines into chat, docs, or bead notes:
 
 ```sh
-rg -n 'Cookie|Set-Cookie|Authorization|Bearer |10\\.|192\\.168\\.|172\\.(1[6-9]|2[0-9]|3[0-1])\\.|/home/|/run/dh|/tmp/' docs/deployment-checks.md scripts .agents/plans/unblock-deployment-network-isolation-kut
+SCAN_TARGETS=(docs/deployment-checks.md)
+if [[ -f scripts/deployment-network-check.sh ]]; then
+  SCAN_TARGETS+=(scripts/deployment-network-check.sh)
+fi
+rg -l 'Cookie|Set-Cookie|Authorization|Bearer |10\\.|192\\.168\\.|172\\.(1[6-9]|2[0-9]|3[0-1])\\.|/home/|/run/dh|/tmp/' \
+  "${SCAN_TARGETS[@]}" \
+  >"$ROM_BRIDGE_VALIDATION_DIR/redaction-candidates.txt" || true
+test ! -s "$ROM_BRIDGE_VALIDATION_DIR/redaction-candidates.txt"
 bash scripts/redaction-gate.sh
 ```
 

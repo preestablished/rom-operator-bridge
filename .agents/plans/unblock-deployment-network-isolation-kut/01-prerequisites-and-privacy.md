@@ -29,8 +29,8 @@ The executing agent needs operator approval for:
 - whether the bridge service should be reachable only through the proxy or also
   on a documented trusted interface;
 - the private validation directory for raw command output;
-- a throwaway authenticated session cookie only if WebSocket/authenticated-origin
-  checks require it;
+- a throwaway authenticated session cookie in a `0600` private cookie file for
+  authenticated Origin and WebSocket checks;
 - whether outside-network probing is available from the current host or must be
   represented by firewall/listener evidence.
 
@@ -41,6 +41,11 @@ Never commit or paste the concrete private values. Use placeholders:
 - `<redacted-session-cookie>`;
 - `<deployment-host>`;
 - `<operator-approved-network>`.
+
+Never put cookie values in command argv, environment variables, stdout, committed
+docs, plan updates, or bead notes. Commands may reference only the private cookie
+file path, and raw outputs that contain cookies must stay in the private
+validation directory.
 
 ## 3. Private Evidence Storage
 
@@ -64,10 +69,20 @@ Only sanitized pass/fail summaries belong in committed files.
 
 ## 4. Redaction Rules
 
-Before committing docs, search for private values and common leak shapes:
+Before committing docs, search touched public deliverables for private values and
+common leak shapes. Use filename/count-only output and write it to the private
+validation directory. Do not print matching lines to the terminal or paste them
+into chat, final responses, docs, or bead notes.
 
 ```sh
-rg -n '<actual-private-ip>|<actual-private-path>|<actual-cookie>|Bearer |Cookie|Set-Cookie|10\\.|192\\.168\\.|172\\.(1[6-9]|2[0-9]|3[0-1])\\.' docs .agents/plans scripts
+SCAN_TARGETS=(docs/deployment-checks.md)
+if [[ -f scripts/deployment-network-check.sh ]]; then
+  SCAN_TARGETS+=(scripts/deployment-network-check.sh)
+fi
+rg -l '<actual-private-ip>|<actual-private-path>|<actual-cookie>|Bearer |Cookie|Set-Cookie|10\\.|192\\.168\\.|172\\.(1[6-9]|2[0-9]|3[0-1])\\.' \
+  "${SCAN_TARGETS[@]}" \
+  >"$ROM_BRIDGE_VALIDATION_DIR/redaction-candidates.txt" || true
+test ! -s "$ROM_BRIDGE_VALIDATION_DIR/redaction-candidates.txt"
 ```
 
 Replace any real values with placeholders. Do not rely on the static redaction
