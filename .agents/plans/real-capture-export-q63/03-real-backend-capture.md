@@ -43,6 +43,9 @@ hypervisor capture RPC using:
 
 Implementation constraints:
 
+- Do not call `RunWithFrameCapture` unless preflight proved it is implemented
+  and returns enough schema data. Prefer the implemented `Run` or `TakeSnapshot`
+  capture path with `capture: Some(spec)` on the active lease.
 - Do not hold the real backend mutex during blocking gRPC calls.
 - Convert tonic/transport failures to `BackendUnavailable`.
 - Never include endpoint paths, refs, or worker error text in `BackendError`.
@@ -65,6 +68,8 @@ Implement `RealBackend::trigger_capture`:
 
 If the worker or private writer fails after job creation, store a failed job
 with sanitized failure status. Do not leave a permanent active capture lock.
+The stored job must retain enough backend-private state for `capture_job` polling
+without exposing payload refs or worker errors.
 
 ## 5. Capture Job Lookup
 

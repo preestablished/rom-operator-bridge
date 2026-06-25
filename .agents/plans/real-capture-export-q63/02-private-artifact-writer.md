@@ -18,6 +18,9 @@ Validation rules:
 - `run_id`, `capture_id`, and job ids must pass the same path segment checks
   used elsewhere in `PrivateArtifactStore`.
 - Payload filenames must be relative and stay below the private root.
+- Payload filenames written by the bridge must be generated opaque names or
+  sanitized through an allowlist. Do not preserve exporter path basenames if
+  they encode private values.
 - Raw payload bytes must not be serializable through public response types.
 
 ## 2. Add Durable Payload Writes
@@ -26,17 +29,32 @@ Add methods to `PrivateArtifactStore` for real capture artifacts. Suggested
 shape:
 
 ```rust
+pub struct CapturePayloadArtifact {
+    pub artifact_ref: PrivateArtifactRef,
+    pub len: u64,
+    pub blake3: String,
+    pub encoding: String,
+    pub uncompressed_len: Option<u64>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub stride: Option<u32>,
+    pub pixel_format: Option<String>,
+}
+
 pub fn write_capture_payload(
     &self,
     run_id: &str,
     capture_id: &str,
     payload_name: &str,
     bytes: &[u8],
-) -> Result<PrivateArtifactRef, ArtifactError>
+) -> Result<CapturePayloadArtifact, ArtifactError>
 ```
 
 Use `write_private_file_atomic` for payloads and preserve `0600` file mode.
 Do not write payloads to `tmp` without an atomic final rename.
+If the schema requires original exporter refs or basenames, store them only in
+private manifests with redacted `Debug`/`Display` behavior and never expose them
+through public structs, logs, websocket events, or bead notes.
 
 Suggested private layout:
 
@@ -65,6 +83,19 @@ pub fn append_capture_index_row(
 The append must go through `append_private_file`, which fsyncs and keeps the file
 private. The job may be reported as completed only after this method succeeds.
 
+`CaptureIndexRow` must include the authoritative reference workload fields. If
+the schema confirms different names, use those names, but do not omit these
+classes of data:
+
+- `capture_id`;
+- `node_ref` or public-safe source identifier;
+- `capture_source`;
+- `frame_index` or `frame_counter`;
+- `layout_hash`;
+- feature payload metadata, not inline feature bytes;
+- decoded feature order and decoded values when required by the schema;
+- framebuffer metadata and payload metadata, not inline screenshots.
+
 ## 4. Keep Recent Captures And Label Drafts In Sync
 
 When a real capture completes:
@@ -73,7 +104,9 @@ When a real capture completes:
 - write capture manifest if required;
 - append `captures/index.jsonl`;
 - update `captures/recent-captures.json`;
-- write an empty label draft for the new capture.
+- initialize an empty label draft only as a no-overwrite pre-publication step if
+  the API requires the file to exist. `LabelState::apply` remains authoritative
+  for transactional draft updates and rollback behavior.
 
 If any write fails, return `BackendUnavailable` or a sanitized capture failure
 and do not mark the job completed.

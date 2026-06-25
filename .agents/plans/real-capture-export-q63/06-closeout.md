@@ -21,8 +21,16 @@ blocker.
 On success:
 
 ```bash
+git status --short
+git add <changed files>
+git commit -m "Implement real capture export integration"
+git pull --rebase
+COMMIT="$(git rev-parse --short HEAD)"
 bd update rom-operator-bridge-q63 --append-notes "<sanitized summary>"
-bd close rom-operator-bridge-q63 --reason "Real capture export integration writes durable private capture artifacts and sanitized public job metadata"
+bd close rom-operator-bridge-q63 --reason "Real capture export integration writes durable private capture artifacts and sanitized public job metadata" --suggest-next
+bd dolt push
+git push
+git status --short --branch
 ```
 
 Then check what became ready:
@@ -35,6 +43,8 @@ bd show rom-operator-bridge-r77
 If `r77` is still deferred only because private host/operator data is required,
 append a sanitized note saying `q63` is no longer its code blocker. Do not
 undefer or close `r77` unless its owner/operator prerequisites are satisfied.
+The final status must show the branch with no ahead/behind state relative to
+origin.
 
 ## 3. Sanitized Success Note Template
 
@@ -78,12 +88,24 @@ Next unblock step:
 - <single concrete component/request>
 ```
 
-Create or update a narrow request under
-`~/.agents/projects/<repo-name>/requests/` only if another repo must supply the
-missing contract. Keep the request sanitized.
+Apply the blocked/deferred state explicitly:
+
+```bash
+bd update rom-operator-bridge-q63 --status open --append-notes "<sanitized blocker summary>"
+bd defer rom-operator-bridge-q63 --until="+14d"
+bd dolt push
+git status --short --branch
+```
+
+If another repo or operator handoff must supply the missing contract, create or
+update an explicit bead dependency or human/private handoff bead. Create or
+update a narrow request under `~/.agents/projects/<repo-name>/requests/` only as
+supporting context. Keep the request sanitized and reference it from the bead.
 
 ## 5. Repository Close Protocol
 
+If code changed and `q63` is complete, the commit must already exist before the
+success bead note is appended so the note can include the real commit SHA.
 Follow `AGENTS.md` exactly:
 
 ```bash

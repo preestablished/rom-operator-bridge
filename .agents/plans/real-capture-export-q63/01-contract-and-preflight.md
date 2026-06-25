@@ -29,12 +29,18 @@ classes.
 
 Expected bridge-owned decision:
 
-- Prefer the RPC that returns capture/export artifacts from the active lease and
-  configured `BRIDGE_CAPTURE_SPEC_REF`.
-- If the available RPC streams multiple events, complete a job only after the
-  terminal success event and durable private writes.
-- If only `TakeSnapshot` is available, treat it as a private capture payload
-  source only when it has enough metadata to produce a valid capture index row.
+- Do not use `RunWithFrameCapture` for `q63` unless the worker implementation is
+  proven available and the RPC returns enough data for the reference workload
+  capture index row.
+- Resolve `BRIDGE_CAPTURE_SPEC_REF` privately into a concrete
+  `dh::CaptureSpec` plus the layout/feature-map metadata required by the
+  reference workload schema.
+- Prefer `Run(... capture: Some(spec))` or
+  `TakeSnapshot(... capture: Some(spec))` on the active lease if those are the
+  implemented worker capture paths.
+- Complete a job only after the terminal worker success and durable private
+  writes.
+- If the resolver/exporter is absent, stop and leave `q63` open/deferred.
 
 ## 3. Confirm Reference Workload Bundle Contract
 
@@ -54,6 +60,20 @@ If no authoritative schema or exporter exists, stop here:
 - Append a sanitized blocker to `rom-operator-bridge-q63`.
 - Keep `q63` deferred/open.
 - Do not implement synthetic or placeholder completion.
+
+Use explicit bead commands so the state stays authoritative:
+
+```bash
+bd update rom-operator-bridge-q63 --status open --append-notes "Blocked: real capture exporter/schema contract unavailable. Checked only sanitized contract availability. No synthetic, mock-only, or placeholder result was accepted as real capture."
+bd defer rom-operator-bridge-q63 --until="+14d"
+bd dolt push
+git status --short --branch
+```
+
+If another repo or operator handoff must supply the missing contract, create or
+update an explicit bead dependency or human/private handoff bead. A sanitized
+request file under `~/.agents/projects/<repo-name>/requests/` may support the
+handoff, but it must not replace bead state.
 
 ## 4. Preflight Current Bridge Seams
 
@@ -76,7 +96,8 @@ Key current seams:
 ## 5. Privacy Preflight
 
 Before coding, prepare a private forbidden-literals file for any live smoke
-evidence. Include:
+evidence. Store it outside the repository under a private run directory with
+mode `0600`; never commit it. Include:
 
 - private root;
 - worker endpoint;
