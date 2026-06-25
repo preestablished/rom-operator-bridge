@@ -28,7 +28,7 @@ use axum::{
     body::Body,
     extract::{Path, State, ws::WebSocketUpgrade},
     http::{
-        HeaderMap, HeaderName, HeaderValue, StatusCode, Uri,
+        HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri,
         header::{
             ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, CONTENT_TYPE, PRAGMA, SET_COOKIE, VARY,
         },
@@ -41,6 +41,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
+    fs, io,
+    path::{Path as StdPath, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -49,6 +51,7 @@ const JSON_SAFE_U64_MAX: u64 = 9_007_199_254_740_991;
 const MAX_CACHED_FRAME_PREVIEWS: usize = 16;
 const DEFAULT_CAPTURE_LIMIT: usize = 50;
 const MAX_CAPTURE_LIMIT: usize = 200;
+const STATIC_CSP: &str = "default-src 'self'; connect-src 'self' wss://rombridge.birb.homes; img-src 'self' blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -1006,7 +1009,7 @@ pub fn router(state: AppState) -> Router {
             "/ws/events",
             get(events_ws_handshake).fallback(method_not_allowed),
         )
-        .fallback(not_found)
+        .fallback(static_or_not_found)
         .with_state(state)
 }
 
@@ -2293,6 +2296,144 @@ async fn not_found() -> AppError {
     )
 }
 
+async fn static_or_not_found(State(state): State<AppState>, method: Method, uri: Uri) -> Response {
+    if method != Method::GET && method != Method::HEAD {
+        return not_found().await.into_response();
+    }
+    if is_runtime_prefix(uri.path()) {
+        return not_found().await.into_response();
+    }
+
+    let Some(root) = state.config.private_config().static_publish_root() else {
+        return not_found().await.into_response();
+    };
+
+    match static_file_response(root, uri.path(), method == Method::HEAD) {
+        Ok(Some(response)) => response,
+        Ok(None) => not_found().await.into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+fn is_runtime_prefix(path: &str) -> bool {
+    path == "/health"
+        || path.starts_with("/health/")
+        || path == "/api"
+        || path.starts_with("/api/")
+        || path == "/ws"
+        || path.starts_with("/ws/")
+}
+
+fn static_file_response(
+    root: &StdPath,
+    request_path: &str,
+    head_only: bool,
+) -> Result<Option<Response>, AppError> {
+    let requested = static_relative_path(request_path)?;
+    let path = match safe_static_file(root, &requested)? {
+        Some(path) => Some(path),
+        None if looks_like_asset_path(&requested) => None,
+        None => safe_static_file(root, StdPath::new("index.html"))?,
+    };
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let contents = fs::read(&path).map_err(|_| not_found_error())?;
+    let body = if head_only {
+        Body::empty()
+    } else {
+        Body::from(contents)
+    };
+    let mut response = Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, static_content_type(&path))
+        .body(body)
+        .map_err(|_| not_found_error())?;
+    apply_static_headers(response.headers_mut());
+    Ok(Some(response))
+}
+
+fn static_relative_path(request_path: &str) -> Result<PathBuf, AppError> {
+    if request_path.contains('%') || request_path.contains('\\') || request_path.contains('\0') {
+        return Err(not_found_error());
+    }
+
+    let mut relative = PathBuf::new();
+    for segment in request_path.trim_start_matches('/').split('/') {
+        if segment.is_empty() {
+            continue;
+        }
+        if segment == "."
+            || segment == ".."
+            || segment.starts_with('.')
+            || segment.contains(':')
+            || segment.ends_with(".map")
+        {
+            return Err(not_found_error());
+        }
+        relative.push(segment);
+    }
+
+    if relative.as_os_str().is_empty() {
+        relative.push("index.html");
+    }
+    Ok(relative)
+}
+
+fn safe_static_file(root: &StdPath, relative_path: &StdPath) -> Result<Option<PathBuf>, AppError> {
+    let mut current = root.to_path_buf();
+    for component in relative_path.components() {
+        let std::path::Component::Normal(part) = component else {
+            return Err(not_found_error());
+        };
+        current.push(part);
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(not_found_error()),
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(not_found_error());
+        }
+    }
+
+    match fs::metadata(&current) {
+        Ok(metadata) if metadata.is_file() => Ok(Some(current)),
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(not_found_error()),
+    }
+}
+
+fn looks_like_asset_path(path: &StdPath) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.contains('.'))
+}
+
+fn static_content_type(path: &StdPath) -> &'static str {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("css") => "text/css; charset=utf-8",
+        Some("html") => "text/html; charset=utf-8",
+        Some("js") | Some("mjs") => "text/javascript; charset=utf-8",
+        Some("json") => "application/json; charset=utf-8",
+        Some("png") => "image/png",
+        Some("svg") => "image/svg+xml",
+        Some("txt") => "text/plain; charset=utf-8",
+        Some("wasm") => "application/wasm",
+        _ => "application/octet-stream",
+    }
+}
+
+fn not_found_error() -> AppError {
+    AppError::new(
+        StatusCode::NOT_FOUND,
+        ErrorCode::BadRequest,
+        "Route not found.",
+        false,
+    )
+}
+
 async fn method_not_allowed() -> AppError {
     AppError::new(
         StatusCode::METHOD_NOT_ALLOWED,
@@ -2766,6 +2907,22 @@ fn apply_no_store_headers(headers: &mut HeaderMap) {
     headers.insert(
         HeaderName::from_static("x-content-type-options"),
         HeaderValue::from_static("nosniff"),
+    );
+}
+
+fn apply_static_headers(headers: &mut HeaderMap) {
+    apply_no_store_headers(headers);
+    headers.insert(
+        HeaderName::from_static("content-security-policy"),
+        HeaderValue::from_static(STATIC_CSP),
+    );
+    headers.insert(
+        HeaderName::from_static("referrer-policy"),
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-frame-options"),
+        HeaderValue::from_static("DENY"),
     );
 }
 

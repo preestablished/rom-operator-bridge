@@ -12,7 +12,13 @@ COOKIE_FILE=${ROM_BRIDGE_SESSION_COOKIE_FILE:-}
 COOKIE_CURL_CONFIG_FILE=${ROM_BRIDGE_COOKIE_CURL_CONFIG_FILE:-}
 SERVICE_PORT=${ROM_BRIDGE_SERVICE_PORT:-7410}
 NETWORK_EVIDENCE_FILE=${ROM_BRIDGE_NETWORK_EVIDENCE_FILE:-}
+NETWORK_EVIDENCE_REVIEWED=${ROM_BRIDGE_NETWORK_EVIDENCE_REVIEWED:-}
 OUTSIDE_PROBE_FILE=${ROM_BRIDGE_OUTSIDE_PROBE_RESULT_FILE:-}
+OUTSIDE_PROBE_REVIEWED=${ROM_BRIDGE_OUTSIDE_PROBE_REVIEWED:-}
+HOST_SNI_EVIDENCE_FILE=${ROM_BRIDGE_HOST_SNI_EVIDENCE_FILE:-}
+HOST_SNI_EVIDENCE_REVIEWED=${ROM_BRIDGE_HOST_SNI_EVIDENCE_REVIEWED:-}
+WRONG_HOST=${ROM_BRIDGE_WRONG_HOST:-not-rombridge.invalid}
+STATIC_PUBLISH_ROOT=${ROM_BRIDGE_STATIC_PUBLISH_ROOT:-}
 FORBID_FILE=${ROM_BRIDGE_FORBID_FILE:-}
 
 FAILURES=0
@@ -34,8 +40,17 @@ Optional:
   ROM_BRIDGE_RESOLVE_IP             private IP for curl --resolve
   ROM_BRIDGE_COOKIE_CURL_CONFIG_FILE 0600 curl config containing cookie header
   ROM_BRIDGE_SERVICE_PORT           default: 7410
-  ROM_BRIDGE_NETWORK_EVIDENCE_FILE  private firewall/ingress/ACL evidence file
+  ROM_BRIDGE_NETWORK_EVIDENCE_FILE  private listener/firewall/ingress/ACL
+                                    evidence file; requires
+                                    ROM_BRIDGE_NETWORK_EVIDENCE_REVIEWED=1
   ROM_BRIDGE_OUTSIDE_PROBE_RESULT_FILE private outside-network probe result file
+                                    requires
+                                    ROM_BRIDGE_OUTSIDE_PROBE_REVIEWED=1
+  ROM_BRIDGE_HOST_SNI_EVIDENCE_FILE private Host/SNI isolation evidence file;
+                                    requires
+                                    ROM_BRIDGE_HOST_SNI_EVIDENCE_REVIEWED=1
+  ROM_BRIDGE_WRONG_HOST             default: not-rombridge.invalid
+  ROM_BRIDGE_STATIC_PUBLISH_ROOT    deployed static root to scan, outside repo
   ROM_BRIDGE_FORBID_FILE            private forbidden-literals file
 EOF
 }
@@ -90,6 +105,31 @@ check_private_file() {
   if [[ "$mode" != "600" ]]; then
     fail "$label"
     return
+  fi
+  pass "$label"
+}
+
+reviewed_evidence_file() {
+  local path=$1
+  local reviewed=$2
+  local label=$3
+  if [[ -z "$path" || ! -f "$path" ]]; then
+    fail "$label"
+    return 1
+  fi
+  if contains_placeholder "$path"; then
+    fail "$label"
+    return 1
+  fi
+  local mode
+  mode=$(stat -c '%a' "$path" 2>/dev/null || true)
+  if [[ "$mode" != "600" ]]; then
+    fail "$label"
+    return 1
+  fi
+  if [[ "$reviewed" != "1" ]]; then
+    fail "${label}_operator_reviewed"
+    return 1
   fi
   pass "$label"
 }
@@ -191,12 +231,27 @@ check_service_bind() {
     return
   fi
 
-  if rg -q "(127\\.0\\.0\\.1|\\[::1\\]|::1):${SERVICE_PORT}\\b" "$VALIDATION_DIR/listeners.txt"; then
+  local port_listeners="$VALIDATION_DIR/listeners-${SERVICE_PORT}.txt"
+  rg "(:|\\])${SERVICE_PORT}\\b" "$VALIDATION_DIR/listeners.txt" >"$port_listeners" || true
+  if [[ ! -s "$port_listeners" ]]; then
+    fail service_bind
+    return
+  fi
+
+  if rg -q "(^|[[:space:]])(0\\.0\\.0\\.0|\\*|\\[::\\]|::):${SERVICE_PORT}\\b" "$port_listeners"; then
+    fail service_bind_wildcard
+    return
+  fi
+
+  if rg -q "(127\\.0\\.0\\.1|\\[::1\\]|::1):${SERVICE_PORT}\\b" "$port_listeners"; then
     pass service_bind
     return
   fi
 
-  if [[ -n "$NETWORK_EVIDENCE_FILE" && -f "$NETWORK_EVIDENCE_FILE" ]]; then
+  if reviewed_evidence_file \
+    "$NETWORK_EVIDENCE_FILE" \
+    "$NETWORK_EVIDENCE_REVIEWED" \
+    network_evidence_private; then
     pass service_bind_trusted_interface
     return
   fi
@@ -348,24 +403,139 @@ check_websockets() {
 }
 
 check_mixed_content() {
+  local failed=0
   if ! http_probe root_index "200 301 302" "$BASE_URL/"; then
     fail mixed_content_absent
     return
   fi
   rg -l 'http://|ws://' "$VALIDATION_DIR/root_index.body" >"$VALIDATION_DIR/mixed-content-candidates.txt" || true
   if [[ -s "$VALIDATION_DIR/mixed-content-candidates.txt" ]]; then
-    fail mixed_content_absent
-    return
+    failed=1
   fi
-  pass mixed_content_absent
+
+  if ! check_static_publish_root; then
+    failed=1
+  fi
+
+  if [[ $failed -eq 0 ]]; then
+    pass mixed_content_absent
+  else
+    fail mixed_content_absent
+  fi
+}
+
+check_static_publish_root() {
+  if [[ -z "$STATIC_PUBLISH_ROOT" ]]; then
+    fail static_publish_root_scan
+    return 1
+  fi
+  if contains_placeholder "$STATIC_PUBLISH_ROOT"; then
+    fail static_publish_root_scan
+    return 1
+  fi
+  if [[ ! -d "$STATIC_PUBLISH_ROOT" ]]; then
+    fail static_publish_root_scan
+    return 1
+  fi
+
+  local root_real static_real failed=0
+  root_real=$(cd "$ROOT_DIR" && pwd -P)
+  static_real=$(cd "$STATIC_PUBLISH_ROOT" && pwd -P)
+  if [[ "$static_real" == "$root_real" || "$static_real" == "$root_real"/* ]]; then
+    fail static_publish_root_outside_repo
+    return 1
+  fi
+
+  find "$static_real" -type l -print -quit >"$VALIDATION_DIR/static-symlink-candidates.txt"
+  if [[ -s "$VALIDATION_DIR/static-symlink-candidates.txt" ]]; then
+    fail static_publish_root_no_symlinks
+    failed=1
+  fi
+
+  find "$static_real" -type f -name '*.map' -print -quit >"$VALIDATION_DIR/static-sourcemap-candidates.txt"
+  if [[ -s "$VALIDATION_DIR/static-sourcemap-candidates.txt" ]]; then
+    fail static_publish_root_no_sourcemaps
+    failed=1
+  fi
+
+  rg -l 'http://|ws://' "$static_real" >"$VALIDATION_DIR/static-mixed-content-candidates.txt" || true
+  if [[ -s "$VALIDATION_DIR/static-mixed-content-candidates.txt" ]]; then
+    fail static_publish_root_mixed_content_absent
+    failed=1
+  fi
+
+  scan_forbidden static_publish_root "$static_real" || failed=1
+
+  if [[ $failed -eq 0 ]]; then
+    pass static_publish_root_scan
+    return 0
+  fi
+  return 1
+}
+
+check_host_sni() {
+  local failed=0
+  local headers="$VALIDATION_DIR/wrong-host.headers"
+  local body="$VALIDATION_DIR/wrong-host.body"
+  local stderr="$VALIDATION_DIR/wrong-host.stderr"
+  local code status
+  set +e
+  code=$(curl -sS --max-time 15 "${curl_args_common[@]}" \
+    -H "Host: $WRONG_HOST" \
+    -D "$headers" \
+    -o "$body" \
+    -w '%{http_code}' \
+    "$BASE_URL/" 2>"$stderr")
+  status=$?
+  set -e
+  printf '%s\n' "$code" >"$VALIDATION_DIR/wrong-host.status"
+  if [[ $status -eq 0 && "$code" =~ ^(200|301|302)$ ]]; then
+    failed=1
+  fi
+
+  if [[ -n "$RESOLVE_IP" ]]; then
+    local sni_headers="$VALIDATION_DIR/wrong-sni.headers"
+    local sni_body="$VALIDATION_DIR/wrong-sni.body"
+    local sni_stderr="$VALIDATION_DIR/wrong-sni.stderr"
+    set +e
+    code=$(curl -k -sS --max-time 15 \
+      --resolve "$WRONG_HOST:443:$RESOLVE_IP" \
+      -D "$sni_headers" \
+      -o "$sni_body" \
+      -w '%{http_code}' \
+      "https://$WRONG_HOST/" 2>"$sni_stderr")
+    status=$?
+    set -e
+    printf '%s\n' "$code" >"$VALIDATION_DIR/wrong-sni.status"
+    if [[ $status -eq 0 && "$code" =~ ^(200|301|302)$ ]]; then
+      failed=1
+    fi
+  elif ! reviewed_evidence_file \
+    "$HOST_SNI_EVIDENCE_FILE" \
+    "$HOST_SNI_EVIDENCE_REVIEWED" \
+    host_sni_evidence_private; then
+    failed=1
+  fi
+
+  if [[ $failed -eq 0 ]]; then
+    pass host_sni_isolation
+  else
+    fail host_sni_isolation
+  fi
 }
 
 check_outside_network() {
-  if [[ -n "$OUTSIDE_PROBE_FILE" && -f "$OUTSIDE_PROBE_FILE" ]]; then
+  if reviewed_evidence_file \
+    "$OUTSIDE_PROBE_FILE" \
+    "$OUTSIDE_PROBE_REVIEWED" \
+    outside_probe_private; then
     pass outside_network_rejected
     return
   fi
-  if [[ -n "$NETWORK_EVIDENCE_FILE" && -f "$NETWORK_EVIDENCE_FILE" ]]; then
+  if reviewed_evidence_file \
+    "$NETWORK_EVIDENCE_FILE" \
+    "$NETWORK_EVIDENCE_REVIEWED" \
+    network_evidence_private; then
     pass outside_network_rejected_with_network_artifact
     return
   fi
@@ -378,6 +548,7 @@ main() {
   require_command rg
   require_command ss
   require_command awk
+  require_command find
   require_command stat
 
   if [[ -z "$VALIDATION_DIR" || ( -z "$COOKIE_FILE" && -z "$COOKIE_CURL_CONFIG_FILE" ) ]]; then
@@ -400,6 +571,7 @@ main() {
   check_runtime_no_store
   check_websockets
   check_mixed_content
+  check_host_sni
   check_outside_network
 
   if [[ $FAILURES -eq 0 ]]; then

@@ -27,6 +27,7 @@ fn placeholder_config_loads_without_private_values() {
     assert_eq!(config.backend_mode(), BackendMode::Synthetic);
     assert!(config.private_config().is_placeholder());
     assert!(config.private_config().private_root().is_none());
+    assert!(config.private_config().static_publish_root().is_none());
     assert!(!config.private_config().operator_credential_configured());
     assert!(!config.private_config().session_secret_configured());
 }
@@ -68,6 +69,7 @@ fn config_file_loads_private_values_and_creates_private_dirs() {
         config.private_config().private_root(),
         Some(private_root.as_path())
     );
+    assert!(config.private_config().static_publish_root().is_none());
     assert_eq!(mode(&private_root), PRIVATE_DIR_MODE);
     assert_eq!(
         mode(&private_root.join(PRIVATE_ROOT_MARKER)),
@@ -463,6 +465,29 @@ fn private_root_inside_static_publish_root_is_rejected() {
     );
 }
 
+#[test]
+fn static_publish_root_inside_private_root_is_rejected() {
+    let workspace = tempfile::tempdir().expect("tempdir creates");
+    let private_root = workspace.path().join("bridge-private");
+    let static_root = private_root.join("static-publish");
+
+    let mut pairs = complete_private_pairs(&private_root);
+    pairs.push((
+        ENV_STATIC_PUBLISH_ROOT.to_string(),
+        static_root.display().to_string(),
+    ));
+
+    assert_eq!(
+        ServiceConfig::from_pairs(pairs),
+        Err(ConfigError::PrivateConfig(
+            PrivateConfigError::StaticPublishRootInsidePrivateRoot {
+                private_root,
+                static_publish_root: static_root,
+            }
+        ))
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn symlinked_static_publish_root_alias_is_rejected() {
@@ -515,13 +540,27 @@ fn config_error_debug_does_not_expose_private_paths() {
 fn private_config_sanitizer_rejects_configured_root_and_secrets() {
     let workspace = tempfile::tempdir().expect("tempdir creates");
     let private_root = workspace.path().join("bridge-private");
-    let config =
-        ServiceConfig::from_pairs(complete_private_pairs(&private_root)).expect("config loads");
+    let static_root = workspace.path().join("static-publish");
+    let mut pairs = complete_private_pairs(&private_root);
+    pairs.push((
+        ENV_STATIC_PUBLISH_ROOT.to_string(),
+        static_root.display().to_string(),
+    ));
+    let config = ServiceConfig::from_pairs(pairs).expect("config loads");
+    assert_eq!(
+        config.private_config().static_publish_root(),
+        Some(static_root.as_path())
+    );
     let sanitizer = config.private_config().public_sanitizer();
 
     assert!(
         sanitizer
             .inspect_text(&format!("opened {}", private_root.display()))
+            .is_err()
+    );
+    assert!(
+        sanitizer
+            .inspect_text(&format!("served {}", static_root.display()))
             .is_err()
     );
     assert!(

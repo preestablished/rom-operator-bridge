@@ -21,6 +21,14 @@ certificate resource for `rombridge.birb.homes`, and no installed
 `rom-operator-bridge` systemd unit. The active blocker is missing deployment
 prerequisites, not just a failing network-isolation assertion.
 
+Repo-side deployment prerequisites have now been implemented for the next
+operator run: the service can serve the static UI root from a configured static
+publish root, committed systemd/K3s templates exist under `deploy/`, and the
+deployment-network checker now requires reviewed private bind, Host/SNI,
+static-root, and outside-network evidence. Live host installation and K3s apply
+still require operator-private env and endpoint material, so this document does
+not claim a deployment PASS yet.
+
 ## Evidence Boundary
 
 Raw evidence label:
@@ -76,6 +84,12 @@ Repeatable sanitized check:
 ```sh
 ROM_BRIDGE_VALIDATION_DIR=<private-validation-dir>/deployment-network-kut/<run-id> \
 ROM_BRIDGE_COOKIE_CURL_CONFIG_FILE=<private-cookie-curl-config> \
+ROM_BRIDGE_STATIC_PUBLISH_ROOT=<absolute-static-publish-root> \
+ROM_BRIDGE_NETWORK_EVIDENCE_FILE=<private-network-evidence-file> \
+ROM_BRIDGE_NETWORK_EVIDENCE_REVIEWED=1 \
+ROM_BRIDGE_OUTSIDE_PROBE_RESULT_FILE=<private-outside-probe-file> \
+ROM_BRIDGE_OUTSIDE_PROBE_REVIEWED=1 \
+ROM_BRIDGE_FORBID_FILE=<private-forbid-file> \
 scripts/deployment-network-check.sh
 ```
 
@@ -83,13 +97,34 @@ The script writes raw evidence under the private validation directory and emits
 only sanitized PASS/FAIL lines. It must not print cookies, private addresses,
 raw headers, response bodies, or private paths.
 
+If the run does not provide `ROM_BRIDGE_RESOLVE_IP`, also provide a reviewed
+private Host/SNI evidence file:
+
+```sh
+ROM_BRIDGE_HOST_SNI_EVIDENCE_FILE=<private-host-sni-evidence-file> \
+ROM_BRIDGE_HOST_SNI_EVIDENCE_REVIEWED=1
+```
+
+Deployment redaction checks must require the operator-private forbid file:
+
+```sh
+ROM_OPERATOR_BRIDGE_FORBID_FILE=<private-forbid-file> \
+ROM_OPERATOR_BRIDGE_REQUIRE_FORBID_FILE=1 \
+bash scripts/redaction-gate.sh
+```
+
 ## Remaining Blockers
 
 `kut` should remain deferred until all of the following are true:
 
 - trusted TLS verification succeeds for `https://rombridge.birb.homes/`;
+- `deploy/systemd/rom-operator-bridge.service` is installed with a private
+  env file and the service is active;
+- the K3s ingress manifest is applied along with an operator-private endpoint
+  manifest for the trusted bridge address;
 - the bridge service is active and bound only to the documented trusted
-  interface or a documented loopback proxy topology;
+  interface or a documented loopback proxy topology, with reviewed listener
+  evidence that rejects wildcard binds;
 - `/health` returns sanitized health over the trusted deployment route;
 - allowed-Origin/no-cookie runtime requests produce sanitized auth rejection;
 - valid-cookie requests with absent, `null`, and unrelated Origins are rejected;
@@ -97,10 +132,15 @@ raw headers, response bodies, or private paths.
   headers;
 - both `/ws/events` and `/ws/input` reject unauthenticated and wrong-Origin
   handshakes and accept allowed-Origin authenticated handshakes;
-- browser-facing assets contain no `http://` or `ws://` runtime endpoints;
+- Host/SNI probes or reviewed Host/SNI artifacts prove the bridge is not served
+  for unrelated hostnames;
+- the deployed static publish root is scanned as a clean release directory with
+  no symlinks, source maps, private values, `http://`, or `ws://` runtime
+  endpoints;
 - outside-network isolation is backed by a technical artifact, such as an
   outside-network probe, firewall/ingress policy, Host/SNI routing evidence plus
-  listener evidence, or equivalent network ACL proof.
+  listener evidence, or equivalent network ACL proof, and the artifact is
+  operator-reviewed.
 
 A private request has been created for the deployment/operator agent to provide
 these prerequisites before the next `kut` run. The request asks for a running
@@ -111,6 +151,9 @@ proxying, and technical outside-network isolation evidence.
 
 - `docs/deployment-note.md`
 - `docs/deployment-security-shape.md`
+- `deploy/README.md`
+- `deploy/k8s/rombridge-ingress.yaml`
+- `deploy/systemd/rom-operator-bridge.service`
 - `docs/runtime-api.md`
 - `docs/redaction.md`
 - `scripts/deployment-network-check.sh`

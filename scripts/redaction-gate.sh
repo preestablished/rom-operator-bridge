@@ -16,7 +16,7 @@ trap cleanup EXIT
 need_command() {
   local command_name=$1
   if ! command -v "$command_name" >/dev/null 2>&1; then
-    printf 'ERROR: redaction gate requires `%s` on PATH.\n' "$command_name" >&2
+    printf "ERROR: redaction gate requires \`%s\` on PATH.\n" "$command_name" >&2
     exit 127
   fi
 }
@@ -117,7 +117,7 @@ REDACTION_FIXTURE_ROOT="$FIXTURE_ROOT" \
 printf 'redaction-gate: building static UI output\n'
 (cd "$ROOT_DIR" && npm --prefix ui run build >/dev/null)
 
-printf 'redaction-gate: scanning static UI/docs output\n'
+printf 'redaction-gate: scanning static UI/docs/deploy output\n'
 set +e
 node "$ROOT_DIR/scripts/redaction-gate.mjs" scan \
   --root "$ROOT_DIR" \
@@ -149,4 +149,4 @@ if [[ $pattern_status -ne 0 || $refwork_status -ne 0 ]]; then
   exit 1
 fi
 
-printf 'redaction-gate: PASS — scanned static UI/docs output; reports written to the validation directory\n'
+printf 'redaction-gate: PASS — scanned static UI/docs/deploy output; reports written to the validation directory\n'

@@ -38,6 +38,7 @@ const MIN_PRIVATE_ROOT_COMPONENTS: usize = 3;
 #[derive(Clone, PartialEq, Eq)]
 pub struct BridgePrivateConfig {
     root: Option<PrivateRootConfig>,
+    static_publish_root: Option<PathBuf>,
     operator_credential: Option<SecretValue>,
     session_secret: Option<SecretValue>,
     real_runtime: Option<RealRuntimeConfig>,
@@ -47,6 +48,7 @@ impl BridgePrivateConfig {
     pub fn placeholder() -> Self {
         Self {
             root: None,
+            static_publish_root: None,
             operator_credential: None,
             session_secret: None,
             real_runtime: None,
@@ -101,6 +103,7 @@ impl BridgePrivateConfig {
 
         let config = Self {
             root: Some(PrivateRootConfig { path: root }),
+            static_publish_root,
             operator_credential: Some(operator_credential),
             session_secret: Some(session_secret),
             real_runtime,
@@ -111,6 +114,7 @@ impl BridgePrivateConfig {
 
     pub fn is_placeholder(&self) -> bool {
         self.root.is_none()
+            && self.static_publish_root.is_none()
             && self.operator_credential.is_none()
             && self.session_secret.is_none()
             && self.real_runtime.is_none()
@@ -118,6 +122,10 @@ impl BridgePrivateConfig {
 
     pub fn private_root(&self) -> Option<&Path> {
         self.root.as_ref().map(PrivateRootConfig::path)
+    }
+
+    pub fn static_publish_root(&self) -> Option<&Path> {
+        self.static_publish_root.as_deref()
     }
 
     pub fn operator_credential_configured(&self) -> bool {
@@ -135,6 +143,9 @@ impl BridgePrivateConfig {
     pub fn public_sanitizer(&self) -> PublicSanitizer {
         let mut sanitizer = PublicSanitizer::new();
         if let Some(root) = self.private_root() {
+            sanitizer = sanitizer.with_private_root(root);
+        }
+        if let Some(root) = self.static_publish_root() {
             sanitizer = sanitizer.with_private_root(root);
         }
         if let Some(secret) = &self.operator_credential {
@@ -365,6 +376,10 @@ impl fmt::Debug for BridgePrivateConfig {
         formatter
             .debug_struct("BridgePrivateConfig")
             .field("root_configured", &self.root.is_some())
+            .field(
+                "static_publish_root_configured",
+                &self.static_publish_root.is_some(),
+            )
             .field(
                 "operator_credential_configured",
                 &self.operator_credential.is_some(),
@@ -843,6 +858,12 @@ fn validate_private_root(
                 static_publish_root: static_publish_root.to_path_buf(),
             });
         }
+        if static_publish_root.starts_with(root) {
+            return Err(PrivateConfigError::StaticPublishRootInsidePrivateRoot {
+                private_root: root.to_path_buf(),
+                static_publish_root: static_publish_root.to_path_buf(),
+            });
+        }
     }
 
     if let Some(metadata) = path_metadata(root)? {
@@ -1229,6 +1250,11 @@ pub enum PrivateConfigError {
     PathContainsParent { env: &'static str, path: PathBuf },
     #[error("private root must not be inside the static publish root")]
     PrivateRootInsideStaticPublishRoot {
+        private_root: PathBuf,
+        static_publish_root: PathBuf,
+    },
+    #[error("static publish root must not be inside the private root")]
+    StaticPublishRootInsidePrivateRoot {
         private_root: PathBuf,
         static_publish_root: PathBuf,
     },

@@ -7,6 +7,8 @@ bridge material. It is intentionally agent-runnable and is called by
 The gate scans:
 
 - public docs: `README.md`, `docs/`, and `contracts/`;
+- deployment templates and sanitized deployment handoff material under
+  `deploy/`;
 - UI shell/config: `ui/README.md`, `ui/index.html`, and `ui/public/`;
 - built UI output: `ui/dist/`.
 
