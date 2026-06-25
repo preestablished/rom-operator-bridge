@@ -16,12 +16,23 @@ bridge runtime surfaces. The bridge service is also not active on the expected
 host service path, so Origin, no-store, WSS, mixed-content, and outside-network
 isolation checks cannot pass yet.
 
+Additional host inspection found no bridge-specific K3s ingress, service, or
+certificate resource for `rombridge.birb.homes`, and no installed
+`rom-operator-bridge` systemd unit. The active blocker is missing deployment
+prerequisites, not just a failing network-isolation assertion.
+
 ## Evidence Boundary
 
 Raw evidence label:
 
 ```text
 private evidence: deployment-network-kut/20260625T181209Z
+```
+
+Private request label:
+
+```text
+private request: rom-operator-bridge/kut-deployment-route-prerequisites
 ```
 
 This label identifies private evidence outside the repository. It is not a
@@ -90,6 +101,11 @@ raw headers, response bodies, or private paths.
 - outside-network isolation is backed by a technical artifact, such as an
   outside-network probe, firewall/ingress policy, Host/SNI routing evidence plus
   listener evidence, or equivalent network ACL proof.
+
+A private request has been created for the deployment/operator agent to provide
+these prerequisites before the next `kut` run. The request asks for a running
+bridge service, trusted TLS, Host/SNI-routed ingress, runtime API and WSS
+proxying, and technical outside-network isolation evidence.
 
 ## References
 
