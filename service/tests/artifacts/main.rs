@@ -1,8 +1,9 @@
 use rom_operator_bridge_service::{
     artifacts::{
-        ARTIFACT_SCHEMA_VERSION, ArtifactError, BridgeEventRow, CaptureSummary, InputRejectionRow,
-        LabelDraft, LabelDraftFile, PrivateArtifactStore, RecentCapturesFile, RunManifest,
-        ValidationRunRow,
+        ARTIFACT_SCHEMA_VERSION, ArtifactError, BridgeEventRow, CaptureFeatureBytesIndex,
+        CaptureFramebufferIndex, CaptureIndexRow, CapturePayloadKind, CaptureSummary,
+        InputRejectionRow, LabelDraft, LabelDraftFile, PrivateArtifactStore, RecentCapturesFile,
+        RunManifest, ValidationRunRow,
     },
     backend::BackendMode,
     private_config::{
@@ -277,6 +278,164 @@ fn artifact_writers_reject_bad_schema_versions_and_path_ids() {
             ..
         })
     ));
+}
+
+#[cfg(unix)]
+#[test]
+fn writes_capture_payloads_and_appends_capture_index_rows() {
+    let (_workspace, config, private_root) = private_config();
+    let store = PrivateArtifactStore::new(config.private_config());
+
+    let feature_payload = store
+        .write_capture_payload(
+            "real-capture-0000",
+            CapturePayloadKind::FeatureBytes,
+            "feature-bytes.bin",
+            &[1, 0, 2, 3],
+        )
+        .expect("feature payload writes");
+    let framebuffer_payload = store
+        .write_capture_payload(
+            "real-capture-0000",
+            CapturePayloadKind::Framebuffer,
+            "framebuffer.fb_lz4",
+            &[4, 5, 6, 7],
+        )
+        .expect("framebuffer payload writes");
+
+    assert_eq!(feature_payload.len, 4);
+    assert!(feature_payload.blake3.starts_with("blake3:"));
+    assert_eq!(
+        mode(&artifact_path(&private_root, &feature_payload.artifact_ref)),
+        PRIVATE_FILE_MODE
+    );
+    assert_eq!(
+        mode(&private_root.join("artifacts/feature-bytes")),
+        PRIVATE_DIR_MODE
+    );
+    assert!(!format!("{feature_payload:?}").contains("real-capture-0000"));
+
+    let row = capture_index_row(
+        "real-capture-0000",
+        feature_payload.artifact_ref.artifact_ref(),
+        feature_payload.blake3,
+        framebuffer_payload.artifact_ref.artifact_ref(),
+        framebuffer_payload.blake3,
+    );
+    let index_ref = store
+        .append_capture_index_row(&row)
+        .expect("capture index row appends");
+    let mut second = row.clone();
+    second.capture_id = "real-capture-0001".to_string();
+    store
+        .append_capture_index_row(&second)
+        .expect("second capture index row appends");
+
+    let index_path = artifact_path(&private_root, &index_ref);
+    assert_eq!(mode(&index_path), PRIVATE_FILE_MODE);
+    let lines = read_lines(&index_path);
+    assert_eq!(lines.len(), 2);
+    let parsed: Value = serde_json::from_str(&lines[0]).expect("index row parses");
+    assert_eq!(parsed["capture_id"], "real-capture-0000");
+    assert_eq!(parsed["capture_source"], "real_take_snapshot");
+    assert!(parsed["feature_bytes"]["bytes"].is_null());
+    assert!(parsed["framebuffer"]["bytes"].is_null());
+}
+
+#[test]
+fn capture_payloads_and_index_rows_reject_invalid_inputs() {
+    let (_workspace, config, _private_root) = private_config();
+    let store = PrivateArtifactStore::new(config.private_config());
+
+    assert!(matches!(
+        store.write_capture_payload(
+            "../capture",
+            CapturePayloadKind::FeatureBytes,
+            "feature-bytes.bin",
+            &[1],
+        ),
+        Err(ArtifactError::InvalidIdentifier {
+            field: "capture_id",
+            ..
+        })
+    ));
+    assert!(matches!(
+        store.write_capture_payload(
+            "real-capture-0000",
+            CapturePayloadKind::FeatureBytes,
+            "../feature-bytes.bin",
+            &[1],
+        ),
+        Err(ArtifactError::InvalidIdentifier {
+            field: "payload_name",
+            ..
+        })
+    ));
+    store
+        .write_capture_payload(
+            "real-capture-immutable",
+            CapturePayloadKind::FeatureBytes,
+            "feature-bytes.bin",
+            &[1],
+        )
+        .expect("first immutable payload writes");
+    assert!(matches!(
+        store.write_capture_payload(
+            "real-capture-immutable",
+            CapturePayloadKind::FeatureBytes,
+            "feature-bytes.bin",
+            &[2],
+        ),
+        Err(ArtifactError::ExistingCapturePayload)
+    ));
+
+    let mut row = capture_index_row(
+        "real-capture-0000",
+        "artifact:feature".to_string(),
+        "blake3:0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+        "artifact:framebuffer".to_string(),
+        "blake3:1111111111111111111111111111111111111111111111111111111111111111".to_string(),
+    );
+    row.decoded_values.clear();
+    assert!(matches!(
+        store.append_capture_index_row(&row),
+        Err(ArtifactError::InvalidCaptureIndexRow)
+    ));
+}
+
+fn capture_index_row(
+    capture_id: &str,
+    feature_ref: String,
+    feature_hash: String,
+    framebuffer_ref: String,
+    framebuffer_hash: String,
+) -> CaptureIndexRow {
+    CaptureIndexRow {
+        schema_version: ARTIFACT_SCHEMA_VERSION,
+        capture_id: capture_id.to_string(),
+        node_ref: format!("run:real-run-0000:capture:{capture_id}"),
+        capture_source: "real_take_snapshot".to_string(),
+        frame_counter: 12,
+        layout_hash: "blake3:2222222222222222222222222222222222222222222222222222222222222222"
+            .to_string(),
+        feature_bytes: CaptureFeatureBytesIndex {
+            artifact_ref: feature_ref,
+            len: 4,
+            blake3: feature_hash,
+        },
+        decoded_order: vec!["frame_ctr".to_string(), "frame_low".to_string()],
+        decoded_values: vec![1, 2],
+        framebuffer: CaptureFramebufferIndex {
+            artifact_ref: framebuffer_ref,
+            encoding: "fb_lz4".to_string(),
+            width: 256,
+            height: 224,
+            stride: 1024,
+            pixel_format: "xrgb8888".to_string(),
+            uncompressed_len: 229376,
+            blake3: framebuffer_hash,
+        },
+    }
 }
 
 fn private_config() -> (

@@ -1137,6 +1137,7 @@ impl BridgeBackend for CaptureBackend {
             job_id: "backend-capture-job".to_string(),
             status: CaptureJobStatus::Running,
             capture_id: None,
+            public: None,
         })
     }
 
@@ -1145,6 +1146,7 @@ impl BridgeBackend for CaptureBackend {
             job_id,
             status: CaptureJobStatus::Running,
             capture_id: None,
+            public: None,
         })
     }
 }

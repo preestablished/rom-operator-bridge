@@ -15,13 +15,18 @@ use tower::service_fn;
 
 use crate::{
     api::RUNTIME_API_SCHEMA_VERSION,
-    artifacts::{BridgeEventRow, PadLogEventRow, PrivateArtifactStore, RunManifest},
+    artifacts::{
+        BridgeEventRow, CaptureDeterminismClass, CaptureFeatureBytesIndex, CaptureFramebufferIndex,
+        CaptureIndexRow, CaptureLifecycleRefs, CaptureManifest, CapturePayloadKind, PadLogEventRow,
+        PrivateArtifactStore, RunManifest,
+    },
     framebuffer::{
         RawFramebuffer, RawFramebufferFormat, SYNTHETIC_FRAME_HEIGHT, SYNTHETIC_FRAME_WIDTH,
         framebuffer_png, synthetic_frame_png,
     },
     input::{AppliedInputFrame, PadLog, PadWord},
     private_config::{BridgePrivateConfig, RealRuntimeConfig},
+    real_capture::{ResolvedCaptureSpec, resolve_capture_spec},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,6 +110,17 @@ impl BackendCapabilities {
             preview: true,
             capture: false,
             labels: false,
+            privileged_features: false,
+            validation_runner: false,
+        }
+    }
+
+    pub const fn real_capture_mvp() -> Self {
+        Self {
+            input: true,
+            preview: true,
+            capture: true,
+            labels: true,
             privileged_features: false,
             validation_runner: false,
         }
@@ -226,12 +242,26 @@ pub struct CaptureJob {
     pub job_id: CaptureJobId,
     pub status: CaptureJobStatus,
     pub capture_id: Option<String>,
+    pub public: Option<RealCapturePublicProjection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealCapturePublicProjection {
+    pub frame_counter: FrameCounter,
+    pub capture_source: String,
+    pub layout_hash: String,
+    pub capture_spec_hash: String,
+    pub map_hash: String,
+    pub has_preview: bool,
+    pub features_available: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum BackendError {
     #[error("backend unavailable")]
     BackendUnavailable,
+    #[error("capture already in progress")]
+    CaptureInProgress,
     #[error("input target frame is stale")]
     FrameStale {
         requested_frame: FrameCounter,
@@ -570,6 +600,7 @@ impl BridgeBackend for SyntheticBackend {
             job_id: "synthetic-capture-job-scaffold".to_string(),
             status: CaptureJobStatus::Pending,
             capture_id: None,
+            public: None,
         })
     }
 
@@ -578,6 +609,7 @@ impl BridgeBackend for SyntheticBackend {
             job_id,
             status: CaptureJobStatus::Pending,
             capture_id: None,
+            public: None,
         })
     }
 }
@@ -750,6 +782,10 @@ impl RealBackend {
         }
     }
 
+    fn capture_spec(&self) -> BackendResult<ResolvedCaptureSpec> {
+        resolve_capture_spec(&self.runtime_config).map_err(|_| BackendError::BackendUnavailable)
+    }
+
     fn start_command(&self) -> BackendResult<RealStartCommand> {
         let start_source = self.runtime_config.start_source();
         if let Some(snapshot_hash) = start_source
@@ -847,6 +883,103 @@ impl RealBackend {
         }
     }
 
+    fn persist_real_capture(
+        &self,
+        session: &RealSession,
+        job_id: &str,
+        capture_id: &str,
+        resolved: &ResolvedCaptureSpec,
+        outcome: &RealCaptureOutcome,
+    ) -> BackendResult<RealCapturePublicProjection> {
+        let expected_len =
+            usize::try_from(resolved.total_len).map_err(|_| BackendError::BackendUnavailable)?;
+        if outcome.feature_bytes.len() != expected_len
+            || outcome.fb_info.frame_counter != outcome.frame_counter
+        {
+            return Err(BackendError::BackendUnavailable);
+        }
+        let decoded = resolved
+            .decode_values(&outcome.feature_bytes)
+            .map_err(|_| BackendError::BackendUnavailable)?;
+        let pixels = lz4_flex::decompress_size_prepended(&outcome.fb_lz4)
+            .map_err(|_| BackendError::BackendUnavailable)?;
+        let uncompressed_len =
+            u64::try_from(pixels.len()).map_err(|_| BackendError::BackendUnavailable)?;
+        let pixel_format = framebuffer_pixel_format_name(outcome.fb_info.format)?;
+        validate_framebuffer_geometry(&outcome.fb_info, uncompressed_len)?;
+
+        let store = PrivateArtifactStore::new(&self.private_config);
+        let feature_payload = store
+            .write_capture_payload(
+                capture_id,
+                CapturePayloadKind::FeatureBytes,
+                "feature-bytes.bin",
+                &outcome.feature_bytes,
+            )
+            .map_err(|_| BackendError::BackendUnavailable)?;
+        let framebuffer_payload = store
+            .write_capture_payload(
+                capture_id,
+                CapturePayloadKind::Framebuffer,
+                "framebuffer.fb_lz4",
+                &outcome.fb_lz4,
+            )
+            .map_err(|_| BackendError::BackendUnavailable)?;
+        let manifest = CaptureManifest::new(
+            capture_id,
+            job_id,
+            &session.run_id,
+            u64::from(outcome.frame_counter),
+            outcome.icount,
+            outcome.vns,
+            &resolved.layout_hash,
+            &resolved.capture_spec_hash,
+            &resolved.map_hash,
+            "real_take_snapshot",
+            capture_lifecycle_refs(outcome),
+        );
+        store
+            .write_capture_manifest(capture_id, &manifest)
+            .map_err(|_| BackendError::BackendUnavailable)?;
+        let row = CaptureIndexRow {
+            schema_version: crate::artifacts::ARTIFACT_SCHEMA_VERSION,
+            capture_id: capture_id.to_string(),
+            node_ref: format!("run:{}:capture:{}", session.run_id, capture_id),
+            capture_source: "real_take_snapshot".to_string(),
+            frame_counter: u64::from(outcome.frame_counter),
+            layout_hash: resolved.layout_hash.clone(),
+            feature_bytes: CaptureFeatureBytesIndex {
+                artifact_ref: feature_payload.artifact_ref.artifact_ref(),
+                len: feature_payload.len,
+                blake3: feature_payload.blake3,
+            },
+            decoded_order: decoded.order,
+            decoded_values: decoded.values,
+            framebuffer: CaptureFramebufferIndex {
+                artifact_ref: framebuffer_payload.artifact_ref.artifact_ref(),
+                encoding: "fb_lz4".to_string(),
+                width: outcome.fb_info.width,
+                height: outcome.fb_info.height,
+                stride: outcome.fb_info.stride,
+                pixel_format: pixel_format.to_string(),
+                uncompressed_len,
+                blake3: framebuffer_payload.blake3,
+            },
+        };
+        store
+            .append_capture_index_row(&row)
+            .map_err(|_| BackendError::BackendUnavailable)?;
+        Ok(RealCapturePublicProjection {
+            frame_counter: u64::from(outcome.frame_counter),
+            capture_source: "hypervisor".to_string(),
+            layout_hash: resolved.layout_hash.clone(),
+            capture_spec_hash: public_capture_spec_hash(&resolved.capture_spec_hash),
+            map_hash: resolved.map_hash.clone(),
+            has_preview: false,
+            features_available: false,
+        })
+    }
+
     fn clear_starting(&self) {
         self.inner
             .lock()
@@ -861,7 +994,11 @@ impl BridgeBackend for RealBackend {
     }
 
     fn capabilities(&self) -> BackendCapabilities {
-        BackendCapabilities::real_input_preview_mvp()
+        if self.capture_spec().is_ok() {
+            BackendCapabilities::real_capture_mvp()
+        } else {
+            BackendCapabilities::real_input_preview_mvp()
+        }
     }
 
     fn start_session(&self, request: StartBackendSession) -> BackendResult<BackendSession> {
@@ -911,6 +1048,7 @@ impl BridgeBackend for RealBackend {
             last_applied_input_frame: 0,
             frame_base_known: true,
             input_in_flight: false,
+            active_capture_job_id: None,
             applied_inputs: Vec::new(),
             capabilities: request.requested_capabilities,
         };
@@ -1378,12 +1516,112 @@ impl BridgeBackend for RealBackend {
         })
     }
 
-    fn trigger_capture(&self, _request: CaptureRequest) -> BackendResult<CaptureJob> {
-        Err(BackendError::BackendUnavailable)
+    fn trigger_capture(&self, request: CaptureRequest) -> BackendResult<CaptureJob> {
+        let resolved = self.capture_spec()?;
+        let (session, job_id, capture_id) = {
+            let mut inner = self.inner.lock().expect("real backend mutex poisoned");
+            let key = (request.session_id.clone(), request.idempotency_key.clone());
+            if let Some(job_id) = inner.capture_idempotency.get(&key) {
+                let job = inner
+                    .capture_jobs
+                    .get(job_id)
+                    .ok_or(BackendError::BackendUnavailable)?;
+                return Ok(job.capture_job());
+            }
+
+            let (job_id, capture_id) =
+                real_capture_ids(&request.session_id, &request.idempotency_key);
+            let active = inner
+                .active
+                .as_mut()
+                .filter(|session| session.session_id == request.session_id)
+                .ok_or(BackendError::BackendUnavailable)?;
+            if active.active_capture_job_id.is_some() {
+                return Err(BackendError::CaptureInProgress);
+            }
+            if !active.capabilities.capture
+                || active.state != SessionState::Paused
+                || active.input_in_flight
+            {
+                return Err(BackendError::BackendUnavailable);
+            }
+            active.active_capture_job_id = Some(job_id.clone());
+            let session = active.clone();
+            inner.capture_idempotency.insert(key, job_id.clone());
+            inner.capture_jobs.insert(
+                job_id.clone(),
+                RealCaptureJobState {
+                    job_id: job_id.clone(),
+                    capture_id: capture_id.clone(),
+                    status: CaptureJobStatus::Running,
+                    public: None,
+                },
+            );
+            (session, job_id, capture_id)
+        };
+
+        let capture_result = self
+            .worker
+            .capture(session.lease.clone(), resolved.spec.clone())
+            .map_err(BackendError::from)
+            .and_then(|outcome| {
+                let public =
+                    self.persist_real_capture(&session, &job_id, &capture_id, &resolved, &outcome)?;
+                Ok((outcome, public))
+            });
+
+        let completed = match capture_result {
+            Ok((outcome, public)) => Some((outcome, public)),
+            Err(_) => None,
+        };
+        let terminal_status = if completed.is_some() {
+            CaptureJobStatus::Completed
+        } else {
+            CaptureJobStatus::Failed
+        };
+
+        let job = {
+            let mut inner = self.inner.lock().expect("real backend mutex poisoned");
+            if let Some(active) = inner
+                .active
+                .as_mut()
+                .filter(|active| active.session_id == session.session_id)
+            {
+                if active.active_capture_job_id.as_deref() == Some(&job_id) {
+                    active.active_capture_job_id = None;
+                }
+                if let Some((outcome, _public)) = &completed {
+                    active.current_frame = u64::from(outcome.frame_counter);
+                    active.current_icount = outcome.icount;
+                    active.frame_base_known = true;
+                    active.preview_stale = active.last_preview_frame < active.current_frame;
+                }
+            }
+            let job = inner
+                .capture_jobs
+                .get_mut(&job_id)
+                .ok_or(BackendError::BackendUnavailable)?;
+            job.status = terminal_status;
+            job.public = completed.map(|(_outcome, public)| public);
+            job.capture_job()
+        };
+
+        let event = if terminal_status == CaptureJobStatus::Completed {
+            ("capture_completed", "real backend capture completed")
+        } else {
+            ("capture_failed", "real backend capture failed")
+        };
+        let _ = self.append_real_event(&session.run_id, event.0, event.1);
+        Ok(job)
     }
 
-    fn capture_job(&self, _job_id: CaptureJobId) -> BackendResult<CaptureJob> {
-        Err(BackendError::BackendUnavailable)
+    fn capture_job(&self, job_id: CaptureJobId) -> BackendResult<CaptureJob> {
+        let inner = self.inner.lock().expect("real backend mutex poisoned");
+        inner
+            .capture_jobs
+            .get(&job_id)
+            .map(RealCaptureJobState::capture_job)
+            .ok_or(BackendError::BackendUnavailable)
     }
 }
 
@@ -1392,7 +1630,31 @@ struct RealBackendInner {
     active: Option<RealSession>,
     next_sequence: u64,
     next_event_seq: u64,
+    capture_jobs: BTreeMap<CaptureJobId, RealCaptureJobState>,
+    capture_idempotency: BTreeMap<(SessionId, String), CaptureJobId>,
     starting: bool,
+}
+
+#[derive(Debug, Clone)]
+struct RealCaptureJobState {
+    job_id: CaptureJobId,
+    capture_id: String,
+    status: CaptureJobStatus,
+    public: Option<RealCapturePublicProjection>,
+}
+
+impl RealCaptureJobState {
+    fn capture_job(&self) -> CaptureJob {
+        CaptureJob {
+            job_id: self.job_id.clone(),
+            status: self.status,
+            capture_id: (self.status == CaptureJobStatus::Completed)
+                .then(|| self.capture_id.clone()),
+            public: (self.status == CaptureJobStatus::Completed)
+                .then(|| self.public.clone())
+                .flatten(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1408,6 +1670,7 @@ struct RealSession {
     last_applied_input_frame: FrameCounter,
     frame_base_known: bool,
     input_in_flight: bool,
+    active_capture_job_id: Option<CaptureJobId>,
     applied_inputs: Vec<AppliedInputFrame>,
     capabilities: BackendCapabilities,
 }
@@ -1434,7 +1697,7 @@ impl RealSession {
             last_applied_input_frame: self.last_applied_input_frame,
             last_preview_frame: self.last_preview_frame,
             preview_stale: self.preview_stale,
-            active_capture_job_id: None,
+            active_capture_job_id: self.active_capture_job_id.clone(),
         }
     }
 
@@ -1544,6 +1807,23 @@ impl RealWorkerThread {
         rx.recv()
             .map_err(|_| RealWorkerFailure::BackendUnavailable)?
     }
+
+    fn capture(
+        &self,
+        lease: dh::Lease,
+        capture_spec: dh::CaptureSpec,
+    ) -> RealWorkerResult<RealCaptureOutcome> {
+        let (reply, rx) = mpsc::channel();
+        self.tx
+            .send(RealWorkerCommand::Capture {
+                lease,
+                capture_spec,
+                reply,
+            })
+            .map_err(|_| RealWorkerFailure::BackendUnavailable)?;
+        rx.recv()
+            .map_err(|_| RealWorkerFailure::BackendUnavailable)?
+    }
 }
 
 type RealWorkerResult<T> = Result<T, RealWorkerFailure>;
@@ -1583,6 +1863,11 @@ enum RealWorkerCommand {
         target_frame: u32,
         pad_word: PadWord,
         reply: mpsc::Sender<RealWorkerResult<RealInjectInputOutcome>>,
+    },
+    Capture {
+        lease: dh::Lease,
+        capture_spec: dh::CaptureSpec,
+        reply: mpsc::Sender<RealWorkerResult<RealCaptureOutcome>>,
     },
 }
 
@@ -1649,6 +1934,20 @@ struct RealFrameCounterOutcome {
 
 struct RealInjectInputOutcome {
     scheduled: u32,
+}
+
+struct RealCaptureOutcome {
+    snapshot_hash: Option<Vec<u8>>,
+    input_log_id: Vec<u8>,
+    state_hash: Option<Vec<u8>>,
+    machine_config_hash: Vec<u8>,
+    determinism_class: Option<dh::DeterminismClass>,
+    feature_bytes: Vec<u8>,
+    fb_lz4: Vec<u8>,
+    fb_info: dh::FbInfo,
+    frame_counter: u32,
+    icount: u64,
+    vns: u64,
 }
 
 #[derive(Default)]
@@ -1718,6 +2017,13 @@ fn run_real_worker_thread(
                 let _ =
                     reply.send(runtime.block_on(state.inject_input(lease, target_frame, pad_word)));
             }
+            RealWorkerCommand::Capture {
+                lease,
+                capture_spec,
+                reply,
+            } => {
+                let _ = reply.send(runtime.block_on(state.capture(lease, capture_spec)));
+            }
         }
     }
 }
@@ -1746,6 +2052,9 @@ fn reply_unavailable(command: RealWorkerCommand) {
             let _ = reply.send(Err(RealWorkerFailure::BackendUnavailable));
         }
         RealWorkerCommand::InjectInput { reply, .. } => {
+            let _ = reply.send(Err(RealWorkerFailure::BackendUnavailable));
+        }
+        RealWorkerCommand::Capture { reply, .. } => {
             let _ = reply.send(Err(RealWorkerFailure::BackendUnavailable));
         }
     }
@@ -1969,6 +2278,43 @@ impl RealWorkerState {
             scheduled: response.scheduled,
         })
     }
+
+    async fn capture(
+        &mut self,
+        lease: dh::Lease,
+        capture_spec: dh::CaptureSpec,
+    ) -> RealWorkerResult<RealCaptureOutcome> {
+        let response = self
+            .client()
+            .await?
+            .take_snapshot(dh::TakeSnapshotRequest {
+                lease: Some(lease),
+                seal_input_log: Some(true),
+                capture: Some(capture_spec),
+            })
+            .await
+            .map_err(|_| RealWorkerFailure::BackendUnavailable)?
+            .into_inner();
+        let fb_info = response
+            .fb_info
+            .ok_or(RealWorkerFailure::BackendUnavailable)?;
+        if response.feature_bytes.is_empty() || response.fb_lz4.is_empty() {
+            return Err(RealWorkerFailure::BackendUnavailable);
+        }
+        Ok(RealCaptureOutcome {
+            snapshot_hash: response.snapshot.map(|snapshot| snapshot.hash),
+            input_log_id: response.input_log_id,
+            state_hash: response.state_hash.map(|state_hash| state_hash.hash),
+            machine_config_hash: response.machine_config_hash,
+            determinism_class: response.determinism_class,
+            feature_bytes: response.feature_bytes,
+            fb_lz4: response.fb_lz4,
+            fb_info,
+            frame_counter: response.frame_counter,
+            icount: response.icount,
+            vns: response.vns,
+        })
+    }
 }
 
 async fn connect_real_worker(
@@ -2055,6 +2401,89 @@ fn input_worker_failure_from_status(status: tonic::Status) -> RealWorkerFailure 
         Code::InvalidArgument => RealWorkerFailure::FrameStale,
         Code::FailedPrecondition => RealWorkerFailure::FailedPrecondition,
         _ => RealWorkerFailure::BackendUnavailable,
+    }
+}
+
+fn framebuffer_pixel_format_name(format: i32) -> BackendResult<&'static str> {
+    match dh::PixelFormat::try_from(format).map_err(|_| BackendError::BackendUnavailable)? {
+        dh::PixelFormat::Xrgb8888 => Ok("xrgb8888"),
+        dh::PixelFormat::PfUnspecified | dh::PixelFormat::Rgb565 => {
+            Err(BackendError::BackendUnavailable)
+        }
+    }
+}
+
+fn validate_framebuffer_geometry(fb_info: &dh::FbInfo, uncompressed_len: u64) -> BackendResult<()> {
+    let bytes_per_pixel = match dh::PixelFormat::try_from(fb_info.format)
+        .map_err(|_| BackendError::BackendUnavailable)?
+    {
+        dh::PixelFormat::Xrgb8888 => 4u64,
+        dh::PixelFormat::PfUnspecified | dh::PixelFormat::Rgb565 => {
+            return Err(BackendError::BackendUnavailable);
+        }
+    };
+    let row_width = u64::from(fb_info.width)
+        .checked_mul(bytes_per_pixel)
+        .ok_or(BackendError::BackendUnavailable)?;
+    let stride = u64::from(fb_info.stride);
+    let expected_len = stride
+        .checked_mul(u64::from(fb_info.height))
+        .ok_or(BackendError::BackendUnavailable)?;
+    if fb_info.width == 0
+        || fb_info.height == 0
+        || fb_info.stride == 0
+        || stride < row_width
+        || expected_len != uncompressed_len
+    {
+        return Err(BackendError::BackendUnavailable);
+    }
+    Ok(())
+}
+
+fn capture_lifecycle_refs(outcome: &RealCaptureOutcome) -> CaptureLifecycleRefs {
+    CaptureLifecycleRefs {
+        snapshot_ref: outcome.snapshot_hash.as_deref().map(hex_ref),
+        input_log_id: nonempty_hex_ref(&outcome.input_log_id),
+        state_hash: outcome.state_hash.as_deref().map(hex_ref),
+        machine_config_hash: nonempty_hex_ref(&outcome.machine_config_hash),
+        determinism_class: outcome.determinism_class.as_ref().map(|class| {
+            CaptureDeterminismClass {
+                cpu_model: class.cpu_model.clone(),
+                microcode: class.microcode.clone(),
+                host_kernel: class.host_kernel.clone(),
+                vmm_version: class.vmm_version.clone(),
+            }
+        }),
+    }
+}
+
+fn public_capture_spec_hash(capture_spec_hash: &str) -> String {
+    if capture_spec_hash.starts_with("blake3:") {
+        capture_spec_hash.to_string()
+    } else {
+        "private-capture-spec".to_string()
+    }
+}
+
+fn nonempty_hex_ref(bytes: &[u8]) -> Option<String> {
+    (!bytes.is_empty()).then(|| hex_ref(bytes))
+}
+
+fn hex_ref(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity("blake3:".len() + bytes.len() * 2);
+    output.push_str("blake3:");
+    for byte in bytes {
+        output.push(hex_char_private(byte >> 4));
+        output.push(hex_char_private(byte & 0x0f));
+    }
+    output
+}
+
+fn hex_char_private(nibble: u8) -> char {
+    match nibble {
+        0..=9 => (b'0' + nibble) as char,
+        10..=15 => (b'a' + (nibble - 10)) as char,
+        _ => '0',
     }
 }
 
@@ -2262,6 +2691,14 @@ fn real_session_id(sequence: u64) -> String {
 
 fn real_run_id(sequence: u64) -> String {
     format!("real-run-{sequence:04}")
+}
+
+fn real_capture_ids(session_id: &str, idempotency_key: &str) -> (String, String) {
+    let key = idempotency_key.replace('-', "");
+    (
+        format!("real-capture-job-{session_id}-{key}"),
+        format!("real-capture-{session_id}-{key}"),
+    )
 }
 
 #[derive(Debug, Default)]

@@ -620,6 +620,7 @@ impl BridgeBackend for EventBackend {
             job_id: CAPTURE_JOB_ID.to_string(),
             status: CaptureJobStatus::Running,
             capture_id: None,
+            public: None,
         })
     }
 
@@ -628,6 +629,7 @@ impl BridgeBackend for EventBackend {
             job_id,
             status: CaptureJobStatus::Running,
             capture_id: None,
+            public: None,
         })
     }
 }

@@ -81,7 +81,7 @@ ROM_OPERATOR_BRIDGE_PRIVATE_ROOT=<private bridge root>
 ROM_OPERATOR_BRIDGE_OPERATOR_CREDENTIAL=<private operator credential>
 ROM_OPERATOR_BRIDGE_SESSION_SECRET=<private session secret>
 
-BRIDGE_HYPERVISOR_ENDPOINT=unix:///run/dh/grpc.sock
+BRIDGE_HYPERVISOR_ENDPOINT=<hypervisor endpoint, for example unix:///run/dh/grpc.sock on the expected host>
 BRIDGE_WORKLOAD_IMAGE_REF=<private workload image ref>
 BRIDGE_CAPTURE_SPEC_REF=<private capture spec ref>
 BRIDGE_REFERENCE_WORKLOAD_CHECKOUT=<reference workload checkout path>

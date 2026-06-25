@@ -629,7 +629,7 @@ fn committed_files_do_not_include_private_config_or_values() {
             ] {
                 if let Some(value) = assignment_value(line, secret_env) {
                     assert!(
-                        value.starts_with('<'),
+                        value.starts_with('<') || value.contains('$'),
                         "committed file contains a concrete private config assignment: {path}"
                     );
                 }
@@ -660,6 +660,20 @@ fn committed_scan_detects_assignment_variants() {
             ENV_OPERATOR_CREDENTIAL,
         ),
         Some("<operator-credential-from-secret-source>".to_string())
+    );
+    assert_eq!(
+        assignment_value(
+            "BRIDGE_CAPTURE_SPEC_REF='$BRIDGE_CAPTURE_SPEC_REF'",
+            ENV_CAPTURE_SPEC_REF
+        ),
+        Some("$BRIDGE_CAPTURE_SPEC_REF".to_string())
+    );
+    assert_eq!(
+        assignment_value(
+            "BRIDGE_HYPERVISOR_ENDPOINT=\"unix://$O73_WORKER_UDS\"",
+            ENV_HYPERVISOR_ENDPOINT,
+        ),
+        Some("unix://$O73_WORKER_UDS".to_string())
     );
 }
 

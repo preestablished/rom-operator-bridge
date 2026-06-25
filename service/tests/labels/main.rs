@@ -947,6 +947,7 @@ impl BridgeBackend for LabelBackend {
             job_id: "backend-label-capture-job".to_string(),
             status: CaptureJobStatus::Running,
             capture_id: None,
+            public: None,
         })
     }
 
@@ -955,6 +956,7 @@ impl BridgeBackend for LabelBackend {
             job_id,
             status: CaptureJobStatus::Running,
             capture_id: None,
+            public: None,
         })
     }
 }

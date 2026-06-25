@@ -426,6 +426,18 @@ impl RealRuntimeConfig {
         &self.hypervisor_endpoint
     }
 
+    pub fn workload_image_ref(&self) -> &str {
+        self.workload_image_ref.as_str()
+    }
+
+    pub fn capture_spec_ref(&self) -> &str {
+        self.capture_spec_ref.as_str()
+    }
+
+    pub fn reference_workload_checkout(&self) -> &Path {
+        &self.reference_workload_checkout
+    }
+
     pub fn start_source(&self) -> &RealStartSource {
         &self.start_source
     }

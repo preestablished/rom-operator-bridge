@@ -992,6 +992,7 @@ impl BridgeBackend for RecordingBackend {
             job_id: "synthetic-capture-job-scaffold".to_string(),
             status: rom_operator_bridge_service::backend::CaptureJobStatus::Pending,
             capture_id: None,
+            public: None,
         })
     }
 
@@ -1000,6 +1001,7 @@ impl BridgeBackend for RecordingBackend {
             job_id,
             status: rom_operator_bridge_service::backend::CaptureJobStatus::Pending,
             capture_id: None,
+            public: None,
         })
     }
 }

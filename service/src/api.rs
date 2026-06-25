@@ -7,8 +7,8 @@ use crate::{
         validate_origin, validate_runtime_request,
     },
     backend::{
-        BackendCapabilities, BackendError, BackendMode, BridgeBackend, FramePreview, RealBackend,
-        StopReason, SyntheticBackend,
+        BackendCapabilities, BackendError, BackendMode, BridgeBackend, CaptureJob,
+        CaptureJobStatus, FramePreview, RealBackend, StopReason, SyntheticBackend,
     },
     config::ServiceConfig,
     input::{PAD_LAYOUT_ID, PAD_LAYOUT_VERSION},
@@ -285,6 +285,7 @@ impl CaptureState {
         let mut job = CaptureJobRecord {
             job_id: job_id.clone(),
             session_id: input.session_id.clone(),
+            source: CaptureSource::Synthetic,
             status: CaptureStatus::Requested,
             requested_frame: input.observed_preview_frame,
             scheduled_frame,
@@ -296,6 +297,7 @@ impl CaptureState {
             preview_png: input.preview_png,
             durable: false,
             features: None,
+            sanitized_provenance: synthetic_provenance(),
         };
 
         if input.observed_preview_frame < input.current_frame {
@@ -345,6 +347,139 @@ impl CaptureState {
                 Ok(job.view())
             }
         }
+    }
+
+    fn real_job_context(&self, job_id: &str) -> Result<(String, u64, u64), BackendError> {
+        let inner = self.inner.lock().expect("capture mutex poisoned");
+        let job = inner
+            .jobs
+            .get(job_id)
+            .ok_or(BackendError::BackendUnavailable)?;
+        Ok((
+            job.session_id.clone(),
+            job.requested_frame,
+            job.scheduled_frame,
+        ))
+    }
+
+    fn upsert_real_job(
+        &self,
+        config: &ServiceConfig,
+        session_id: &str,
+        backend_job: CaptureJob,
+        requested_frame: u64,
+        scheduled_frame: u64,
+    ) -> Result<CaptureJobView, BackendError> {
+        let status = capture_status_from_backend(backend_job.status);
+        let capture_id = backend_job.capture_id.clone();
+        let public = backend_job.public.clone();
+        let labelable =
+            status == CaptureStatus::Completed && capture_id.is_some() && public.is_some();
+        let recent = if labelable {
+            let capture_id = capture_id
+                .as_ref()
+                .ok_or(BackendError::BackendUnavailable)?
+                .clone();
+            let inner = self.inner.lock().expect("capture mutex poisoned");
+            let mut captures = Vec::with_capacity(inner.capture_order.len() + 1);
+            if !inner.captures.contains_key(&capture_id) {
+                captures.push(PrivateCaptureSummary::new(
+                    capture_id.clone(),
+                    "1970-01-01T00:00:00Z",
+                    status.as_str(),
+                    true,
+                ));
+            }
+            captures.extend(
+                inner
+                    .capture_order
+                    .iter()
+                    .filter_map(|existing_capture_id| {
+                        let record = inner.captures.get(existing_capture_id)?;
+                        let job = inner.jobs.get(&record.job_id)?;
+                        Some(PrivateCaptureSummary::new(
+                            existing_capture_id.clone(),
+                            "1970-01-01T00:00:00Z",
+                            job.status.as_str(),
+                            job.labelable,
+                        ))
+                    }),
+            );
+            Some(RecentCapturesFile::new(captures))
+        } else {
+            None
+        };
+
+        if let Some(recent) = &recent
+            && !config.private_config().is_placeholder()
+        {
+            PrivateArtifactStore::new(config.private_config())
+                .write_recent_captures(recent)
+                .map_err(|_| BackendError::BackendUnavailable)?;
+        }
+
+        let mut inner = self.inner.lock().expect("capture mutex poisoned");
+        let record = inner
+            .jobs
+            .entry(backend_job.job_id.clone())
+            .or_insert_with(|| CaptureJobRecord {
+                job_id: backend_job.job_id.clone(),
+                session_id: session_id.to_string(),
+                source: CaptureSource::Real,
+                status,
+                requested_frame,
+                scheduled_frame,
+                captured_frame: None,
+                capture_id: None,
+                labelable: false,
+                has_preview: false,
+                error: None,
+                preview_png: Vec::new(),
+                durable: false,
+                features: None,
+                sanitized_provenance: real_provenance(),
+            });
+        record.status = status;
+        record.capture_id = capture_id.clone();
+        record.captured_frame = public
+            .as_ref()
+            .filter(|_| status == CaptureStatus::Completed)
+            .map(|public| public.frame_counter);
+        record.labelable = labelable;
+        record.has_preview = public.as_ref().is_some_and(|public| public.has_preview);
+        record.durable = labelable;
+        record.features = public
+            .as_ref()
+            .filter(|public| public.features_available)
+            .map(|_| Vec::new());
+        if let Some(public) = &public {
+            record.sanitized_provenance = SanitizedProvenance {
+                capture_source: public.capture_source.clone(),
+                layout_hash: public.layout_hash.clone(),
+                capture_spec_hash: public.capture_spec_hash.clone(),
+                map_hash: public.map_hash.clone(),
+            };
+        }
+        record.error = (status == CaptureStatus::Failed).then(|| ErrorObject {
+            code: ErrorCode::CaptureFailed,
+            message: "Capture failed.".to_string(),
+            retryable: true,
+            details: json!({}),
+        });
+        let view = record.view();
+        if labelable {
+            let capture_id = capture_id.expect("labelable capture has capture id");
+            if !inner.captures.contains_key(&capture_id) {
+                inner.capture_order.push_front(capture_id.clone());
+                inner.captures.insert(
+                    capture_id,
+                    CaptureRecord {
+                        job_id: backend_job.job_id,
+                    },
+                );
+            }
+        }
+        Ok(view)
     }
 
     fn complete_capturing_job(
@@ -481,6 +616,9 @@ impl CaptureState {
         let inner = self.inner.lock().expect("capture mutex poisoned");
         let record = inner.captures.get(capture_id)?;
         let job = inner.jobs.get(&record.job_id)?;
+        if !job.has_preview || job.source == CaptureSource::Real {
+            return None;
+        }
         Some(job.preview_png.clone())
     }
 }
@@ -499,6 +637,7 @@ struct CaptureInner {
 struct CaptureJobRecord {
     job_id: String,
     session_id: String,
+    source: CaptureSource,
     status: CaptureStatus,
     requested_frame: u64,
     scheduled_frame: u64,
@@ -510,6 +649,7 @@ struct CaptureJobRecord {
     preview_png: Vec<u8>,
     durable: bool,
     features: Option<Vec<CaptureFeatureValue>>,
+    sanitized_provenance: SanitizedProvenance,
 }
 
 impl CaptureJobRecord {
@@ -550,14 +690,15 @@ impl CaptureJobRecord {
             preview_image_url: format!("/api/capture/{capture_id}/preview"),
             privileged_features_available: self.features.is_some(),
             labels: Vec::new(),
-            sanitized_provenance: SanitizedProvenance {
-                capture_source: "synthetic",
-                layout_hash: "sha256:synthetic-layout-v1",
-                capture_spec_hash: "sha256:synthetic-capture-v1",
-                map_hash: "sha256:synthetic-map-v1",
-            },
+            sanitized_provenance: self.sanitized_provenance.clone(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureSource {
+    Synthetic,
+    Real,
 }
 
 #[derive(Debug, Clone)]
@@ -656,6 +797,15 @@ impl CaptureStatus {
     }
 }
 
+fn capture_status_from_backend(status: CaptureJobStatus) -> CaptureStatus {
+    match status {
+        CaptureJobStatus::Pending => CaptureStatus::Requested,
+        CaptureJobStatus::Running => CaptureStatus::Capturing,
+        CaptureJobStatus::Completed => CaptureStatus::Completed,
+        CaptureJobStatus::Failed => CaptureStatus::Failed,
+    }
+}
+
 fn synthetic_capture_features(
     capture_id: &str,
     scheduled_frame: u64,
@@ -682,6 +832,24 @@ fn synthetic_capture_features(
             value: ((scheduled_frame / 2) % 4) as f64,
         },
     ])
+}
+
+fn synthetic_provenance() -> SanitizedProvenance {
+    SanitizedProvenance {
+        capture_source: "synthetic".to_string(),
+        layout_hash: "sha256:synthetic-layout-v1".to_string(),
+        capture_spec_hash: "sha256:synthetic-capture-v1".to_string(),
+        map_hash: "sha256:synthetic-map-v1".to_string(),
+    }
+}
+
+fn real_provenance() -> SanitizedProvenance {
+    SanitizedProvenance {
+        capture_source: "hypervisor".to_string(),
+        layout_hash: "private-layout-hash".to_string(),
+        capture_spec_hash: "private-capture-spec".to_string(),
+        map_hash: "private-feature-map".to_string(),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1146,6 +1314,38 @@ async fn capture_trigger(
     if status.current_frame > JSON_SAFE_U64_MAX {
         return bad_request("Preview frame unavailable.").into_response();
     }
+    if state.backend.mode() == BackendMode::Real {
+        if !status.capabilities.capture {
+            return backend_error(BackendError::BackendUnavailable).into_response();
+        }
+        if request.observed_preview_frame > status.current_frame {
+            return bad_request("Preview frame unavailable.").into_response();
+        }
+        let backend_job = match state
+            .backend
+            .trigger_capture(crate::backend::CaptureRequest {
+                session_id: request.session_id.clone(),
+                idempotency_key: request.idempotency_key,
+            }) {
+            Ok(job) => job,
+            Err(error) => return backend_error(error).into_response(),
+        };
+        let view = match state.captures.upsert_real_job(
+            &state.config,
+            &request.session_id,
+            backend_job,
+            request.observed_preview_frame,
+            status.current_frame,
+        ) {
+            Ok(view) => view,
+            Err(error) => return backend_error(error).into_response(),
+        };
+        publish_capture_event(&state, &request.session_id, &view);
+
+        let mut response = Json(CaptureTriggerResponse::from(view)).into_response();
+        apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
+        return response;
+    }
 
     let preview_png = if request.observed_preview_frame < status.current_frame {
         Vec::new()
@@ -1214,9 +1414,31 @@ async fn capture_job_status(
     if !is_contract_id(&job_id) {
         return bad_request("Invalid capture job.").into_response();
     }
-    let view = match state.captures.job(&state.config, &job_id) {
-        Ok(view) => view,
-        Err(error) => return backend_error(error).into_response(),
+    let view = if state.backend.mode() == BackendMode::Real {
+        let (session_id, requested_frame, scheduled_frame) =
+            match state.captures.real_job_context(&job_id) {
+                Ok(context) => context,
+                Err(error) => return backend_error(error).into_response(),
+            };
+        let backend_job = match state.backend.capture_job(job_id) {
+            Ok(job) => job,
+            Err(error) => return backend_error(error).into_response(),
+        };
+        match state.captures.upsert_real_job(
+            &state.config,
+            &session_id,
+            backend_job,
+            requested_frame,
+            scheduled_frame,
+        ) {
+            Ok(view) => view,
+            Err(error) => return backend_error(error).into_response(),
+        }
+    } else {
+        match state.captures.job(&state.config, &job_id) {
+            Ok(view) => view,
+            Err(error) => return backend_error(error).into_response(),
+        }
     };
     publish_capture_event(&state, &view.session_id, &view);
 
@@ -2242,10 +2464,10 @@ impl From<CaptureFeatureValue> for CaptureFeatureResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SanitizedProvenance {
-    pub capture_source: &'static str,
-    pub layout_hash: &'static str,
-    pub capture_spec_hash: &'static str,
-    pub map_hash: &'static str,
+    pub capture_source: String,
+    pub layout_hash: String,
+    pub capture_spec_hash: String,
+    pub map_hash: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -2462,13 +2684,21 @@ fn bad_request(message: &'static str) -> AppError {
     )
 }
 
-fn backend_error(_error: crate::backend::BackendError) -> AppError {
-    AppError::new(
-        StatusCode::SERVICE_UNAVAILABLE,
-        ErrorCode::BackendUnavailable,
-        "Backend unavailable.",
-        true,
-    )
+fn backend_error(error: crate::backend::BackendError) -> AppError {
+    match error {
+        crate::backend::BackendError::CaptureInProgress => AppError::new(
+            StatusCode::CONFLICT,
+            ErrorCode::CaptureInProgress,
+            "Capture already in progress.",
+            false,
+        ),
+        _ => AppError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::BackendUnavailable,
+            "Backend unavailable.",
+            true,
+        ),
+    }
 }
 
 fn sha256_ref(bytes: &[u8]) -> String {
