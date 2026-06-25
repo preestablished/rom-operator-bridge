@@ -3,33 +3,42 @@
 ## 1. Confirm Snapstore Manifest Availability
 
 If the handoff generator left snapstore running, `SNAPSTORE_GRPC_UDS_PATH` may
-already be a live socket. First try the manifest lookup privately:
+already be a live socket. First check whether the socket exists:
 
 ```bash
 cd /home/infra-admin/git/preestablished/snapshot-store
-if cargo run -p snapstore-cli --bin snapstorectl -- \
+if [ -S "$SNAPSTORE_GRPC_UDS_PATH" ]; then
+  timeout 30s cargo run -p snapstore-cli --bin snapstorectl -- \
     --endpoint "uds:$SNAPSTORE_GRPC_UDS_PATH" \
     dump-manifest "$BRIDGE_REAL_SNAPSHOT_REF" \
     > "$O73_PRIVATE_ROOT/evidence/snapstore-dump-manifest.private.txt" \
     2> "$O73_PRIVATE_ROOT/evidence/snapstore-dump-manifest.private.err"
-then
-  echo 'snapstore manifest lookup: pass'
+  snapstore_lookup_status=$?
 else
-  echo 'snapstore manifest lookup failed; starting snapstore from private config' >&2
+  snapstore_lookup_status=127
 fi
 ```
 
-If the lookup failed because the server is not running, start snapstore using
-the generated config:
+If the socket exists but manifest lookup fails, do not start a competing
+snapstore. Treat it as a sanitized blocker: either the live service is wrong,
+the snapshot is absent/corrupt, or the endpoint is stale and needs operator
+cleanup.
 
 ```bash
-if [ ! -S "$SNAPSTORE_GRPC_UDS_PATH" ] || \
-   ! cargo run -p snapstore-cli --bin snapstorectl -- \
-      --endpoint "uds:$SNAPSTORE_GRPC_UDS_PATH" \
-      dump-manifest "$BRIDGE_REAL_SNAPSHOT_REF" \
-      > /dev/null 2>&1
-then
-  nohup setsid cargo run -p snapstore-server --bin snapstore-server -- \
+if [ "$snapstore_lookup_status" -eq 0 ]; then
+  echo 'snapstore manifest lookup: pass'
+elif [ "$snapstore_lookup_status" -ne 127 ]; then
+  echo 'snapstore socket exists but manifest lookup failed; inspect private stderr and do not start a competing snapstore' >&2
+  exit 1
+else
+  nohup setsid env \
+    -u BRIDGE_REAL_SNAPSHOT_REF \
+    -u BRIDGE_WORKLOAD_IMAGE_REF \
+    -u BRIDGE_CAPTURE_SPEC_REF \
+    -u BRIDGE_HYPERVISOR_ENDPOINT \
+    -u O73_OPERATOR_CREDENTIAL \
+    -u O73_SESSION_SECRET \
+    cargo run -p snapstore-server --bin snapstore-server -- \
     --config "$SNAPSTORE_CONFIG_PATH" \
     > "$O73_PRIVATE_ROOT/evidence/snapstore-server.private.log" 2>&1 &
   echo $! > "$O73_PRIVATE_ROOT/runtime/snapstore-server.pid"
@@ -53,7 +62,7 @@ test -S "$SNAPSTORE_GRPC_UDS_PATH"
 Run the manifest lookup again. It must pass before continuing:
 
 ```bash
-cargo run -p snapstore-cli --bin snapstorectl -- \
+timeout 30s cargo run -p snapstore-cli --bin snapstorectl -- \
   --endpoint "uds:$SNAPSTORE_GRPC_UDS_PATH" \
   dump-manifest "$BRIDGE_REAL_SNAPSHOT_REF" \
   > "$O73_PRIVATE_ROOT/evidence/snapstore-dump-manifest.private.txt" \
@@ -63,19 +72,19 @@ cargo run -p snapstore-cli --bin snapstorectl -- \
 ## 2. Decide Worker Endpoint
 
 The handoff env supplies `BRIDGE_HYPERVISOR_ENDPOINT`. Prefer that endpoint if
-it is available for a snapstore-enabled worker. If it points at
-`unix:///run/dh/grpc.sock` and that socket is currently owned by a
-`--no-snapstore` worker, do not kill it blindly. Choose one of:
+the operator can prove it is owned by a snapstore-enabled worker. `GetWorkerInfo`
+does not prove snapstore is enabled. For safety, default to a private alternate
+worker UDS for this acceptance run unless the operator explicitly approves the
+existing worker and proves its command line includes `--snapstore-uds` or
+`--snapstore-tcp` and does not include `--no-snapstore`.
 
-1. Get operator approval to restart that worker snapstore-enabled.
-2. Use a private alternate worker UDS and override `BRIDGE_HYPERVISOR_ENDPOINT`
-   in `$O73_BRIDGE_ENV`.
+Do not include the worker UDS path in public bead notes.
 
-For a private alternate endpoint:
+Use a private alternate endpoint:
 
 ```bash
-export O73_WORKER_UDS="$O73_PRIVATE_ROOT/runtime/dh-grpc.sock"
-export BRIDGE_HYPERVISOR_ENDPOINT="unix://$O73_WORKER_UDS"
+O73_WORKER_UDS="$O73_PRIVATE_ROOT/runtime/dh-grpc.sock"
+BRIDGE_HYPERVISOR_ENDPOINT="unix://$O73_WORKER_UDS"
 
 tmp="$O73_BRIDGE_ENV.tmp"
 awk -v endpoint="$BRIDGE_HYPERVISOR_ENDPOINT" '
@@ -97,33 +106,47 @@ chmod 0600 "$O73_BRIDGE_ENV"
 printf '%s\n' "$BRIDGE_HYPERVISOR_ENDPOINT" >> "$O73_FORBID_FILE"
 ```
 
-If using the handoff endpoint as-is:
+If the operator explicitly approves an existing worker endpoint instead, derive
+the UDS path from the approved endpoint and verify command-line ownership
+privately before continuing:
 
 ```bash
 case "$BRIDGE_HYPERVISOR_ENDPOINT" in
-  unix://*) export O73_WORKER_UDS="${BRIDGE_HYPERVISOR_ENDPOINT#unix://}" ;;
+  unix://*) O73_WORKER_UDS="${BRIDGE_HYPERVISOR_ENDPOINT#unix://}" ;;
   *) echo 'this plan expects a UDS worker endpoint for o73' >&2; exit 1 ;;
 esac
+
+# Operator-approved existing workers only:
+# privately identify the owning dh-workerd process and verify its command line
+# contains --snapstore-uds or --snapstore-tcp and does not contain --no-snapstore.
 ```
 
 ## 3. Start dh-workerd With Snapstore Enabled
 
 If a worker already responds on `$O73_WORKER_UDS`, verify it privately with
-`GetWorkerInfo`. If it was started with `--no-snapstore`, it cannot satisfy
-o73.
+process/command-line evidence, not only `GetWorkerInfo`. If it was started with
+`--no-snapstore`, it cannot satisfy o73.
 
 Start a fresh snapstore-enabled worker only when the chosen UDS is free:
 
 ```bash
 if [ -S "$O73_WORKER_UDS" ]; then
-  echo 'worker UDS already exists; verify or choose another endpoint' >&2
+  echo 'worker UDS already exists; require private operator proof of snapstore-enabled ownership or choose another endpoint' >&2
+  exit 1
 else
   cd /home/infra-admin/git/preestablished/determinism-hypervisor
   cargo run -p dh-worker --bin dh-workerd -- --preflight
 
-  nohup setsid cargo run -p dh-worker --bin dh-workerd -- serve \
-    --tcp 127.0.0.1:7400 \
-    --http 127.0.0.1:7401 \
+  nohup setsid env \
+    -u BRIDGE_REAL_SNAPSHOT_REF \
+    -u BRIDGE_WORKLOAD_IMAGE_REF \
+    -u BRIDGE_CAPTURE_SPEC_REF \
+    -u BRIDGE_HYPERVISOR_ENDPOINT \
+    -u O73_OPERATOR_CREDENTIAL \
+    -u O73_SESSION_SECRET \
+    cargo run -p dh-worker --bin dh-workerd -- serve \
+    --tcp 127.0.0.1:0 \
+    --http 127.0.0.1:0 \
     --uds "$O73_WORKER_UDS" \
     --image-cache "$DH_M9_IMAGE_CACHE" \
     --snapstore-uds "$SNAPSTORE_GRPC_UDS_PATH" \
@@ -162,6 +185,15 @@ timeout 20s grpcurl -plaintext \
   2> "$O73_PRIVATE_ROOT/evidence/worker-info-before.private.err"
 ```
 
-Privately record total/free slot counts from the response. The sanitized bead
-note should include only counts, not worker endpoint paths or raw JSON.
+Privately assert there is at least one free slot and save counts for later:
 
+```bash
+jq -e '.slotsFree >= 1' "$O73_PRIVATE_ROOT/evidence/worker-info-before.private.json" >/dev/null
+jq -r '.slotsFree' "$O73_PRIVATE_ROOT/evidence/worker-info-before.private.json" \
+  > "$O73_PRIVATE_ROOT/evidence/slots-free-before.private.txt"
+jq -r '.slotsTotal' "$O73_PRIVATE_ROOT/evidence/worker-info-before.private.json" \
+  > "$O73_PRIVATE_ROOT/evidence/slots-total-before.private.txt"
+```
+
+The sanitized bead note should include only counts, not worker endpoint paths or
+raw JSON.

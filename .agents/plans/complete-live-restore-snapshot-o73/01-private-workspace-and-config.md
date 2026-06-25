@@ -7,7 +7,7 @@ operator channel and set it only in shell state:
 
 ```bash
 set +x
-export O73_HANDOFF_ENV="<operator-private handoff env path>"
+O73_HANDOFF_ENV="<operator-private handoff env path>"
 test -f "$O73_HANDOFF_ENV"
 printf 'handoff mode: '
 stat -c '%a' "$O73_HANDOFF_ENV"
@@ -18,10 +18,12 @@ Expected mode: `600`.
 Load it into the current private shell:
 
 ```bash
-set -a
 . "$O73_HANDOFF_ENV"
-set +a
 ```
+
+The handoff values should remain shell-local. Do not use `set -a`, and do not
+export handoff values or generated credentials unless a specific command
+requires a narrow allowlist.
 
 Validate presence without printing values:
 
@@ -60,7 +62,9 @@ run.
 ```bash
 set +x
 umask 077
-export O73_PRIVATE_ROOT="$HOME/.local/state/rom-operator-bridge/o73-live-restore"
+printf 'private o73 evidence root: '
+IFS= read -rs O73_PRIVATE_ROOT
+printf '\n'
 install -d -m 0700 "$O73_PRIVATE_ROOT"
 install -d -m 0700 "$O73_PRIVATE_ROOT"/{bridge,evidence,runtime}
 install -d -m 0700 "$BRIDGE_PRIVATE_ROOT"
@@ -75,8 +79,8 @@ The bridge service needs an operator credential and session secret. These do not
 come from the hypervisor handoff. Generate fresh values for this acceptance run:
 
 ```bash
-export O73_OPERATOR_CREDENTIAL="$(openssl rand -hex 32)"
-export O73_SESSION_SECRET="$(openssl rand -hex 64)"
+O73_OPERATOR_CREDENTIAL="$(openssl rand -hex 32)"
+O73_SESSION_SECRET="$(openssl rand -hex 64)"
 test -n "$O73_OPERATOR_CREDENTIAL"
 test -n "$O73_SESSION_SECRET"
 ```
@@ -88,14 +92,14 @@ Do not print these values.
 Pick a local bind address. Use an unoccupied loopback port:
 
 ```bash
-export O73_BRIDGE_BIND_ADDR="127.0.0.1:7420"
+O73_BRIDGE_BIND_ADDR="127.0.0.1:7420"
 ```
 
 Materialize the bridge config file. The file is private and may contain quoted
 values; the service config parser accepts simple single or double quotes.
 
 ```bash
-export O73_BRIDGE_ENV="$O73_PRIVATE_ROOT/bridge/real-restore-snapshot.env"
+O73_BRIDGE_ENV="$O73_PRIVATE_ROOT/bridge/real-restore-snapshot.env"
 cat > "$O73_BRIDGE_ENV" <<EOF
 ROM_OPERATOR_BRIDGE_BACKEND=real
 ROM_OPERATOR_BRIDGE_BIND_ADDR='$O73_BRIDGE_BIND_ADDR'
@@ -135,7 +139,7 @@ chmod 0600 "$O73_PRIVATE_ROOT/evidence/start-request.private.json"
 This file drives leak sweeps. It is private and must not be printed.
 
 ```bash
-export O73_FORBID_FILE="$O73_PRIVATE_ROOT/evidence/forbidden-literals.private.txt"
+O73_FORBID_FILE="$O73_PRIVATE_ROOT/evidence/forbidden-literals.private.txt"
 : > "$O73_FORBID_FILE"
 chmod 0600 "$O73_FORBID_FILE"
 
@@ -161,4 +165,3 @@ done
 
 Later steps should append the extracted session cookie and any private worker
 error text before running sweeps.
-

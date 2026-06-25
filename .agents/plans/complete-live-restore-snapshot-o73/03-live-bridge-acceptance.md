@@ -37,11 +37,6 @@ nohup setsid env \
 echo $! > "$O73_PRIVATE_ROOT/runtime/bridge.pid"
 
 bridge_pid="$(cat "$O73_PRIVATE_ROOT/runtime/bridge.pid")"
-sleep 1
-if ! kill -0 "$bridge_pid" 2>/dev/null; then
-  echo 'bridge exited; inspect private bridge log' >&2
-  exit 1
-fi
 ```
 
 Set request helpers:
@@ -54,9 +49,19 @@ export ORIGIN="https://rombridge.birb.homes"
 Confirm health:
 
 ```bash
-curl -fsS --connect-timeout 2 --max-time 20 \
-  "$BRIDGE_URL/health" \
-  > "$O73_PRIVATE_ROOT/evidence/bridge-health.private.json"
+for _ in $(seq 1 120); do
+  if ! kill -0 "$bridge_pid" 2>/dev/null; then
+    echo 'bridge exited; inspect private bridge log' >&2
+    exit 1
+  fi
+  if curl -fsS --connect-timeout 2 --max-time 5 \
+      "$BRIDGE_URL/health" \
+      > "$O73_PRIVATE_ROOT/evidence/bridge-health.private.json"; then
+    break
+  fi
+  sleep 0.5
+done
+test -s "$O73_PRIVATE_ROOT/evidence/bridge-health.private.json"
 ```
 
 ## 3. Start A Real Session Through RestoreSnapshot
@@ -158,6 +163,16 @@ timeout 20s grpcurl -plaintext \
   2> "$O73_PRIVATE_ROOT/evidence/worker-info-active.private.err"
 ```
 
+Assert that one worker slot was consumed:
+
+```bash
+jq -r '.slotsFree' "$O73_PRIVATE_ROOT/evidence/worker-info-active.private.json" \
+  > "$O73_PRIVATE_ROOT/evidence/slots-free-active.private.txt"
+before_free="$(cat "$O73_PRIVATE_ROOT/evidence/slots-free-before.private.txt")"
+active_free="$(cat "$O73_PRIVATE_ROOT/evidence/slots-free-active.private.txt")"
+test "$active_free" -lt "$before_free"
+```
+
 ## 5. Stop The Session
 
 ```bash
@@ -202,6 +217,14 @@ timeout 20s grpcurl -plaintext \
   2> "$O73_PRIVATE_ROOT/evidence/worker-info-after-stop.private.err"
 ```
 
+Assert that slot counts returned to the pre-start value:
+
+```bash
+jq -r '.slotsFree' "$O73_PRIVATE_ROOT/evidence/worker-info-after-stop.private.json" \
+  > "$O73_PRIVATE_ROOT/evidence/slots-free-after.private.txt"
+after_free="$(cat "$O73_PRIVATE_ROOT/evidence/slots-free-after.private.txt")"
+test "$after_free" = "$before_free"
+```
+
 If the after-stop slot count does not match the before-start slot count, do not
 close `o73`; classify it as a cleanup failure.
-

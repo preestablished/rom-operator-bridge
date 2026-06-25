@@ -50,10 +50,10 @@ log excerpts.
 The executing agent should set this variable privately:
 
 ```bash
-export O73_HANDOFF_ENV="<operator-private handoff env path>"
+O73_HANDOFF_ENV="<operator-private handoff env path>"
 ```
 
-Do not print the value. Do not commit it.
+Do not print the value. Do not export or commit it.
 
 ## Plan Files
 
@@ -65,4 +65,3 @@ Do not print the value. Do not commit it.
 | `03-live-bridge-acceptance.md` | Start bridge, call start/status/stop, verify worker cleanup |
 | `04-sanitization-and-probes.md` | Forbidden sweeps, sanitized summaries, unavailable-path probe |
 | `05-tests-and-closeout.md` | Quality gates, bead update, push protocol |
-

@@ -41,7 +41,7 @@ Live RestoreSnapshot acceptance passed on 2026-06-25.
 Bridge commit: <short sha>
 Worker checkout: determinism-hypervisor <short sha>
 Snapstore checkout: snapshot-store <short sha>
-Worker transport: UDS (path private unless default /run/dh/grpc.sock was used)
+Worker transport: UDS (path private)
 Snapstore transport: UDS (path private)
 
 Results:
@@ -95,14 +95,39 @@ o73 note.
 Stop only processes started by this plan using private PID files:
 
 ```bash
+stop_plan_process_group() {
+  pid_file="$1"
+  [ -f "$pid_file" ] || return 0
+  pid="$(cat "$pid_file")"
+  case "$pid" in
+    ''|*[!0-9]*) echo 'invalid private pid file; inspect before cleanup' >&2; return 1 ;;
+  esac
+  pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')"
+  [ -n "$pgid" ] || { rm -f "$pid_file"; return 0; }
+  if [ "$pgid" != "$pid" ]; then
+    echo 'refusing process-group kill because pid is not its group leader' >&2
+    return 1
+  fi
+  args="$(ps -o args= -p "$pid" 2>/dev/null || true)"
+  case "$args" in
+    *rom-operator-bridge*|*dh-workerd*|*snapstore-server*) ;;
+    *) echo 'refusing to kill unexpected process from private pid file' >&2; return 1 ;;
+  esac
+  kill -- "-$pid" 2>/dev/null || true
+  for _ in $(seq 1 40); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.25
+  done
+  rm -f "$pid_file"
+}
+
 for pid_file in \
   "$O73_PRIVATE_ROOT/runtime/bridge.pid" \
   "$O73_PRIVATE_ROOT/runtime/backend-unavailable-bridge.pid" \
   "$O73_PRIVATE_ROOT/runtime/dh-workerd.pid" \
   "$O73_PRIVATE_ROOT/runtime/snapstore-server.pid"
 do
-  [ -f "$pid_file" ] || continue
-  kill -- "-$(cat "$pid_file")" 2>/dev/null || true
+  stop_plan_process_group "$pid_file"
 done
 ```
 
@@ -115,8 +140,12 @@ Follow the repository `AGENTS.md` close protocol. At minimum:
 
 ```bash
 git status --short
-git add .agents/plans/complete-live-restore-snapshot-o73
-git commit -m "Plan o73 live RestoreSnapshot completion"
+# Stage the actual changed files intentionally. Include code/docs/tests if the
+# acceptance run required fixes; include plan files only if they changed.
+git add <changed files>
+if ! git diff --cached --quiet; then
+  git commit -m "<specific commit message>"
+fi
 git pull --rebase
 bd dolt push
 git push
@@ -126,4 +155,3 @@ git status --short --branch
 If the executing agent made code changes, include those files in the commit and
 use a code-oriented commit message. The final status must show the branch up to
 date with origin.
-
