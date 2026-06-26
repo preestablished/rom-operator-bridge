@@ -28,6 +28,15 @@ git pull --rebase
 
 ## 1. Install The Private Env File
 
+Ensure the service account and service-accessible private root exist:
+
+```sh
+sudo useradd --system --home /var/lib/rom-operator-bridge \
+  --shell /usr/sbin/nologin rombridge || true
+sudo install -d -o rombridge -g rombridge -m 0700 \
+  /var/lib/rom-operator-bridge/private
+```
+
 Create or approve a private env source outside the repository, then install it:
 
 ```sh
@@ -42,13 +51,23 @@ The env file needs real operator-approved values for these keys:
 |---|---|
 | `ROM_OPERATOR_BRIDGE_BIND_ADDR` | `<bridge-private-ip>:7410` |
 | `ROM_OPERATOR_BRIDGE_BACKEND` | `<synthetic-or-real>` |
-| `ROM_OPERATOR_BRIDGE_PRIVATE_ROOT` | `<absolute-private-runtime-root>` |
+| `ROM_OPERATOR_BRIDGE_PRIVATE_ROOT` | `/var/lib/rom-operator-bridge/private` |
 | `ROM_OPERATOR_BRIDGE_STATIC_PUBLISH_ROOT` | `/var/lib/rom-operator-bridge/static/current` |
 | `ROM_OPERATOR_BRIDGE_OPERATOR_CREDENTIAL` | `<operator-credential>` |
 | `ROM_OPERATOR_BRIDGE_SESSION_SECRET` | `<session-secret>` |
 
 If `ROM_OPERATOR_BRIDGE_BACKEND=real`, also include the approved real backend
 handoff values documented in `docs/runbook.md` and `service/src/private_config.rs`.
+
+Avoid a private root under `/home` or `/root`: the committed systemd unit uses
+`ProtectHome=true`, so those paths are not service-accessible.
+
+Validate the env file without printing values:
+
+```sh
+sudo python3 scripts/validate-operator-env.py \
+  /etc/rom-operator-bridge/rom-operator-bridge.env
+```
 
 ## 2. Build And Install The Release
 
