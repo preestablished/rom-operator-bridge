@@ -105,45 +105,15 @@ different from the reviewed manifest.
 
 ## 3. Create A Throwaway Session Cookie
 
-Generate the session-start JSON using `node` so credentials with special
-characters remain valid JSON.
+Generate the session-start JSON and request a cookie jar for the checker:
 
 ```sh
-export START_SESSION_JSON
-node <<'NODE'
-const fs = require("fs");
-
-const payload = {
-  schema_version: 1,
-  operator_credential: process.env.ROM_OPERATOR_BRIDGE_OPERATOR_CREDENTIAL,
-  backend_mode: process.env.ROM_OPERATOR_BRIDGE_BACKEND || "real",
-  requested_capabilities: ["input", "preview", "capture"]
-};
-
-fs.writeFileSync(
-  process.env.START_SESSION_JSON,
-  `${JSON.stringify(payload, null, 2)}\n`,
-  { mode: 0o600 }
-);
-NODE
-chmod 600 "$START_SESSION_JSON"
-```
-
-Request a cookie jar for the checker:
-
-```sh
-: > "$COOKIE_JAR"
-chmod 600 "$COOKIE_JAR"
-
-curl -sS --fail \
-  --resolve "rombridge.birb.homes:443:$BRIDGE_IP" \
-  -H "Origin: https://rombridge.birb.homes" \
-  -H "Content-Type: application/json" \
-  -c "$COOKIE_JAR" \
-  -o "$SESSION_RESPONSE" \
-  --data @"$START_SESSION_JSON" \
-  https://rombridge.birb.homes/api/session/start
-chmod 600 "$COOKIE_JAR" "$SESSION_RESPONSE"
+python3 scripts/prepare-deployment-validation-inputs.py \
+  --start-session-json "$START_SESSION_JSON" \
+  --cookie-jar "$COOKIE_JAR" \
+  --session-response "$SESSION_RESPONSE" \
+  --network-evidence "$NETWORK_EVIDENCE" \
+  --bridge-ip "$BRIDGE_IP"
 ```
 
 If you already have a private curl config containing the `Cookie:` header, you
@@ -152,19 +122,7 @@ command.
 
 ## 4. Create Reviewed Private Evidence Files
 
-Create local network evidence:
-
-```sh
-{
-  date -u
-  printf '\nservice listener evidence\n'
-  ss -ltnp | awk '$4 ~ /:7410$/ {print}'
-  printf '\nk8s route objects\n'
-  KUBECONFIG=/etc/rancher/k3s/k3s.yaml \
-    kubectl get ingress,svc,endpoints -n rom-operator-bridge -o wide
-} > "$NETWORK_EVIDENCE"
-chmod 600 "$NETWORK_EVIDENCE"
-```
+The previous helper also creates local network evidence.
 
 Review this file before setting `ROM_BRIDGE_NETWORK_EVIDENCE_REVIEWED=1`. It
 must prove the service is not exposed on a wildcard listener such as `0.0.0.0`,
