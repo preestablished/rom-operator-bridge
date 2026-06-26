@@ -9,9 +9,9 @@ logs, probe output, private paths, or private evidence contents.
 
 Do not run step 5 until these host prerequisites pass:
 
-- the static publish root exists at
-  `/var/lib/rom-operator-bridge/static/current`;
-- `/var/lib/rom-operator-bridge/static/current/index.html` exists;
+- `ROM_OPERATOR_BRIDGE_STATIC_PUBLISH_ROOT` points at the real static release
+  directory, not the `static/current` symlink;
+- `$ROM_OPERATOR_BRIDGE_STATIC_PUBLISH_ROOT/index.html` exists;
 - `rom-operator-bridge.service` is active, not restart-looping;
 - the private endpoint manifest has been applied;
 - K3s has the `rom-operator-bridge` Service, Endpoints, and Ingress objects.
@@ -52,7 +52,7 @@ The env file needs real operator-approved values for these keys:
 | `ROM_OPERATOR_BRIDGE_BIND_ADDR` | `<bridge-private-ip>:7410` |
 | `ROM_OPERATOR_BRIDGE_BACKEND` | `<synthetic-or-real>` |
 | `ROM_OPERATOR_BRIDGE_PRIVATE_ROOT` | `/var/lib/rom-operator-bridge/private` |
-| `ROM_OPERATOR_BRIDGE_STATIC_PUBLISH_ROOT` | `/var/lib/rom-operator-bridge/static/current` |
+| `ROM_OPERATOR_BRIDGE_STATIC_PUBLISH_ROOT` | `<absolute-static-release-dir>` |
 | `ROM_OPERATOR_BRIDGE_OPERATOR_CREDENTIAL` | `<operator-credential>` |
 | `ROM_OPERATOR_BRIDGE_SESSION_SECRET` | `<session-secret>` |
 
@@ -103,6 +103,7 @@ sudo install -m 0755 service/target/release/rom-operator-bridge-service \
 
 sudo install -d -m 0755 /var/lib/rom-operator-bridge/static/releases/"$release_id"
 sudo cp -rf ui/dist/. /var/lib/rom-operator-bridge/static/releases/"$release_id"/
+static_release="/var/lib/rom-operator-bridge/static/releases/$release_id"
 
 if [ -n "$old_service_release" ]; then
   sudo ln -sfn "$old_service_release" /opt/rom-operator-bridge/previous
@@ -115,6 +116,40 @@ sudo ln -sfn /opt/rom-operator-bridge/releases/"$release_id" \
   /opt/rom-operator-bridge/current
 sudo ln -sfn /var/lib/rom-operator-bridge/static/releases/"$release_id" \
   /var/lib/rom-operator-bridge/static/current
+```
+
+Update the env file to point at the real static release directory. Do not point
+`ROM_OPERATOR_BRIDGE_STATIC_PUBLISH_ROOT` at the `static/current` symlink; the
+service rejects symlink components in private/static config paths.
+
+```sh
+sudo python3 - "$static_release" <<'PY'
+from pathlib import Path
+import os
+import sys
+
+path = Path("/etc/rom-operator-bridge/rom-operator-bridge.env")
+key = "ROM_OPERATOR_BRIDGE_STATIC_PUBLISH_ROOT"
+value = sys.argv[1]
+lines = path.read_text().splitlines()
+out = []
+seen = False
+for line in lines:
+    stripped = line.strip()
+    name = stripped.removeprefix("export ").split("=", 1)[0].strip() if "=" in stripped else None
+    if name == key:
+        out.append(f"{key}={value}")
+        seen = True
+    else:
+        out.append(line)
+if not seen:
+    out.append(f"{key}={value}")
+path.write_text("\n".join(out) + "\n")
+os.chown(path, 0, 0)
+os.chmod(path, 0o600)
+PY
+sudo python3 scripts/validate-operator-env.py \
+  /etc/rom-operator-bridge/rom-operator-bridge.env
 ```
 
 ## 3. Start The Systemd Service
