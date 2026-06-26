@@ -56,6 +56,17 @@ The env file needs real operator-approved values for these keys:
 | `ROM_OPERATOR_BRIDGE_OPERATOR_CREDENTIAL` | `<operator-credential>` |
 | `ROM_OPERATOR_BRIDGE_SESSION_SECRET` | `<session-secret>` |
 
+Generate missing operator credential and session secret values without printing
+them:
+
+```sh
+sudo python3 scripts/generate-operator-auth.py \
+  /etc/rom-operator-bridge/rom-operator-bridge.env
+```
+
+Use `--rotate` only when intentionally replacing existing values. Rotating
+`ROM_OPERATOR_BRIDGE_SESSION_SECRET` invalidates active sessions.
+
 If `ROM_OPERATOR_BRIDGE_BACKEND=real`, also include the approved real backend
 handoff values documented in `docs/runbook.md` and `service/src/private_config.rs`.
 
