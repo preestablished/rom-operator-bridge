@@ -5,6 +5,20 @@ This runbook is for the operator step that unblocks
 paste instantiated private env values, endpoint addresses, cookie files, raw
 logs, probe output, private paths, or private evidence contents.
 
+## Current Gate Before Private Validation
+
+Do not run step 5 until these host prerequisites pass:
+
+- the static publish root exists at
+  `/var/lib/rom-operator-bridge/static/current`;
+- `/var/lib/rom-operator-bridge/static/current/index.html` exists;
+- `rom-operator-bridge.service` is active, not restart-looping;
+- the private endpoint manifest has been applied;
+- K3s has the `rom-operator-bridge` Service, Endpoints, and Ingress objects.
+
+An empty Kubernetes ingress load-balancer status is a warning, not by itself a
+hard stop, if DNS/TLS and runtime probes in step 5 pass.
+
 Run commands from the repository checkout:
 
 ```sh
