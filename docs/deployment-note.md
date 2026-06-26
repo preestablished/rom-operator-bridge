@@ -1,9 +1,9 @@
 # Deployment Note
 
-Date: 2026-06-24
+Date: 2026-06-26
 
 This note records the deployment contract for the private ROM operator bridge.
-It is a handoff document, not evidence that the service has been deployed. Do
+It is also the sanitized handoff record for the deployed same-origin route. Do
 not paste live command output, private network values, credentials, request
 bodies, capture ids, or validation report excerpts into this file.
 
@@ -15,11 +15,27 @@ The selected deployment shape is a dedicated same-network HTTPS origin:
 https://rombridge.birb.homes/
 ```
 
-DNS for `rombridge.birb.homes` is already configured to resolve to
-`<bridge-private-ip>`. The bridge service source exists in this repository. The
-deployed service instance, TLS route, reverse-proxy manifest, systemd unit,
-release artifact, and private env file are deployment outputs that are not
-present or applied yet.
+Exact operator URL:
+
+```text
+https://rombridge.birb.homes/
+```
+
+DNS for `rombridge.birb.homes` resolves to `<bridge-private-ip>`. The bridge
+service, static UI, TLS route, systemd unit, K3s ingress/service/endpoints, and
+private env file were deployed and validated from the trusted network.
+
+Sanitized evidence label:
+
+```text
+deployment-network-kut/20260626T212016Z
+```
+
+That private validation proved the deployed route serves the static UI over
+HTTPS, runtime API routes work without mixed-content errors, both WebSocket
+routes enforce authenticated same-origin WSS handshakes, unrelated Origins are
+rejected, and no-store headers are present on runtime/private preview routes.
+Operator-private raw evidence remains outside this repository.
 
 The older static-only publishing shape under `https://birb.homes/rom-bridge/`
 is not the Phase 0 runtime target. It remains only a fallback static path shape;
@@ -64,9 +80,8 @@ repo ingress manifest: deploy/k8s/rombridge-ingress.yaml
 k3s kubeconfig: /etc/rancher/k3s/k3s.yaml
 ```
 
-The repo ingress manifest path is reserved for the later deployment bead. Until
-that file exists and is applied, the hostname should be treated as unavailable
-for bridge operation.
+The repo ingress manifest is the sanitized template. The operator-private
+endpoint manifest supplies the concrete trusted address outside the repository.
 
 ## Service Install Paths
 
@@ -199,8 +214,10 @@ handoff text.
 
 ## Deployment Checks
 
-Run these only after the service artifact, private env file, systemd unit, and
-proxy manifest exist:
+The live deployment passed the full private checker under sanitized evidence
+label `deployment-network-kut/20260626T212016Z`. The following command shapes
+are for revalidation after changing the service artifact, private env file,
+systemd unit, static root, or proxy manifest:
 
 ```sh
 getent hosts rombridge.birb.homes
