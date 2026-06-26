@@ -39,7 +39,7 @@ def resolve_static_root(static_current: Path) -> Path:
     resolved = static_current.resolve(strict=True)
     if not resolved.is_dir():
         raise RuntimeError("resolved static publish root is not a directory")
-    if static.S_ISLNK(resolved.lstat().st_mode):
+    if stat.S_ISLNK(resolved.lstat().st_mode):
         raise RuntimeError("resolved static publish root is still a symlink")
     if not (resolved / "index.html").is_file():
         raise RuntimeError("resolved static publish root is missing index.html")
