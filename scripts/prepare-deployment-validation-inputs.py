@@ -5,9 +5,13 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import http.client
+import http.cookies
 import json
 import os
 import re
+import socket
+import ssl
 import subprocess
 import sys
 from pathlib import Path
@@ -19,6 +23,20 @@ PORT = "443"
 SERVICE_PORT = "7410"
 PRIVATE_FILE_MODE = 0o600
 PRIVATE_DIR_MODE = 0o700
+
+
+class ResolvedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, host: str, resolved_ip: str, *args: object, **kwargs: object) -> None:
+        super().__init__(host, *args, **kwargs)
+        self.resolved_ip = resolved_ip
+
+    def connect(self) -> None:
+        self.sock = socket.create_connection(
+            (self.resolved_ip, self.port), self.timeout, self.source_address
+        )
+        if self._tunnel_host:
+            self._tunnel()
+        self.sock = self._context.wrap_socket(self.sock, server_hostname=self.host)
 
 
 def require_value(name: str) -> str:
@@ -52,6 +70,48 @@ def write_private_text(path: Path, contents: str) -> None:
     path.chmod(PRIVATE_FILE_MODE)
 
 
+def write_cookie_jar(path: Path, set_cookie_headers: list[str]) -> None:
+    lines = ["# Netscape HTTP Cookie File"]
+    for header in set_cookie_headers:
+        cookie = http.cookies.SimpleCookie()
+        cookie.load(header)
+        for name, morsel in cookie.items():
+            cookie_path = morsel["path"] or "/"
+            secure = "TRUE" if morsel["secure"] else "FALSE"
+            lines.append(
+                "\t".join(
+                    [
+                        HOST,
+                        "FALSE",
+                        cookie_path,
+                        secure,
+                        "0",
+                        name,
+                        morsel.value,
+                    ]
+                )
+            )
+    write_private_text(path, "\n".join(lines) + "\n")
+
+
+def sanitized_error(body_text: str) -> tuple[str, str]:
+    try:
+        data = json.loads(body_text)
+    except json.JSONDecodeError:
+        return "unparseable", "response body was not JSON"
+    error = data.get("error") if isinstance(data, dict) else None
+    if isinstance(error, dict):
+        code = str(error.get("code") or "")
+        message = str(error.get("message") or "")
+    elif isinstance(data, dict):
+        code = str(data.get("code") or "")
+        message = str(data.get("message") or "")
+    else:
+        code = ""
+        message = ""
+    return code or "unknown", message or "no message"
+
+
 def run_capture(args: list[str], env: dict[str, str] | None = None) -> str:
     result = subprocess.run(args, check=False, text=True, capture_output=True, env=env)
     if result.returncode != 0:
@@ -77,28 +137,36 @@ def create_cookie_jar(
 ) -> None:
     ensure_private_parent(cookie_jar)
     ensure_private_parent(session_response)
-    write_private_text(cookie_jar, "")
-    args = [
-        "curl",
-        "-sS",
-        "--fail",
-        "--resolve",
-        f"{HOST}:{PORT}:{bridge_ip}",
-        "-H",
-        f"Origin: {ORIGIN}",
-        "-H",
-        "Content-Type: application/json",
-        "-c",
-        str(cookie_jar),
-        "-o",
-        str(session_response),
-        "--data",
-        f"@{start_session_json}",
-        f"{ORIGIN}/api/session/start",
-    ]
-    subprocess.run(args, check=True, stdout=subprocess.DEVNULL)
-    cookie_jar.chmod(PRIVATE_FILE_MODE)
-    session_response.chmod(PRIVATE_FILE_MODE)
+    body = start_session_json.read_text(encoding="utf-8")
+    context = ssl.create_default_context()
+    conn = ResolvedHTTPSConnection(HOST, bridge_ip, port=int(PORT), context=context, timeout=15)
+    try:
+        conn.request(
+            "POST",
+            "/api/session/start",
+            body=body,
+            headers={
+                "Origin": ORIGIN,
+                "Content-Type": "application/json",
+            },
+        )
+        response = conn.getresponse()
+        response_body = response.read().decode("utf-8", errors="replace")
+        write_private_text(session_response, response_body)
+        set_cookie_headers = [
+            value for key, value in response.getheaders() if key.lower() == "set-cookie"
+        ]
+        write_cookie_jar(cookie_jar, set_cookie_headers if 200 <= response.status < 300 else [])
+        if not (200 <= response.status < 300):
+            code, message = sanitized_error(response_body)
+            print(
+                f"validation-inputs: FAIL session_cookie_http status={response.status} "
+                f"code={code} message={message}",
+                file=sys.stderr,
+            )
+            raise RuntimeError("session request failed")
+    finally:
+        conn.close()
 
 
 def create_network_evidence(path: Path, kubeconfig: str) -> None:
