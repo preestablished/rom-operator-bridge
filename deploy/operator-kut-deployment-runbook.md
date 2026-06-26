@@ -123,31 +123,8 @@ Update the env file to point at the real static release directory. Do not point
 service rejects symlink components in private/static config paths.
 
 ```sh
-sudo python3 - "$static_release" <<'PY'
-from pathlib import Path
-import os
-import sys
-
-path = Path("/etc/rom-operator-bridge/rom-operator-bridge.env")
-key = "ROM_OPERATOR_BRIDGE_STATIC_PUBLISH_ROOT"
-value = sys.argv[1]
-lines = path.read_text().splitlines()
-out = []
-seen = False
-for line in lines:
-    stripped = line.strip()
-    name = stripped.removeprefix("export ").split("=", 1)[0].strip() if "=" in stripped else None
-    if name == key:
-        out.append(f"{key}={value}")
-        seen = True
-    else:
-        out.append(line)
-if not seen:
-    out.append(f"{key}={value}")
-path.write_text("\n".join(out) + "\n")
-os.chown(path, 0, 0)
-os.chmod(path, 0o600)
-PY
+sudo python3 scripts/update-static-publish-root.py \
+  /etc/rom-operator-bridge/rom-operator-bridge.env
 sudo python3 scripts/validate-operator-env.py \
   /etc/rom-operator-bridge/rom-operator-bridge.env
 ```
