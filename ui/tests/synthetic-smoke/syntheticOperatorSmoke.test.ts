@@ -126,6 +126,7 @@ describe("synthetic operator smoke", () => {
 
     expect(client.startSession).toHaveBeenCalledWith({
       operatorCredential: "synthetic-operator-credential",
+      backendMode: "synthetic",
       requestedCapabilities: ["input", "preview", "capture", "labels", "privileged_features"]
     });
     expect(root.textContent).toContain("session-001");

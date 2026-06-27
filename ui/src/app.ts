@@ -95,6 +95,7 @@ type OperatorRuntimeViewState = {
 export type RuntimeEventClient = Pick<RuntimeWebSocketClient, "eventSocket">;
 export type RuntimeInputClient = Pick<RuntimeWebSocketClient, "inputSocket">;
 export type RuntimePreviewClient = Pick<RuntimeApiClient, "currentFrame">;
+type RuntimeHealthClient = Pick<RuntimeApiClient, "health">;
 export type RuntimeRunClient = Pick<
   RuntimeApiClient,
   "runStatus" | "pauseRun" | "resumeRun" | "triggerCapture" | "captureJob"
@@ -105,7 +106,13 @@ type RuntimeCaptureReviewClient = Pick<
   "recentCaptures" | "captureDetail" | "captureFeatures" | "updateLabels" | "labelsSnapshot"
 >;
 type OperatorRuntimeClient = RuntimeSessionClient &
-  Partial<RuntimePreviewClient & RuntimeRunClient & RuntimeValidationClient & RuntimeCaptureReviewClient>;
+  Partial<
+    RuntimeHealthClient &
+      RuntimePreviewClient &
+      RuntimeRunClient &
+      RuntimeValidationClient &
+      RuntimeCaptureReviewClient
+  >;
 type OperatorSocketClient = RuntimeEventClient & Partial<RuntimeInputClient>;
 
 type FocusState = "focused" | "blurred" | "hidden";
@@ -413,6 +420,7 @@ export function mountOperatorApp(
   let gamepadButtons: PadButton[] = [];
   let neutralizedDirections: NeutralizedDirection[] = [];
   let padlogTail: PadlogTailEntry[] = [];
+  let serviceBackendMode: BackendMode = auth.session.backend_mode;
   let eventSocket: ReturnType<RuntimeEventClient["eventSocket"]> | null = null;
   let eventSessionId: string | null = null;
   let inputSocket: ReturnType<RuntimeInputClient["inputSocket"]> | null = null;
@@ -455,6 +463,33 @@ export function mountOperatorApp(
     }
   };
 
+  const applyServiceBackendMode = (backendMode: BackendMode) => {
+    serviceBackendMode = backendMode;
+    if (!auth.session.active && auth.session.backend_mode !== backendMode) {
+      auth = {
+        ...auth,
+        session: {
+          ...auth.session,
+          backend_mode: backendMode
+        }
+      };
+      render();
+    }
+  };
+
+  const refreshServiceBackendMode = (): Promise<BackendMode> => {
+    const health = client.health?.bind(client);
+    if (!health) {
+      return Promise.resolve(serviceBackendMode);
+    }
+    return health()
+      .then((response) => {
+        applyServiceBackendMode(response.backend_mode);
+        return response.backend_mode;
+      })
+      .catch(() => serviceBackendMode);
+  };
+
   const applyAuthResult = (requestSeq: number, next: AuthSessionState) => {
     if (requestSeq !== authRequestSeq) {
       return;
@@ -464,7 +499,18 @@ export function mountOperatorApp(
     if (sessionWillReset) {
       closeInputStream(true);
     }
-    auth = next;
+    if (next.session.active) {
+      serviceBackendMode = next.session.backend_mode;
+      auth = next;
+    } else {
+      auth = {
+        ...next,
+        session: {
+          ...next.session,
+          backend_mode: serviceBackendMode
+        }
+      };
+    }
     if (sessionWillReset) {
       preview = null;
       previewRequestSeq += 1;
@@ -1027,9 +1073,11 @@ export function mountOperatorApp(
     preview = null;
     previewRequestSeq += 1;
     render();
-    submitCredential(auth, client, credential).then((next) => {
-      applyAuthResult(requestSeq, next);
-    });
+    refreshServiceBackendMode()
+      .then((backendMode) => submitCredential(auth, client, credential, backendMode))
+      .then((next) => {
+        applyAuthResult(requestSeq, next);
+      });
   });
 
   root.addEventListener("submit", (event) => {
@@ -1631,6 +1679,7 @@ export function mountOperatorApp(
   globalThis.document?.addEventListener?.("visibilitychange", () => updateFocusState());
   globalThis.addEventListener?.("pagehide", () => updateFocusState("hidden"));
 
+  void refreshServiceBackendMode();
   render("credential");
   const refreshSeq = ++authRequestSeq;
   refreshSession(auth, client).then((next) => {

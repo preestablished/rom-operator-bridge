@@ -301,13 +301,16 @@ export function initialRuntimeSessionModel(): RuntimeSessionModel {
   };
 }
 
-export function modelFromStartSession(response: StartSessionResponse): RuntimeSessionModel {
+export function modelFromStartSession(
+  response: StartSessionResponse,
+  backendMode: BackendMode = "synthetic"
+): RuntimeSessionModel {
   return {
     active: true,
     session_id: response.session_id,
     run_id: response.run_id,
     state: response.state,
-    backend_mode: "synthetic",
+    backend_mode: backendMode,
     current_frame: response.current_frame,
     last_applied_input_frame: 0,
     last_preview_frame: 0,
