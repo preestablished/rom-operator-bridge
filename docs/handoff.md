@@ -26,7 +26,7 @@ Recent commits to know about:
 - `rom-operator-bridge.service` is active and running on the expected host.
 - The live route was updated after the service initially kept serving the prior bundle; direct and public checks now both see `index-Ds6jVeRa.js`.
 
-Do not record operator credentials, session secrets, cookie jars, private endpoint addresses, private artifact contents, raw verifier output, screenshots, or private evidence paths in Git.
+Do not record operator credentials, session secrets, cookie jars, private endpoint addresses, private artifact contents, unsanitized verifier logs, screenshots, or private evidence paths in Git.
 
 ## What Was Just Fixed
 
