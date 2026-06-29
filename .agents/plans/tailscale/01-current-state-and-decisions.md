@@ -136,13 +136,18 @@ HTTP-or-HTTPS switch:
 
 ```text
 ROM_OPERATOR_BRIDGE_DEPLOYMENT_PROFILES=https-origin,tailscale-http
-ROM_OPERATOR_BRIDGE_PROFILE_HTTPS_PUBLIC_ORIGIN=https://rombridge.birb.homes
-ROM_OPERATOR_BRIDGE_PROFILE_HTTPS_ALLOWED_ORIGINS=https://rombridge.birb.homes
-ROM_OPERATOR_BRIDGE_PROFILE_HTTPS_COOKIE_SECURE=true
-ROM_OPERATOR_BRIDGE_PROFILE_TAIL_PUBLIC_ORIGIN=http://tailrombridge.birb.homes
-ROM_OPERATOR_BRIDGE_PROFILE_TAIL_ALLOWED_ORIGINS=http://tailrombridge.birb.homes
-ROM_OPERATOR_BRIDGE_PROFILE_TAIL_COOKIE_SECURE=false
+ROM_OPERATOR_BRIDGE_PROFILE_HTTPS_ORIGIN_PUBLIC_ORIGIN=https://rombridge.birb.homes
+ROM_OPERATOR_BRIDGE_PROFILE_HTTPS_ORIGIN_ALLOWED_ORIGINS=https://rombridge.birb.homes
+ROM_OPERATOR_BRIDGE_PROFILE_HTTPS_ORIGIN_COOKIE_SECURE=true
+ROM_OPERATOR_BRIDGE_PROFILE_TAILSCALE_HTTP_PUBLIC_ORIGIN=http://tailrombridge.birb.homes
+ROM_OPERATOR_BRIDGE_PROFILE_TAILSCALE_HTTP_ALLOWED_ORIGINS=http://tailrombridge.birb.homes
+ROM_OPERATOR_BRIDGE_PROFILE_TAILSCALE_HTTP_COOKIE_SECURE=false
+ROM_OPERATOR_BRIDGE_PROFILE_TAILSCALE_HTTP_EXPOSURE_MODE=tailscale-http
 ```
+
+Profile-specific env names are derived by uppercasing the profile id and
+replacing non-alphanumeric characters with `_`. For example,
+`tailscale-http` maps to `ROM_OPERATOR_BRIDGE_PROFILE_TAILSCALE_HTTP_*`.
 
 For a separate Tailscale-only service instance, the same profile can be reduced
 to a single-process HTTP configuration:

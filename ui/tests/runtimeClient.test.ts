@@ -497,6 +497,20 @@ describe("runtime WebSocket clients", () => {
     expect(errors).toEqual([]);
   });
 
+  it("builds input WebSocket URLs for the Tailscale HTTP route", () => {
+    const client = new RuntimeWebSocketClient(config, {
+      socketConstructor: FakeWebSocket,
+      location: { protocol: "http:", host: "tailrombridge.birb.homes" },
+      maxReconnects: 0
+    });
+
+    const input = client.inputSocket("session-001", "keyboard");
+    const socket = FakeWebSocket.instances[0]!;
+
+    expect(socket.url).toBe("ws://tailrombridge.birb.homes/ws/input");
+    input.close();
+  });
+
   it("allows server sequence numbers to restart for a new session", () => {
     const messages: RuntimeWsMessage[] = [];
     const client = new RuntimeWebSocketClient(config, {

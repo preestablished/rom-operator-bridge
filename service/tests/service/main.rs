@@ -2,7 +2,7 @@ use axum::{
     body::{Body, to_bytes},
     http::{
         HeaderMap, HeaderName, Request, StatusCode,
-        header::{CACHE_CONTROL, CONTENT_TYPE, PRAGMA},
+        header::{CACHE_CONTROL, CONTENT_TYPE, HOST, PRAGMA},
     },
 };
 use rom_operator_bridge_service::{
@@ -11,7 +11,10 @@ use rom_operator_bridge_service::{
         BackendCapabilities, BackendError, BackendMode, BridgeBackend, InputScheduleRequest,
         RealBackendUnavailable, StartBackendSession, SyntheticBackend,
     },
-    config::{ConfigError, DEFAULT_BIND_ADDR, ENV_BACKEND_MODE, ENV_BIND_ADDR, ServiceConfig},
+    config::{
+        ConfigError, DEFAULT_BIND_ADDR, ENV_BACKEND_MODE, ENV_BIND_ADDR, ENV_DEPLOYMENT_PROFILES,
+        ServiceConfig,
+    },
     input::{PadButton, PadWord},
     private_config::{
         ENV_OPERATOR_CREDENTIAL, ENV_PRIVATE_ROOT, ENV_SESSION_SECRET, ENV_STATIC_PUBLISH_ROOT,
@@ -27,6 +30,11 @@ use tower::ServiceExt;
 
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
+
+const HTTPS_ORIGIN: &str = "https://rombridge.birb.homes";
+const TAILSCALE_ORIGIN: &str = "http://tailrombridge.birb.homes";
+const HTTPS_STATIC_CSP: &str = "default-src 'self'; connect-src 'self' wss://rombridge.birb.homes; img-src 'self' blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'";
+const TAILSCALE_STATIC_CSP: &str = "default-src 'self'; connect-src 'self' ws://tailrombridge.birb.homes; img-src 'self' blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'";
 
 #[tokio::test]
 async fn health_route_returns_schema_v1_without_private_paths() {
@@ -153,6 +161,7 @@ async fn configured_static_root_serves_ui_shell_with_security_headers() {
         .oneshot(
             Request::builder()
                 .uri("/")
+                .header(HOST, "rombridge.birb.homes")
                 .body(Body::empty())
                 .expect("request builds"),
         )
@@ -176,6 +185,7 @@ async fn configured_static_root_serves_ui_shell_with_security_headers() {
         .oneshot(
             Request::builder()
                 .uri("/runtime-config.json")
+                .header(HOST, "rombridge.birb.homes")
                 .body(Body::empty())
                 .expect("request builds"),
         )
@@ -191,6 +201,53 @@ async fn configured_static_root_serves_ui_shell_with_security_headers() {
             .and_then(|value| value.to_str().ok()),
         Some("application/json; charset=utf-8")
     );
+}
+
+#[tokio::test]
+async fn static_csp_follows_validated_deployment_host() {
+    let workspace = tempfile::tempdir().expect("tempdir creates");
+    let private_root = workspace.path().join("bridge-private");
+    let static_root = workspace.path().join("static-publish");
+    write_static_file(
+        &static_root.join("index.html"),
+        "<main>ROM operator shell</main>",
+    );
+
+    let app = router(AppState::synthetic_for_tests(
+        config_with_static_root_and_profiles(&private_root, &static_root),
+    ));
+
+    for (host, expected_csp) in [
+        ("rombridge.birb.homes:443", HTTPS_STATIC_CSP),
+        ("tailrombridge.birb.homes:80", TAILSCALE_STATIC_CSP),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(HOST, host)
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("static route request succeeds");
+
+        assert_eq!(response.status(), StatusCode::OK, "host={host}");
+        assert_static_headers_with_csp(response.headers(), expected_csp);
+    }
+
+    let rejected = app
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .header(HOST, "example.invalid")
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("unknown host request succeeds");
+    assert_eq!(rejected.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -210,6 +267,7 @@ async fn static_spa_fallback_does_not_shadow_runtime_routes() {
         .oneshot(
             Request::builder()
                 .uri("/operator/session")
+                .header(HOST, "rombridge.birb.homes")
                 .body(Body::empty())
                 .expect("request builds"),
         )
@@ -266,6 +324,7 @@ async fn static_serving_rejects_unsafe_paths_and_source_maps() {
             .oneshot(
                 Request::builder()
                     .uri(uri)
+                    .header(HOST, "rombridge.birb.homes")
                     .body(Body::empty())
                     .expect("request builds"),
             )
@@ -283,6 +342,7 @@ async fn static_serving_rejects_unsafe_paths_and_source_maps() {
         .oneshot(
             Request::builder()
                 .uri("/assets/app.js")
+                .header(HOST, "rombridge.birb.homes")
                 .body(Body::empty())
                 .expect("request builds"),
         )
@@ -311,6 +371,7 @@ async fn static_serving_rejects_symlinked_files() {
         .oneshot(
             Request::builder()
                 .uri("/leak.txt")
+                .header(HOST, "rombridge.birb.homes")
                 .body(Body::empty())
                 .expect("request builds"),
         )
@@ -482,15 +543,65 @@ fn config_with_static_root(private_root: &Path, static_root: &Path) -> ServiceCo
     .expect("static root config loads")
 }
 
+fn config_with_static_root_and_profiles(private_root: &Path, static_root: &Path) -> ServiceConfig {
+    ServiceConfig::from_pairs([
+        (ENV_BIND_ADDR.to_string(), "127.0.0.1:0".to_string()),
+        (ENV_BACKEND_MODE.to_string(), "synthetic".to_string()),
+        (
+            ENV_PRIVATE_ROOT.to_string(),
+            private_root.display().to_string(),
+        ),
+        (
+            ENV_STATIC_PUBLISH_ROOT.to_string(),
+            static_root.display().to_string(),
+        ),
+        (
+            ENV_OPERATOR_CREDENTIAL.to_string(),
+            "operator-credential-from-test-source".to_string(),
+        ),
+        (
+            ENV_SESSION_SECRET.to_string(),
+            "session-secret-from-test-source-32-bytes".to_string(),
+        ),
+        (
+            ENV_DEPLOYMENT_PROFILES.to_string(),
+            "https-origin,tailscale-http".to_string(),
+        ),
+        (
+            "ROM_OPERATOR_BRIDGE_PROFILE_HTTPS_ORIGIN_PUBLIC_ORIGIN".to_string(),
+            HTTPS_ORIGIN.to_string(),
+        ),
+        (
+            "ROM_OPERATOR_BRIDGE_PROFILE_TAILSCALE_HTTP_PUBLIC_ORIGIN".to_string(),
+            TAILSCALE_ORIGIN.to_string(),
+        ),
+        (
+            "ROM_OPERATOR_BRIDGE_PROFILE_TAILSCALE_HTTP_ALLOWED_ORIGINS".to_string(),
+            TAILSCALE_ORIGIN.to_string(),
+        ),
+        (
+            "ROM_OPERATOR_BRIDGE_PROFILE_TAILSCALE_HTTP_COOKIE_SECURE".to_string(),
+            "false".to_string(),
+        ),
+        (
+            "ROM_OPERATOR_BRIDGE_PROFILE_TAILSCALE_HTTP_EXPOSURE_MODE".to_string(),
+            "tailscale-http".to_string(),
+        ),
+    ])
+    .expect("static root deployment profile config loads")
+}
+
 fn assert_static_headers(headers: &HeaderMap) {
+    assert_static_headers_with_csp(headers, HTTPS_STATIC_CSP);
+}
+
+fn assert_static_headers_with_csp(headers: &HeaderMap, expected_csp: &str) {
     assert_no_store_headers(headers);
     assert_eq!(
         headers
             .get(HeaderName::from_static("content-security-policy"))
             .and_then(|value| value.to_str().ok()),
-        Some(
-            "default-src 'self'; connect-src 'self' wss://rombridge.birb.homes; img-src 'self' blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
-        )
+        Some(expected_csp)
     );
     assert_eq!(
         headers

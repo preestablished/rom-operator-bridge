@@ -2,7 +2,7 @@ use axum::{
     body::{Body, to_bytes},
     http::{
         Method, Request, StatusCode,
-        header::{COOKIE, ORIGIN, SET_COOKIE},
+        header::{COOKIE, HOST, ORIGIN, SET_COOKIE},
     },
 };
 use rom_operator_bridge_service::{
@@ -11,7 +11,7 @@ use rom_operator_bridge_service::{
         ALLOWED_ORIGIN, AUTH_RATE_LIMIT_WINDOW_SECONDS, AuthState, MAX_FAILED_AUTH_ATTEMPTS,
         SESSION_COOKIE_NAME, SESSION_TTL_SECONDS,
     },
-    config::{ENV_BACKEND_MODE, ServiceConfig},
+    config::{ENV_BACKEND_MODE, ENV_DEPLOYMENT_PROFILES, ServiceConfig},
     private_config::{
         ENV_CAPTURE_SPEC_REF, ENV_OPERATOR_CREDENTIAL, ENV_PRIVATE_ROOT, ENV_REAL_SNAPSHOT_REF,
         ENV_REFERENCE_WORKLOAD_CHECKOUT, ENV_SESSION_SECRET, ENV_WORKLOAD_IMAGE_REF,
@@ -23,6 +23,7 @@ use tower::ServiceExt;
 
 const GOOD_CREDENTIAL: &str = "operator-credential-from-test-source";
 const SESSION_SECRET: &str = "session-secret-from-test-source-32-bytes";
+const TAILSCALE_ORIGIN: &str = "http://tailrombridge.birb.homes";
 
 #[tokio::test]
 async fn missing_session_cookie_is_rejected_without_private_details() {
@@ -94,6 +95,31 @@ async fn unrelated_absent_and_null_origins_are_rejected() {
 }
 
 #[tokio::test]
+async fn runtime_requests_reject_host_origin_profile_mismatches() {
+    let workspace = tempfile::tempdir().expect("tempdir creates");
+    let private_root = workspace.path().join("bridge-private");
+    let app = router(AppState::synthetic_for_tests(tailscale_config(
+        &private_root,
+    )));
+
+    let response = app
+        .oneshot(
+            runtime_request_with_origin(
+                Method::POST,
+                "/api/session/start",
+                Body::from(start_session_body(GOOD_CREDENTIAL)),
+                TAILSCALE_ORIGIN,
+            )
+            .with_header(HOST, "rombridge.birb.homes"),
+        )
+        .await
+        .expect("host mismatch request runs");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_auth_safe_error(response, "origin_rejected", &private_root).await;
+}
+
+#[tokio::test]
 async fn successful_login_sets_strict_cookie_and_allows_session_status() {
     let (_workspace, app, _private_root) = auth_app();
 
@@ -152,6 +178,108 @@ async fn successful_login_sets_strict_cookie_and_allows_session_status() {
     let status_json = json_body(status_response).await;
     assert_eq!(status_json["active"], true);
     assert_eq!(status_json["state"], "running");
+}
+
+#[tokio::test]
+async fn tailscale_http_origin_sets_non_secure_cookie_and_allows_session_status() {
+    let workspace = tempfile::tempdir().expect("tempdir creates");
+    let private_root = workspace.path().join("bridge-private");
+    let app = router(AppState::synthetic_for_tests(tailscale_config(
+        &private_root,
+    )));
+
+    let login_response = app
+        .clone()
+        .oneshot(runtime_request_with_origin(
+            Method::POST,
+            "/api/session/start",
+            Body::from(start_session_body(GOOD_CREDENTIAL)),
+            TAILSCALE_ORIGIN,
+        ))
+        .await
+        .expect("tailscale login runs");
+
+    assert_eq!(login_response.status(), StatusCode::OK);
+    assert_eq!(
+        login_response
+            .headers()
+            .get("access-control-allow-origin")
+            .and_then(|value| value.to_str().ok()),
+        Some(TAILSCALE_ORIGIN)
+    );
+    let set_cookie = login_response
+        .headers()
+        .get(SET_COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .expect("session cookie is set")
+        .to_string();
+    assert!(set_cookie.starts_with(&format!("{SESSION_COOKIE_NAME}=v1.")));
+    assert_cookie_attribute(&set_cookie, "HttpOnly");
+    assert_cookie_attribute(&set_cookie, "SameSite=Strict");
+    assert_no_cookie_attribute(&set_cookie, "Secure");
+
+    let cookie = set_cookie
+        .split(';')
+        .next()
+        .expect("cookie pair exists")
+        .to_string();
+    let status_response = app
+        .oneshot(
+            runtime_request_with_origin(
+                Method::GET,
+                "/api/session",
+                Body::empty(),
+                TAILSCALE_ORIGIN,
+            )
+            .with_header(COOKIE, cookie),
+        )
+        .await
+        .expect("tailscale status request runs");
+
+    assert_eq!(status_response.status(), StatusCode::OK);
+    assert_eq!(
+        status_response
+            .headers()
+            .get("access-control-allow-origin")
+            .and_then(|value| value.to_str().ok()),
+        Some(TAILSCALE_ORIGIN)
+    );
+    let status_json = json_body(status_response).await;
+    assert_eq!(status_json["active"], true);
+}
+
+#[tokio::test]
+async fn multi_profile_https_origin_keeps_secure_cookie() {
+    let workspace = tempfile::tempdir().expect("tempdir creates");
+    let private_root = workspace.path().join("bridge-private");
+    let app = router(AppState::synthetic_for_tests(tailscale_config(
+        &private_root,
+    )));
+
+    let login_response = app
+        .oneshot(runtime_request(
+            Method::POST,
+            "/api/session/start",
+            Body::from(start_session_body(GOOD_CREDENTIAL)),
+        ))
+        .await
+        .expect("https login runs");
+
+    assert_eq!(login_response.status(), StatusCode::OK);
+    assert_eq!(
+        login_response
+            .headers()
+            .get("access-control-allow-origin")
+            .and_then(|value| value.to_str().ok()),
+        Some(ALLOWED_ORIGIN)
+    );
+    let set_cookie = login_response
+        .headers()
+        .get(SET_COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .expect("session cookie is set");
+    assert_cookie_attribute(set_cookie, "Secure");
+    assert_cookie_attribute(set_cookie, "SameSite=Strict");
 }
 
 #[tokio::test]
@@ -297,7 +425,7 @@ async fn backend_start_failure_does_not_leave_session_locked() {
 async fn websocket_handshake_uses_same_origin_and_cookie_auth() {
     let (_workspace, app, _private_root) = auth_app();
 
-    let missing_cookie = raw_ws_response(app.clone(), None, true).await;
+    let missing_cookie = raw_ws_response(app.clone(), ALLOWED_ORIGIN, None, true).await;
     assert!(missing_cookie.starts_with("HTTP/1.1 401 Unauthorized"));
 
     let login_response = app
@@ -317,15 +445,45 @@ async fn websocket_handshake_uses_same_origin_and_cookie_auth() {
         .expect("cookie pair")
         .to_string();
 
-    let non_upgrade = raw_ws_response(app.clone(), Some(&cookie), false).await;
+    let non_upgrade = raw_ws_response(app.clone(), ALLOWED_ORIGIN, Some(&cookie), false).await;
     assert!(!non_upgrade.starts_with("HTTP/1.1 101"));
 
-    let accepted = raw_ws_response(app, Some(&cookie), true).await;
+    let accepted = raw_ws_response(app, ALLOWED_ORIGIN, Some(&cookie), true).await;
     let accepted_lower = accepted.to_ascii_lowercase();
 
     assert!(accepted.starts_with("HTTP/1.1 101 Switching Protocols"));
     assert!(accepted_lower.contains("upgrade: websocket"));
     assert!(accepted_lower.contains("sec-websocket-accept:"));
+}
+
+#[tokio::test]
+async fn websocket_handshake_accepts_tailscale_http_origin() {
+    let workspace = tempfile::tempdir().expect("tempdir creates");
+    let private_root = workspace.path().join("bridge-private");
+    let app = router(AppState::synthetic_for_tests(tailscale_config(
+        &private_root,
+    )));
+
+    let login_response = app
+        .clone()
+        .oneshot(runtime_request_with_origin(
+            Method::POST,
+            "/api/session/start",
+            Body::from(start_session_body(GOOD_CREDENTIAL)),
+            TAILSCALE_ORIGIN,
+        ))
+        .await
+        .expect("tailscale login runs");
+    let cookie = login_response
+        .headers()
+        .get(SET_COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|cookie| cookie.split(';').next())
+        .expect("cookie pair")
+        .to_string();
+
+    let accepted = raw_ws_response(app, TAILSCALE_ORIGIN, Some(&cookie), true).await;
+    assert!(accepted.starts_with("HTTP/1.1 101 Switching Protocols"));
 }
 
 trait RequestExt {
@@ -372,6 +530,51 @@ fn config(private_root: &std::path::Path) -> ServiceConfig {
     .expect("private config loads")
 }
 
+fn tailscale_config(private_root: &std::path::Path) -> ServiceConfig {
+    let mut pairs = private_pairs(private_root);
+    pairs.extend([
+        (
+            ENV_DEPLOYMENT_PROFILES.to_string(),
+            "https-origin,tailscale-http".to_string(),
+        ),
+        (
+            "ROM_OPERATOR_BRIDGE_PROFILE_HTTPS_ORIGIN_PUBLIC_ORIGIN".to_string(),
+            ALLOWED_ORIGIN.to_string(),
+        ),
+        (
+            "ROM_OPERATOR_BRIDGE_PROFILE_TAILSCALE_HTTP_PUBLIC_ORIGIN".to_string(),
+            TAILSCALE_ORIGIN.to_string(),
+        ),
+        (
+            "ROM_OPERATOR_BRIDGE_PROFILE_TAILSCALE_HTTP_ALLOWED_ORIGINS".to_string(),
+            TAILSCALE_ORIGIN.to_string(),
+        ),
+        (
+            "ROM_OPERATOR_BRIDGE_PROFILE_TAILSCALE_HTTP_COOKIE_SECURE".to_string(),
+            "false".to_string(),
+        ),
+        (
+            "ROM_OPERATOR_BRIDGE_PROFILE_TAILSCALE_HTTP_EXPOSURE_MODE".to_string(),
+            "tailscale-http".to_string(),
+        ),
+    ]);
+    ServiceConfig::from_pairs(pairs).expect("tailscale config loads")
+}
+
+fn private_pairs(private_root: &std::path::Path) -> Vec<(String, String)> {
+    vec![
+        (
+            ENV_PRIVATE_ROOT.to_string(),
+            private_root.display().to_string(),
+        ),
+        (
+            ENV_OPERATOR_CREDENTIAL.to_string(),
+            GOOD_CREDENTIAL.to_string(),
+        ),
+        (ENV_SESSION_SECRET.to_string(), SESSION_SECRET.to_string()),
+    ]
+}
+
 fn real_config(private_root: &std::path::Path) -> ServiceConfig {
     let reference_checkout = private_root
         .parent()
@@ -409,16 +612,31 @@ fn real_config(private_root: &std::path::Path) -> ServiceConfig {
 }
 
 fn runtime_request(method: Method, uri: &str, body: Body) -> Request<Body> {
+    runtime_request_with_origin(method, uri, body, ALLOWED_ORIGIN)
+}
+
+fn runtime_request_with_origin(
+    method: Method,
+    uri: &str,
+    body: Body,
+    origin: &str,
+) -> Request<Body> {
     Request::builder()
         .method(method)
         .uri(uri)
-        .header(ORIGIN, ALLOWED_ORIGIN)
+        .header(HOST, host_for_origin(origin))
+        .header(ORIGIN, origin)
         .header("content-type", "application/json")
         .body(body)
         .expect("request builds")
 }
 
-async fn raw_ws_response(app: axum::Router, cookie: Option<&str>, upgrade: bool) -> String {
+async fn raw_ws_response(
+    app: axum::Router,
+    origin: &str,
+    cookie: Option<&str>,
+    upgrade: bool,
+) -> String {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream},
@@ -435,8 +653,10 @@ async fn raw_ws_response(app: axum::Router, cookie: Option<&str>, upgrade: bool)
     let mut stream = TcpStream::connect(addr)
         .await
         .expect("test client connects");
-    let mut request =
-        format!("GET /ws/input HTTP/1.1\r\nHost: {addr}\r\nOrigin: {ALLOWED_ORIGIN}\r\n");
+    let mut request = format!(
+        "GET /ws/input HTTP/1.1\r\nHost: {}\r\nOrigin: {origin}\r\n",
+        host_for_origin(origin)
+    );
     if upgrade {
         request.push_str(
             "Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
@@ -456,6 +676,34 @@ async fn raw_ws_response(app: axum::Router, cookie: Option<&str>, upgrade: bool)
     server.abort();
 
     String::from_utf8_lossy(&buffer[..read]).into_owned()
+}
+
+fn host_for_origin(origin: &str) -> &str {
+    origin
+        .strip_prefix("https://")
+        .or_else(|| origin.strip_prefix("http://"))
+        .expect("test origin includes scheme")
+}
+
+fn assert_cookie_attribute(set_cookie: &str, attribute: &str) {
+    assert!(
+        cookie_has_attribute(set_cookie, attribute),
+        "expected cookie attribute {attribute:?} in {set_cookie:?}",
+    );
+}
+
+fn assert_no_cookie_attribute(set_cookie: &str, attribute: &str) {
+    assert!(
+        !cookie_has_attribute(set_cookie, attribute),
+        "unexpected cookie attribute {attribute:?} in {set_cookie:?}",
+    );
+}
+
+fn cookie_has_attribute(set_cookie: &str, attribute: &str) -> bool {
+    set_cookie
+        .split(';')
+        .map(str::trim)
+        .any(|candidate| candidate.eq_ignore_ascii_case(attribute))
 }
 
 fn start_session_body(credential: &str) -> String {

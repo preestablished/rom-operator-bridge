@@ -948,6 +948,10 @@ impl WsServer {
             .headers_mut()
             .insert("Origin", HeaderValue::from_static(ALLOWED_ORIGIN));
         request.headers_mut().insert(
+            HeaderName::from_static("host"),
+            HeaderValue::from_static("rombridge.birb.homes"),
+        );
+        request.headers_mut().insert(
             HeaderName::from_static("cookie"),
             HeaderValue::from_str(cookie).expect("cookie header parses"),
         );

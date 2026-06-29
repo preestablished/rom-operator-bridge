@@ -42,10 +42,10 @@ ROM_BRIDGE_TAILSCALE_ORIGIN=http://tailrombridge.birb.homes
 ROM_BRIDGE_TAILSCALE_VALIDATION_DIR=<private-validation-dir>/tailscale-http/<run-id>
 ROM_BRIDGE_TAILSCALE_START_SESSION_JSON=<private-start-session-json>
 ROM_BRIDGE_TAILSCALE_SESSION_RESPONSE=<private-session-response-json>
-ROM_BRIDGE_TAILSCALE_COOKIE_FILE=<private-cookie-file-written-by-checker>
+ROM_BRIDGE_TAILSCALE_SESSION_COOKIE_FILE=<private-cookie-file-written-by-prep>
 ROM_BRIDGE_TAILSCALE_NETWORK_EVIDENCE_FILE=<private-network-evidence-file>
 ROM_BRIDGE_TAILSCALE_NETWORK_EVIDENCE_REVIEWED=1
-ROM_BRIDGE_FORBID_FILE=<private-forbid-file>
+ROM_BRIDGE_TAILSCALE_FORBID_FILE=<private-forbid-file>
 ```
 
 The script should reject repo-local validation directories, symlinked private
@@ -55,7 +55,8 @@ style.
 The checker must create or refresh its own throwaway HTTP session. Either
 parameterize `scripts/prepare-deployment-validation-inputs.py` for HTTP, port
 `80`, and `tailrombridge.birb.homes`, or create
-`scripts/prepare-tailscale-http-validation-inputs.py`. The prep path must:
+`scripts/prepare-tailscale-http-validation-inputs.py`. This repo uses the
+separate prep script. The prep path must:
 
 - send `Host: tailrombridge.birb.homes`;
 - send `Origin: http://tailrombridge.birb.homes`;
@@ -98,6 +99,10 @@ The checker should prove:
   HTTPS upstream;
 - wrong Host and direct IP-literal HTTP requests do not serve the bridge UI,
   `/health`, `/api/...`, or `/ws/...`;
+- service-level API/WebSocket validation rejects requests whose present Host
+  header selects a different deployment profile than the accepted Origin;
+- proxy/default-server validation owns `/health` wrong-Host and direct-IP
+  rejection because `/health` intentionally stays simple and unauthenticated;
 - outside-network access is unavailable or rejected.
 
 If the implementation preserves the HTTPS route, also rerun the existing

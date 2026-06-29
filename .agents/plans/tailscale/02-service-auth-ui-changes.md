@@ -147,9 +147,10 @@ public origin. There are currently two CSP sources:
 - the Rust service's `STATIC_CSP`;
 - the Vite preview/test `SPA_RESPONSE_HEADERS` in `ui/vite.config.ts`.
 
-Update both, or explicitly keep Vite preview on the HTTPS profile while the
-service-served static route is profile-aware. Tests must document whichever
-choice is made.
+Implementation decision: keep Vite preview on the HTTPS profile. Production
+static serving is done by the Rust service, which selects CSP from the validated
+Host/profile. Vite preview tests should continue to assert the HTTPS CSP; Rust
+service static tests should cover both HTTPS and Tailscale HTTP CSP variants.
 
 For `http://tailrombridge.birb.homes`, expected CSP:
 
@@ -166,6 +167,13 @@ default-src 'self'; connect-src 'self' wss://rombridge.birb.homes; img-src 'self
 For static responses, select the CSP by validated Host/public origin, not by
 untrusted query string or request body. Avoid one static CSP that authorizes
 both unrelated deployment hosts.
+
+For runtime HTTP and WebSocket routes, select the profile from the accepted
+Origin and reject requests when a present Host header selects a different
+profile. Missing Host headers can remain an in-process test allowance; real
+browser and proxy traffic sends Host, and deployment validation must prove wrong
+Host/direct IP traffic is rejected before it reaches or is accepted by the
+bridge route.
 
 ## Runtime Headers
 

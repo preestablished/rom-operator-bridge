@@ -55,13 +55,18 @@ without replacing the HTTPS profile:
 
 ```sh
 ROM_OPERATOR_BRIDGE_DEPLOYMENT_PROFILES=https-origin,tailscale-http
-ROM_OPERATOR_BRIDGE_PROFILE_HTTPS_PUBLIC_ORIGIN=https://rombridge.birb.homes
-ROM_OPERATOR_BRIDGE_PROFILE_HTTPS_ALLOWED_ORIGINS=https://rombridge.birb.homes
-ROM_OPERATOR_BRIDGE_PROFILE_HTTPS_COOKIE_SECURE=true
-ROM_OPERATOR_BRIDGE_PROFILE_TAIL_PUBLIC_ORIGIN=http://tailrombridge.birb.homes
-ROM_OPERATOR_BRIDGE_PROFILE_TAIL_ALLOWED_ORIGINS=http://tailrombridge.birb.homes
-ROM_OPERATOR_BRIDGE_PROFILE_TAIL_COOKIE_SECURE=false
+ROM_OPERATOR_BRIDGE_PROFILE_HTTPS_ORIGIN_PUBLIC_ORIGIN=https://rombridge.birb.homes
+ROM_OPERATOR_BRIDGE_PROFILE_HTTPS_ORIGIN_ALLOWED_ORIGINS=https://rombridge.birb.homes
+ROM_OPERATOR_BRIDGE_PROFILE_HTTPS_ORIGIN_COOKIE_SECURE=true
+ROM_OPERATOR_BRIDGE_PROFILE_TAILSCALE_HTTP_PUBLIC_ORIGIN=http://tailrombridge.birb.homes
+ROM_OPERATOR_BRIDGE_PROFILE_TAILSCALE_HTTP_ALLOWED_ORIGINS=http://tailrombridge.birb.homes
+ROM_OPERATOR_BRIDGE_PROFILE_TAILSCALE_HTTP_COOKIE_SECURE=false
+ROM_OPERATOR_BRIDGE_PROFILE_TAILSCALE_HTTP_EXPOSURE_MODE=tailscale-http
 ```
+
+Those names use the service's profile-id normalization: `https-origin` becomes
+`PROFILE_HTTPS_ORIGIN_*`, and `tailscale-http` becomes
+`PROFILE_TAILSCALE_HTTP_*`.
 
 For separate-instance Tailscale HTTP mode, use a separate env file such as:
 

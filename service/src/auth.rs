@@ -1,5 +1,8 @@
-use crate::private_config::{BridgePrivateConfig, PrivateConfigError};
-use axum::http::{HeaderMap, Uri, header};
+use crate::{
+    config::DeploymentSecurityConfig,
+    private_config::{BridgePrivateConfig, PrivateConfigError},
+};
+use axum::http::{HeaderMap, HeaderValue, Uri, header};
 use std::{
     sync::{
         Arc, Mutex,
@@ -19,6 +22,13 @@ pub const AUTH_RATE_LIMIT_WINDOW_SECONDS: u64 = 60;
 pub struct OperatorSession {
     pub token: String,
     pub expires_at_unix_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeAuthContext {
+    pub profile_id: String,
+    pub origin: HeaderValue,
+    pub cookie_secure: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -217,9 +227,13 @@ pub enum AuthError {
     PrivateConfig(#[from] PrivateConfigError),
 }
 
-pub fn validate_runtime_request(headers: &HeaderMap, uri: &Uri) -> Result<(), AuthError> {
+pub fn validate_runtime_request(
+    headers: &HeaderMap,
+    uri: &Uri,
+    deployment_security: &DeploymentSecurityConfig,
+) -> Result<RuntimeAuthContext, AuthError> {
     reject_credentials_in_url(uri)?;
-    validate_origin(headers)
+    validate_runtime_headers(headers, deployment_security)
 }
 
 pub fn reject_credentials_in_url(uri: &Uri) -> Result<(), AuthError> {
@@ -230,28 +244,63 @@ pub fn reject_credentials_in_url(uri: &Uri) -> Result<(), AuthError> {
     Ok(())
 }
 
-pub fn validate_origin(headers: &HeaderMap) -> Result<(), AuthError> {
-    let origin = headers
+pub fn validate_origin(
+    headers: &HeaderMap,
+    deployment_security: &DeploymentSecurityConfig,
+) -> Result<RuntimeAuthContext, AuthError> {
+    let origin_header = headers
         .get(header::ORIGIN)
-        .and_then(|value| value.to_str().ok())
+        .ok_or(AuthError::MissingOrigin)?;
+    let origin = origin_header
+        .to_str()
+        .ok()
         .ok_or(AuthError::MissingOrigin)?;
 
-    if origin == ALLOWED_ORIGIN {
-        Ok(())
-    } else {
-        Err(AuthError::OriginRejected)
-    }
+    let profile = deployment_security
+        .profile_for_origin(origin)
+        .ok_or(AuthError::OriginRejected)?;
+    Ok(RuntimeAuthContext {
+        profile_id: profile.id().to_string(),
+        origin: origin_header.clone(),
+        cookie_secure: profile.cookie_secure(),
+    })
 }
 
-pub fn session_cookie_header(session: &OperatorSession) -> String {
-    format!(
-        "{SESSION_COOKIE_NAME}={}; Path=/; Max-Age={SESSION_TTL_SECONDS}; HttpOnly; Secure; SameSite=Strict",
-        session.token
+pub fn validate_runtime_headers(
+    headers: &HeaderMap,
+    deployment_security: &DeploymentSecurityConfig,
+) -> Result<RuntimeAuthContext, AuthError> {
+    let context = validate_origin(headers, deployment_security)?;
+    let Some(host_header) = headers.get(header::HOST) else {
+        return Ok(context);
+    };
+    let host = host_header
+        .to_str()
+        .map_err(|_| AuthError::OriginRejected)?;
+    let host_profile = deployment_security
+        .profile_for_host_header(Some(host))
+        .ok_or(AuthError::OriginRejected)?;
+    if host_profile.id() != context.profile_id {
+        return Err(AuthError::OriginRejected);
+    }
+    Ok(context)
+}
+
+pub fn session_cookie_header(session: &OperatorSession, secure: bool) -> String {
+    cookie_header(
+        &format!(
+            "{SESSION_COOKIE_NAME}={}; Path=/; Max-Age={SESSION_TTL_SECONDS}; HttpOnly",
+            session.token
+        ),
+        secure,
     )
 }
 
-pub fn expired_session_cookie_header() -> String {
-    format!("{SESSION_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict")
+pub fn expired_session_cookie_header(secure: bool) -> String {
+    cookie_header(
+        &format!("{SESSION_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly"),
+        secure,
+    )
 }
 
 fn session_cookie(headers: &HeaderMap) -> Option<&str> {
@@ -267,6 +316,14 @@ fn session_cookie(headers: &HeaderMap) -> Option<&str> {
     }
 
     None
+}
+
+fn cookie_header(prefix: &str, secure: bool) -> String {
+    if secure {
+        format!("{prefix}; Secure; SameSite=Strict")
+    } else {
+        format!("{prefix}; SameSite=Strict")
+    }
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {

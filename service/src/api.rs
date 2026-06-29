@@ -3,14 +3,14 @@ use crate::{
         CaptureSummary as PrivateCaptureSummary, PrivateArtifactStore, RecentCapturesFile,
     },
     auth::{
-        ALLOWED_ORIGIN, AuthError, AuthState, expired_session_cookie_header, session_cookie_header,
-        validate_origin, validate_runtime_request,
+        AuthError, AuthState, RuntimeAuthContext, expired_session_cookie_header,
+        session_cookie_header, validate_runtime_headers, validate_runtime_request,
     },
     backend::{
         BackendCapabilities, BackendError, BackendMode, BridgeBackend, CaptureJob,
         CaptureJobStatus, FramePreview, RealBackend, StopReason, SyntheticBackend,
     },
-    config::ServiceConfig,
+    config::{DeploymentProfile, ServiceConfig},
     input::{PAD_LAYOUT_ID, PAD_LAYOUT_VERSION},
     labels::{
         LabelApplyOutcome, LabelApplyRequest, LabelConflict, LabelConflictKind, LabelSnapshot,
@@ -30,7 +30,8 @@ use axum::{
     http::{
         HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri,
         header::{
-            ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, CONTENT_TYPE, PRAGMA, SET_COOKIE, VARY,
+            ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, CONTENT_TYPE, HOST, PRAGMA, SET_COOKIE,
+            VARY,
         },
     },
     response::{IntoResponse, Response},
@@ -51,7 +52,6 @@ const JSON_SAFE_U64_MAX: u64 = 9_007_199_254_740_991;
 const MAX_CACHED_FRAME_PREVIEWS: usize = 16;
 const DEFAULT_CAPTURE_LIMIT: usize = 50;
 const MAX_CAPTURE_LIMIT: usize = 200;
-const STATIC_CSP: &str = "default-src 'self'; connect-src 'self' wss://rombridge.birb.homes; img-src 'self' blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -1036,9 +1036,11 @@ async fn start_session(
     uri: Uri,
     Json(request): Json<StartSessionRequest>,
 ) -> Response {
-    if let Err(error) = validate_runtime_request(&headers, &uri) {
-        return auth_error(error).into_response();
-    }
+    let auth_context =
+        match validate_runtime_request(&headers, &uri, state.config.deployment_security()) {
+            Ok(context) => context,
+            Err(error) => return auth_error(error).into_response(),
+        };
 
     if request.schema_version != RUNTIME_API_SCHEMA_VERSION {
         return AppError::new(
@@ -1128,19 +1130,23 @@ async fn start_session(
         capabilities: granted_capabilities,
     })
     .into_response();
-    apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
+    apply_runtime_headers(response.headers_mut(), &auth_context);
     response.headers_mut().insert(
         SET_COOKIE,
-        HeaderValue::from_str(&session_cookie_header(&operator_session))
-            .expect("session cookie contains only valid header characters"),
+        HeaderValue::from_str(&session_cookie_header(
+            &operator_session,
+            auth_context.cookie_secure,
+        ))
+        .expect("session cookie contains only valid header characters"),
     );
     response
 }
 
 async fn session_status(State(state): State<AppState>, headers: HeaderMap, uri: Uri) -> Response {
-    if let Err(response) = authenticate_runtime_request(&state, &headers, &uri) {
-        return response;
-    }
+    let auth_context = match authenticate_runtime_request(&state, &headers, &uri) {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
 
     let Some(active_session) = state
         .runtime_session
@@ -1154,7 +1160,15 @@ async fn session_status(State(state): State<AppState>, headers: HeaderMap, uri: 
     let session_id = active_session.session_id.clone();
     let status = match state.backend.status(session_id.clone()) {
         Ok(status) => status,
-        Err(error) => return backend_error_clearing_session(&state, &headers, &session_id, error),
+        Err(error) => {
+            return backend_error_clearing_session(
+                &state,
+                &headers,
+                &auth_context,
+                &session_id,
+                error,
+            );
+        }
     };
 
     let mut response = Json(SessionResponse {
@@ -1167,7 +1181,7 @@ async fn session_status(State(state): State<AppState>, headers: HeaderMap, uri: 
         backend_mode: status.backend_mode,
     })
     .into_response();
-    apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
+    apply_runtime_headers(response.headers_mut(), &auth_context);
     response
 }
 
@@ -1177,9 +1191,10 @@ async fn stop_session(
     uri: Uri,
     Json(request): Json<StopSessionRequest>,
 ) -> Response {
-    if let Err(response) = authenticate_runtime_request(&state, &headers, &uri) {
-        return response;
-    }
+    let auth_context = match authenticate_runtime_request(&state, &headers, &uri) {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
     if request.schema_version != RUNTIME_API_SCHEMA_VERSION {
         return bad_request("Unsupported schema version.").into_response();
     }
@@ -1193,7 +1208,13 @@ async fn stop_session(
     {
         Ok(stopped) => stopped,
         Err(error) => {
-            return backend_error_clearing_session(&state, &headers, &request.session_id, error);
+            return backend_error_clearing_session(
+                &state,
+                &headers,
+                &auth_context,
+                &request.session_id,
+                error,
+            );
         }
     };
     publish_stopped_event(&state, &stopped);
@@ -1210,19 +1231,20 @@ async fn stop_session(
         final_frame: stopped.final_frame,
     })
     .into_response();
-    apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
+    apply_runtime_headers(response.headers_mut(), &auth_context);
     response.headers_mut().insert(
         SET_COOKIE,
-        HeaderValue::from_str(&expired_session_cookie_header())
+        HeaderValue::from_str(&expired_session_cookie_header(auth_context.cookie_secure))
             .expect("expired session cookie contains only valid header characters"),
     );
     response
 }
 
 async fn run_status(State(state): State<AppState>, headers: HeaderMap, uri: Uri) -> Response {
-    if let Err(response) = authenticate_runtime_request(&state, &headers, &uri) {
-        return response;
-    }
+    let auth_context = match authenticate_runtime_request(&state, &headers, &uri) {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
     let session_id = match active_session_id(&state) {
         Ok(session_id) => session_id,
         Err(response) => return response,
@@ -1230,7 +1252,15 @@ async fn run_status(State(state): State<AppState>, headers: HeaderMap, uri: Uri)
 
     let status = match state.backend.status(session_id.clone()) {
         Ok(status) => status,
-        Err(error) => return backend_error_clearing_session(&state, &headers, &session_id, error),
+        Err(error) => {
+            return backend_error_clearing_session(
+                &state,
+                &headers,
+                &auth_context,
+                &session_id,
+                error,
+            );
+        }
     };
     if status.session_id != session_id {
         return auth_error(AuthError::BadSession).into_response();
@@ -1238,7 +1268,7 @@ async fn run_status(State(state): State<AppState>, headers: HeaderMap, uri: Uri)
     let status = project_active_capture(&state, status);
 
     let mut response = Json(RunStatusResponse::from(status)).into_response();
-    apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
+    apply_runtime_headers(response.headers_mut(), &auth_context);
     response
 }
 
@@ -1247,9 +1277,10 @@ async fn validation_status(
     headers: HeaderMap,
     uri: Uri,
 ) -> Response {
-    if let Err(response) = authenticate_runtime_request(&state, &headers, &uri) {
-        return response;
-    }
+    let auth_context = match authenticate_runtime_request(&state, &headers, &uri) {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
     if let Err(response) = active_session_id(&state) {
         return response;
     }
@@ -1258,14 +1289,15 @@ async fn validation_status(
         state.validation_status_snapshot(),
     ))
     .into_response();
-    apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
+    apply_runtime_headers(response.headers_mut(), &auth_context);
     response
 }
 
 async fn frame_current(State(state): State<AppState>, headers: HeaderMap, uri: Uri) -> Response {
-    if let Err(response) = authenticate_runtime_request(&state, &headers, &uri) {
-        return response;
-    }
+    let auth_context = match authenticate_runtime_request(&state, &headers, &uri) {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
     let session_id = match active_session_id(&state) {
         Ok(session_id) => session_id,
         Err(response) => return response,
@@ -1299,7 +1331,7 @@ async fn frame_current(State(state): State<AppState>, headers: HeaderMap, uri: U
         preview_hash: sha256_ref(&preview.png_bytes),
     })
     .into_response();
-    apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
+    apply_runtime_headers(response.headers_mut(), &auth_context);
     response
 }
 
@@ -1308,10 +1340,11 @@ async fn frame_current_image(
     headers: HeaderMap,
     uri: Uri,
 ) -> Response {
-    if let Err(response) = authenticate_runtime_request_allowing_frame_hint(&state, &headers, &uri)
-    {
-        return response;
-    }
+    let auth_context =
+        match authenticate_runtime_request_allowing_frame_hint(&state, &headers, &uri) {
+            Ok(context) => context,
+            Err(response) => return response,
+        };
     let requested_frame = match requested_frame_hint(&uri) {
         Ok(requested_frame) => requested_frame,
         Err(response) => return response,
@@ -1351,7 +1384,7 @@ async fn frame_current_image(
     };
 
     let mut response = Response::new(Body::from(preview.png_bytes));
-    apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
+    apply_runtime_headers(response.headers_mut(), &auth_context);
     response
         .headers_mut()
         .insert(CONTENT_TYPE, HeaderValue::from_static("image/png"));
@@ -1364,9 +1397,10 @@ async fn capture_trigger(
     uri: Uri,
     Json(request): Json<CaptureTriggerRequest>,
 ) -> Response {
-    if let Err(response) = authenticate_runtime_request(&state, &headers, &uri) {
-        return response;
-    }
+    let auth_context = match authenticate_runtime_request(&state, &headers, &uri) {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
     if request.schema_version != RUNTIME_API_SCHEMA_VERSION {
         return bad_request("Unsupported schema version.").into_response();
     }
@@ -1423,7 +1457,7 @@ async fn capture_trigger(
             publish_capture_event(&state, &request.session_id, &view);
 
             let mut response = Json(CaptureTriggerResponse::from(view)).into_response();
-            apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
+            apply_runtime_headers(response.headers_mut(), &auth_context);
             return response;
         }
         let backend_job = match state
@@ -1448,7 +1482,7 @@ async fn capture_trigger(
         publish_capture_event(&state, &request.session_id, &view);
 
         let mut response = Json(CaptureTriggerResponse::from(view)).into_response();
-        apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
+        apply_runtime_headers(response.headers_mut(), &auth_context);
         return response;
     }
 
@@ -1503,7 +1537,7 @@ async fn capture_trigger(
     publish_capture_event(&state, &request.session_id, &view);
 
     let mut response = Json(CaptureTriggerResponse::from(view)).into_response();
-    apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
+    apply_runtime_headers(response.headers_mut(), &auth_context);
     response
 }
 
@@ -1513,9 +1547,10 @@ async fn capture_job_status(
     uri: Uri,
     Path(job_id): Path<String>,
 ) -> Response {
-    if let Err(response) = authenticate_runtime_request(&state, &headers, &uri) {
-        return response;
-    }
+    let auth_context = match authenticate_runtime_request(&state, &headers, &uri) {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
     if !is_contract_id(&job_id) {
         return bad_request("Invalid capture job.").into_response();
     }
@@ -1524,7 +1559,7 @@ async fn capture_job_status(
             publish_capture_event(&state, &view.session_id, &view);
 
             let mut response = Json(CaptureJobResponse::from(view)).into_response();
-            apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
+            apply_runtime_headers(response.headers_mut(), &auth_context);
             return response;
         }
         let (session_id, requested_frame, scheduled_frame) =
@@ -1555,16 +1590,20 @@ async fn capture_job_status(
     publish_capture_event(&state, &view.session_id, &view);
 
     let mut response = Json(CaptureJobResponse::from(view)).into_response();
-    apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
+    apply_runtime_headers(response.headers_mut(), &auth_context);
     response
 }
 
 async fn capture_recent(State(state): State<AppState>, headers: HeaderMap, uri: Uri) -> Response {
-    if let Err(response) =
-        authenticate_runtime_request_allowing_query(&state, &headers, &uri, is_capture_recent_query)
-    {
-        return response;
-    }
+    let auth_context = match authenticate_runtime_request_allowing_query(
+        &state,
+        &headers,
+        &uri,
+        is_capture_recent_query,
+    ) {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
     let (offset, limit) = match capture_recent_window(&uri) {
         Ok(window) => window,
         Err(response) => return response,
@@ -1585,7 +1624,7 @@ async fn capture_recent(State(state): State<AppState>, headers: HeaderMap, uri: 
         next_cursor: view.next_cursor,
     })
     .into_response();
-    apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
+    apply_runtime_headers(response.headers_mut(), &auth_context);
     response
 }
 
@@ -1595,9 +1634,10 @@ async fn capture_detail(
     uri: Uri,
     Path(capture_id): Path<String>,
 ) -> Response {
-    if let Err(response) = authenticate_runtime_request(&state, &headers, &uri) {
-        return response;
-    }
+    let auth_context = match authenticate_runtime_request(&state, &headers, &uri) {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
     if !is_contract_id(&capture_id) {
         return bad_request("Invalid capture id.").into_response();
     }
@@ -1614,7 +1654,7 @@ async fn capture_detail(
     let mut detail = CaptureDetailResponse::from(view);
     detail.labels = state.labels.label_names_for_capture(&detail.capture_id);
     let mut response = Json(detail).into_response();
-    apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
+    apply_runtime_headers(response.headers_mut(), &auth_context);
     response
 }
 
@@ -1624,9 +1664,10 @@ async fn capture_features(
     uri: Uri,
     Path(capture_id): Path<String>,
 ) -> Response {
-    if let Err(response) = authenticate_runtime_request(&state, &headers, &uri) {
-        return response;
-    }
+    let auth_context = match authenticate_runtime_request(&state, &headers, &uri) {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
     if !active_session_capabilities(&state)
         .is_some_and(|capabilities| capabilities.privileged_features)
     {
@@ -1652,7 +1693,7 @@ async fn capture_features(
     };
 
     let mut response = Json(CaptureFeaturesResponse::from(view)).into_response();
-    apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
+    apply_runtime_headers(response.headers_mut(), &auth_context);
     response
 }
 
@@ -1662,10 +1703,11 @@ async fn capture_preview(
     uri: Uri,
     Path(capture_id): Path<String>,
 ) -> Response {
-    if let Err(response) = authenticate_runtime_request_allowing_frame_hint(&state, &headers, &uri)
-    {
-        return response;
-    }
+    let auth_context =
+        match authenticate_runtime_request_allowing_frame_hint(&state, &headers, &uri) {
+            Ok(context) => context,
+            Err(response) => return response,
+        };
     if let Err(response) = requested_frame_hint(&uri) {
         return response;
     }
@@ -1683,7 +1725,7 @@ async fn capture_preview(
     };
 
     let mut response = Response::new(Body::from(png));
-    apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
+    apply_runtime_headers(response.headers_mut(), &auth_context);
     response
         .headers_mut()
         .insert(CONTENT_TYPE, HeaderValue::from_static("image/png"));
@@ -1696,9 +1738,10 @@ async fn labels_apply(
     uri: Uri,
     Json(request): Json<LabelsRequest>,
 ) -> Response {
-    if let Err(response) = authenticate_runtime_request(&state, &headers, &uri) {
-        return response;
-    }
+    let auth_context = match authenticate_runtime_request(&state, &headers, &uri) {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
     if request.schema_version != RUNTIME_API_SCHEMA_VERSION {
         return bad_request("Unsupported schema version.").into_response();
     }
@@ -1742,17 +1785,18 @@ async fn labels_apply(
     publish_label_event(&state, outcome.label_revision, outcome.applied);
 
     let mut response = Json(LabelsResponse::from(outcome)).into_response();
-    apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
+    apply_runtime_headers(response.headers_mut(), &auth_context);
     response
 }
 
 async fn labels_snapshot(State(state): State<AppState>, headers: HeaderMap, uri: Uri) -> Response {
-    if let Err(response) = authenticate_runtime_request(&state, &headers, &uri) {
-        return response;
-    }
+    let auth_context = match authenticate_runtime_request(&state, &headers, &uri) {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
 
     let mut response = Json(LabelsSnapshotResponse::from(state.labels.snapshot())).into_response();
-    apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
+    apply_runtime_headers(response.headers_mut(), &auth_context);
     response
 }
 
@@ -1780,9 +1824,10 @@ async fn input_ws_handshake(
     headers: HeaderMap,
     uri: Uri,
 ) -> Response {
-    if let Err(response) = authenticate_runtime_request(&state, &headers, &uri) {
-        return response;
-    }
+    let auth_context = match authenticate_runtime_request(&state, &headers, &uri) {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
 
     let Some(active_session) = state
         .runtime_session
@@ -1802,7 +1847,7 @@ async fn input_ws_handshake(
             serve_input_socket(socket, backend, ws_input, session_id, private_config)
         })
         .into_response();
-    apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
+    apply_runtime_headers(response.headers_mut(), &auth_context);
     response
 }
 
@@ -1812,9 +1857,10 @@ async fn events_ws_handshake(
     headers: HeaderMap,
     uri: Uri,
 ) -> Response {
-    if let Err(response) = authenticate_runtime_request(&state, &headers, &uri) {
-        return response;
-    }
+    let auth_context = match authenticate_runtime_request(&state, &headers, &uri) {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
 
     let session_id = match active_session_id(&state) {
         Ok(session_id) => session_id,
@@ -1845,7 +1891,7 @@ async fn events_ws_handshake(
             )
         })
         .into_response();
-    apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
+    apply_runtime_headers(response.headers_mut(), &auth_context);
     response
 }
 
@@ -1856,9 +1902,10 @@ fn run_state_transition(
     request: SessionOnlyRequest,
     transition: RunTransition,
 ) -> Response {
-    if let Err(response) = authenticate_runtime_request(&state, &headers, &uri) {
-        return response;
-    }
+    let auth_context = match authenticate_runtime_request(&state, &headers, &uri) {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
     if request.schema_version != RUNTIME_API_SCHEMA_VERSION {
         return bad_request("Unsupported schema version.").into_response();
     }
@@ -1894,7 +1941,7 @@ fn run_state_transition(
         current_frame: boundary.current_frame,
     })
     .into_response();
-    apply_runtime_headers(response.headers_mut(), Some(ALLOWED_ORIGIN));
+    apply_runtime_headers(response.headers_mut(), &auth_context);
     response
 }
 
@@ -1919,13 +1966,15 @@ fn authenticate_runtime_request(
     state: &AppState,
     headers: &HeaderMap,
     uri: &Uri,
-) -> Result<(), Response> {
-    if let Err(error) = validate_runtime_request(headers, uri) {
-        return Err(auth_error(error).into_response());
-    }
+) -> Result<RuntimeAuthContext, Response> {
+    let auth_context =
+        match validate_runtime_request(headers, uri, state.config.deployment_security()) {
+            Ok(context) => context,
+            Err(error) => return Err(auth_error(error).into_response()),
+        };
 
     match state.auth.authenticate_headers(headers) {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(auth_context),
         Err(AuthError::ExpiredSession) => {
             if let Err(error) = cleanup_runtime_session(state, StopReason::SessionReplaced) {
                 return Err(backend_error(error).into_response());
@@ -1940,7 +1989,7 @@ fn authenticate_runtime_request_allowing_frame_hint(
     state: &AppState,
     headers: &HeaderMap,
     uri: &Uri,
-) -> Result<(), Response> {
+) -> Result<RuntimeAuthContext, Response> {
     authenticate_runtime_request_allowing_query(state, headers, uri, is_frame_hint_query)
 }
 
@@ -1949,13 +1998,15 @@ fn authenticate_runtime_request_allowing_query(
     headers: &HeaderMap,
     uri: &Uri,
     allowed_query: fn(&str) -> bool,
-) -> Result<(), Response> {
+) -> Result<RuntimeAuthContext, Response> {
     if uri.query().is_some_and(allowed_query) {
-        if let Err(error) = validate_origin(headers) {
-            return Err(auth_error(error).into_response());
-        }
+        let auth_context =
+            match validate_runtime_headers(headers, state.config.deployment_security()) {
+                Ok(context) => context,
+                Err(error) => return Err(auth_error(error).into_response()),
+            };
         match state.auth.authenticate_headers(headers) {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(auth_context),
             Err(AuthError::ExpiredSession) => {
                 if let Err(error) = cleanup_runtime_session(state, StopReason::SessionReplaced) {
                     return Err(backend_error(error).into_response());
@@ -2126,6 +2177,7 @@ fn clear_runtime_session_state(state: &AppState, session_id: &str) -> bool {
 fn backend_error_clearing_session(
     state: &AppState,
     headers: &HeaderMap,
+    auth_context: &RuntimeAuthContext,
     session_id: &str,
     error: BackendError,
 ) -> Response {
@@ -2134,7 +2186,7 @@ fn backend_error_clearing_session(
         let mut response = backend_error(error).into_response();
         response.headers_mut().insert(
             SET_COOKIE,
-            HeaderValue::from_str(&expired_session_cookie_header())
+            HeaderValue::from_str(&expired_session_cookie_header(auth_context.cookie_secure))
                 .expect("expired session cookie contains only valid header characters"),
         );
         response
@@ -2300,7 +2352,12 @@ async fn not_found() -> AppError {
     )
 }
 
-async fn static_or_not_found(State(state): State<AppState>, method: Method, uri: Uri) -> Response {
+async fn static_or_not_found(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    method: Method,
+    uri: Uri,
+) -> Response {
     if method != Method::GET && method != Method::HEAD {
         return not_found().await.into_response();
     }
@@ -2311,8 +2368,15 @@ async fn static_or_not_found(State(state): State<AppState>, method: Method, uri:
     let Some(root) = state.config.private_config().static_publish_root() else {
         return not_found().await.into_response();
     };
+    let Some(profile) = state
+        .config
+        .deployment_security()
+        .profile_for_host_header(headers.get(HOST).and_then(|value| value.to_str().ok()))
+    else {
+        return not_found().await.into_response();
+    };
 
-    match static_file_response(root, uri.path(), method == Method::HEAD) {
+    match static_file_response(root, uri.path(), method == Method::HEAD, profile) {
         Ok(Some(response)) => response,
         Ok(None) => not_found().await.into_response(),
         Err(error) => error.into_response(),
@@ -2332,6 +2396,7 @@ fn static_file_response(
     root: &StdPath,
     request_path: &str,
     head_only: bool,
+    profile: &DeploymentProfile,
 ) -> Result<Option<Response>, AppError> {
     let requested = static_relative_path(request_path)?;
     let path = match safe_static_file(root, &requested)? {
@@ -2353,7 +2418,7 @@ fn static_file_response(
         .header(CONTENT_TYPE, static_content_type(&path))
         .body(body)
         .map_err(|_| not_found_error())?;
-    apply_static_headers(response.headers_mut());
+    apply_static_headers(response.headers_mut(), profile);
     Ok(Some(response))
 }
 
@@ -2916,11 +2981,12 @@ fn apply_no_store_headers(headers: &mut HeaderMap) {
     );
 }
 
-fn apply_static_headers(headers: &mut HeaderMap) {
+fn apply_static_headers(headers: &mut HeaderMap, profile: &DeploymentProfile) {
     apply_no_store_headers(headers);
     headers.insert(
         HeaderName::from_static("content-security-policy"),
-        HeaderValue::from_static(STATIC_CSP),
+        HeaderValue::from_str(&profile.static_csp())
+            .expect("deployment profile CSP contains only header-safe values"),
     );
     headers.insert(
         HeaderName::from_static("referrer-policy"),
@@ -2932,15 +2998,10 @@ fn apply_static_headers(headers: &mut HeaderMap) {
     );
 }
 
-fn apply_runtime_headers(headers: &mut HeaderMap, origin: Option<&'static str>) {
+fn apply_runtime_headers(headers: &mut HeaderMap, auth_context: &RuntimeAuthContext) {
     apply_no_store_headers(headers);
-    if let Some(origin) = origin {
-        headers.insert(
-            ACCESS_CONTROL_ALLOW_ORIGIN,
-            HeaderValue::from_static(origin),
-        );
-        headers.insert(VARY, HeaderValue::from_static("Origin"));
-    }
+    headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, auth_context.origin.clone());
+    headers.insert(VARY, HeaderValue::from_static("Origin"));
 }
 
 fn bad_request(message: &'static str) -> AppError {

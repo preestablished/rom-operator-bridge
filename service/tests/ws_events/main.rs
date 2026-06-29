@@ -116,6 +116,10 @@ async fn event_websocket_handshake_includes_runtime_security_headers() {
         .headers_mut()
         .insert("Origin", HeaderValue::from_static(ALLOWED_ORIGIN));
     request.headers_mut().insert(
+        HeaderName::from_static("host"),
+        HeaderValue::from_static("rombridge.birb.homes"),
+    );
+    request.headers_mut().insert(
         HeaderName::from_static("cookie"),
         HeaderValue::from_str(&cookie).expect("cookie header parses"),
     );
@@ -323,6 +327,10 @@ impl WsServer {
                 .headers_mut()
                 .insert("Origin", HeaderValue::from_static(origin));
         }
+        request.headers_mut().insert(
+            HeaderName::from_static("host"),
+            HeaderValue::from_static("rombridge.birb.homes"),
+        );
         if let Some(cookie) = cookie {
             request.headers_mut().insert(
                 HeaderName::from_static("cookie"),

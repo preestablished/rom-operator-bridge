@@ -1,6 +1,9 @@
 use rom_operator_bridge_service::{
     backend::BackendMode,
-    config::{ConfigError, ENV_BACKEND_MODE, ENV_BIND_ADDR, ServiceConfig},
+    config::{
+        ConfigError, ENV_ALLOWED_ORIGINS, ENV_BACKEND_MODE, ENV_BIND_ADDR, ENV_COOKIE_SECURE,
+        ENV_DEPLOYMENT_PROFILES, ENV_EXPOSURE_MODE, ENV_PUBLIC_ORIGIN, ServiceConfig,
+    },
     private_config::{
         ENV_CAPTURE_SPEC_REF, ENV_CONFIG_FILE, ENV_CREATE_VM_CONFIG_REF, ENV_HYPERVISOR_ENDPOINT,
         ENV_OPERATOR_CREDENTIAL, ENV_PRIVATE_ROOT, ENV_PRIVATE_ROOT_ALIAS, ENV_REAL_SNAPSHOT_REF,
@@ -20,6 +23,9 @@ use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
 
+const HTTPS_ORIGIN: &str = "https://rombridge.birb.homes";
+const TAILSCALE_ORIGIN: &str = "http://tailrombridge.birb.homes";
+
 #[test]
 fn placeholder_config_loads_without_private_values() {
     let config = ServiceConfig::from_pairs([(ENV_BIND_ADDR, "127.0.0.1:0")]).expect("config loads");
@@ -30,6 +36,141 @@ fn placeholder_config_loads_without_private_values() {
     assert!(config.private_config().static_publish_root().is_none());
     assert!(!config.private_config().operator_credential_configured());
     assert!(!config.private_config().session_secret_configured());
+}
+
+#[test]
+fn deployment_profiles_load_https_and_tailscale_http_security_settings() {
+    let config = ServiceConfig::from_pairs([
+        (ENV_DEPLOYMENT_PROFILES, "https-origin,tailscale-http"),
+        (
+            "ROM_OPERATOR_BRIDGE_PROFILE_HTTPS_ORIGIN_PUBLIC_ORIGIN",
+            HTTPS_ORIGIN,
+        ),
+        (
+            "ROM_OPERATOR_BRIDGE_PROFILE_TAILSCALE_HTTP_PUBLIC_ORIGIN",
+            TAILSCALE_ORIGIN,
+        ),
+        (
+            "ROM_OPERATOR_BRIDGE_PROFILE_TAILSCALE_HTTP_ALLOWED_ORIGINS",
+            TAILSCALE_ORIGIN,
+        ),
+        (
+            "ROM_OPERATOR_BRIDGE_PROFILE_TAILSCALE_HTTP_COOKIE_SECURE",
+            "false",
+        ),
+        (
+            "ROM_OPERATOR_BRIDGE_PROFILE_TAILSCALE_HTTP_EXPOSURE_MODE",
+            "tailscale-http",
+        ),
+    ])
+    .expect("deployment profiles load");
+
+    let https = config
+        .deployment_security()
+        .profile_for_origin(HTTPS_ORIGIN)
+        .expect("https origin is accepted");
+    assert_eq!(https.id(), "https-origin");
+    assert!(https.cookie_secure());
+    assert_eq!(
+        https.static_csp(),
+        "default-src 'self'; connect-src 'self' wss://rombridge.birb.homes; img-src 'self' blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+    );
+
+    let tailscale = config
+        .deployment_security()
+        .profile_for_origin(TAILSCALE_ORIGIN)
+        .expect("tailscale origin is accepted");
+    assert_eq!(tailscale.id(), "tailscale-http");
+    assert!(!tailscale.cookie_secure());
+    assert_eq!(
+        tailscale.static_csp(),
+        "default-src 'self'; connect-src 'self' ws://tailrombridge.birb.homes; img-src 'self' blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+    );
+    assert_eq!(
+        config
+            .deployment_security()
+            .profile_for_host_header(Some("tailrombridge.birb.homes:80"))
+            .map(|profile| profile.id()),
+        Some("tailscale-http")
+    );
+    assert_eq!(
+        config
+            .deployment_security()
+            .profile_for_host_header(Some("rombridge.birb.homes:443"))
+            .map(|profile| profile.id()),
+        Some("https-origin")
+    );
+}
+
+#[test]
+fn insecure_cookie_policy_requires_tailscale_http_origins() {
+    assert_eq!(
+        ServiceConfig::from_pairs([
+            (ENV_COOKIE_SECURE, "false"),
+            (ENV_PUBLIC_ORIGIN, TAILSCALE_ORIGIN),
+            (ENV_ALLOWED_ORIGINS, TAILSCALE_ORIGIN),
+        ]),
+        Err(ConfigError::InvalidCookiePolicy {
+            env: ENV_COOKIE_SECURE
+        })
+    );
+
+    assert_eq!(
+        ServiceConfig::from_pairs([
+            (ENV_COOKIE_SECURE, "false"),
+            (ENV_PUBLIC_ORIGIN, HTTPS_ORIGIN),
+            (ENV_ALLOWED_ORIGINS, HTTPS_ORIGIN),
+            (ENV_EXPOSURE_MODE, "tailscale-http"),
+        ]),
+        Err(ConfigError::InvalidCookiePolicy {
+            env: ENV_COOKIE_SECURE
+        })
+    );
+
+    ServiceConfig::from_pairs([
+        (ENV_COOKIE_SECURE, "false"),
+        (ENV_PUBLIC_ORIGIN, TAILSCALE_ORIGIN),
+        (ENV_ALLOWED_ORIGINS, TAILSCALE_ORIGIN),
+        (ENV_EXPOSURE_MODE, "tailscale-http"),
+    ])
+    .expect("tailscale http can opt out of secure cookies");
+}
+
+#[test]
+fn deployment_profiles_reject_ambiguous_public_hosts() {
+    assert_eq!(
+        ServiceConfig::from_pairs([
+            (ENV_DEPLOYMENT_PROFILES, "one,two"),
+            (
+                "ROM_OPERATOR_BRIDGE_PROFILE_ONE_PUBLIC_ORIGIN",
+                "https://rombridge.birb.homes",
+            ),
+            (
+                "ROM_OPERATOR_BRIDGE_PROFILE_TWO_PUBLIC_ORIGIN",
+                "https://rombridge.birb.homes:443",
+            ),
+        ]),
+        Err(ConfigError::DuplicateDeploymentProfile {
+            env: ENV_DEPLOYMENT_PROFILES
+        })
+    );
+
+    assert_eq!(
+        ServiceConfig::from_pairs([
+            (ENV_DEPLOYMENT_PROFILES, "one,two"),
+            (
+                "ROM_OPERATOR_BRIDGE_PROFILE_ONE_PUBLIC_ORIGIN",
+                "https://shared.example",
+            ),
+            (
+                "ROM_OPERATOR_BRIDGE_PROFILE_TWO_PUBLIC_ORIGIN",
+                "http://shared.example",
+            ),
+        ]),
+        Err(ConfigError::DuplicateDeploymentProfile {
+            env: ENV_DEPLOYMENT_PROFILES
+        })
+    );
 }
 
 #[cfg(unix)]
