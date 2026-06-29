@@ -149,8 +149,12 @@ prove those requests do not receive the bridge UI or runtime API.
 
 ## Traefik Alternative
 
-If the operator prefers K3s/Traefik, add a separate sanitized manifest instead
-of modifying the HTTPS route in place.
+For K3s/Traefik, use the separate sanitized manifest instead of modifying the
+HTTPS route in place:
+
+```text
+deploy/k8s/rombridge-tailscale-http-ingress.yaml
+```
 
 Expected shape:
 
@@ -162,6 +166,7 @@ metadata:
   namespace: rom-operator-bridge
   annotations:
     traefik.ingress.kubernetes.io/router.entrypoints: web
+    traefik.ingress.kubernetes.io/router.priority: "100"
 spec:
   ingressClassName: traefik
   rules:
@@ -183,6 +188,11 @@ Internet-facing HTTP listener.
 
 If Traefik is used, add an equivalent wrong-Host rejection route or middleware
 and prove it with the Tailscale validation checker.
+
+If `tailrombridge.birb.homes` serves the Apache `birb.homes` page from the
+`birb-homes` namespace, the Tailscale HTTP Host rule is not active or not taking
+priority. Confirm the bridge Ingress exists on the `web` entrypoint and points
+to the `rom-operator-bridge` Service before debugging bridge code.
 
 ## Service Install
 

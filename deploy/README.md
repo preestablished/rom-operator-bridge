@@ -125,6 +125,37 @@ KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl apply -f deploy/k8s/rombridge-ingre
 KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl apply -f <private-endpoint-manifest>
 ```
 
+## Tailscale HTTP Route
+
+The optional Tailscale-only HTTP route is a separate Traefik `web` entrypoint
+Ingress:
+
+```text
+deploy/k8s/rombridge-tailscale-http-ingress.yaml
+```
+
+It routes `http://tailrombridge.birb.homes/` to the existing
+`rom-operator-bridge` Service on port `7410`. It intentionally does not enable
+TLS. Apply it only after the base Namespace, Service, and private Endpoints
+exist:
+
+```sh
+KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl apply -f deploy/k8s/rombridge-ingress.yaml
+KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl apply -f <private-endpoint-manifest>
+KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl apply -f deploy/k8s/rombridge-tailscale-http-ingress.yaml
+```
+
+If `tailrombridge.birb.homes` serves the Apache `birb.homes` page from the
+`birb-homes` namespace, Traefik is still routing that Host to the fallback site
+instead of this bridge Ingress. Check Traefik route state and Apache access logs
+for the request while keeping raw logs private.
+
+Rollback only the Tailscale HTTP route:
+
+```sh
+KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl delete -f deploy/k8s/rombridge-tailscale-http-ingress.yaml
+```
+
 ## Validation
 
 Run validation only with private cookie, forbid-file, static-root, and network
@@ -140,6 +171,26 @@ ROM_BRIDGE_OUTSIDE_PROBE_RESULT_FILE=<private-outside-probe-file> \
 ROM_BRIDGE_OUTSIDE_PROBE_REVIEWED=1 \
 ROM_BRIDGE_FORBID_FILE=<private-forbid-file> \
 scripts/deployment-network-check.sh
+```
+
+For the Tailscale HTTP route, first prepare private validation inputs, then run
+the route-specific checker:
+
+```sh
+python3 scripts/prepare-tailscale-http-validation-inputs.py \
+  --start-session-json <private-start-session-json> \
+  --cookie-jar <private-cookie-jar> \
+  --session-response <private-session-response-json> \
+  --network-evidence <private-network-evidence-file>
+
+ROM_BRIDGE_TAILSCALE_VALIDATION_DIR=<private-validation-dir>/tailscale-http/<run-id> \
+ROM_BRIDGE_TAILSCALE_SESSION_COOKIE_FILE=<private-cookie-jar> \
+ROM_BRIDGE_TAILSCALE_NETWORK_EVIDENCE_FILE=<private-network-evidence-file> \
+ROM_BRIDGE_TAILSCALE_NETWORK_EVIDENCE_REVIEWED=1 \
+ROM_BRIDGE_TAILSCALE_OUTSIDE_PROBE_RESULT_FILE=<private-outside-probe-file> \
+ROM_BRIDGE_TAILSCALE_OUTSIDE_PROBE_REVIEWED=1 \
+ROM_BRIDGE_TAILSCALE_FORBID_FILE=<private-forbid-file> \
+scripts/tailscale-http-check.sh
 ```
 
 Run the redaction gate separately with the same private forbid file:
