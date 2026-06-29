@@ -80,6 +80,48 @@ sudo python3 scripts/validate-operator-env.py \
 
 ## 2. Build And Install The Release
 
+Recommended two-phase deploy:
+
+```sh
+scripts/build-release.sh
+```
+
+Install or refresh the audited root-owned installer:
+
+```sh
+sudo install -d -o root -g root -m 0755 \
+  /usr/local/libexec/rom-operator-bridge
+sudo install -o root -g root -m 0755 \
+  deploy/admin/install-release-root.sh \
+  /usr/local/libexec/rom-operator-bridge/install-release
+```
+
+Optional narrow passwordless sudo for future deploys:
+
+```sh
+printf '%s\n' \
+  'infra-admin ALL=(root) NOPASSWD: /usr/local/libexec/rom-operator-bridge/install-release' \
+  | sudo tee /etc/sudoers.d/rom-operator-bridge-deploy >/dev/null
+sudo chmod 0440 /etc/sudoers.d/rom-operator-bridge-deploy
+sudo visudo -cf /etc/sudoers.d/rom-operator-bridge-deploy
+```
+
+Do not whitelist a script inside this repository checkout. The sudoers command
+must point at the root-owned installed copy and must not include `SETENV`,
+wildcards, or arbitrary arguments.
+
+Deploy the built release:
+
+```sh
+sudo -n /usr/local/libexec/rom-operator-bridge/install-release
+```
+
+The installer performs the release-directory install, static-root env update,
+systemd unit install, restart, and sanitized pointer/service checks. Private
+network validation remains step 5.
+
+Manual fallback:
+
 Build the service and UI:
 
 ```sh
@@ -186,7 +228,7 @@ Run the deployment-network checker with private evidence inputs:
 ```sh
 ROM_BRIDGE_VALIDATION_DIR=<private-validation-dir>/deployment-network-kut/<run-id> \
 ROM_BRIDGE_COOKIE_CURL_CONFIG_FILE=<private-cookie-curl-config> \
-ROM_BRIDGE_STATIC_PUBLISH_ROOT=/var/lib/rom-operator-bridge/static/current \
+ROM_BRIDGE_STATIC_PUBLISH_ROOT=<resolved-static-release-dir> \
 ROM_BRIDGE_NETWORK_EVIDENCE_FILE=<private-network-evidence-file> \
 ROM_BRIDGE_NETWORK_EVIDENCE_REVIEWED=1 \
 ROM_BRIDGE_OUTSIDE_PROBE_RESULT_FILE=<private-outside-probe-file> \
@@ -236,4 +278,7 @@ sudo systemctl restart rom-operator-bridge.service
 ```
 
 If the env file changed during the failed deployment, restore the private env
-backup before restarting.
+backup before restarting. The root installer stores env backups under
+`/etc/rom-operator-bridge/backups/` using the release id; restore the matching
+backup when rolling back a release that changed
+`ROM_OPERATOR_BRIDGE_STATIC_PUBLISH_ROOT`.

@@ -9,6 +9,7 @@ const TEXT_EXTENSIONS = new Set([
   ".json",
   ".md",
   ".mjs",
+  ".sh",
   ".service",
   ".svg",
   ".toml",

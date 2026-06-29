@@ -42,7 +42,57 @@ ROM_OPERATOR_BRIDGE_SESSION_SECRET=<session-secret>
 Real backend mode also requires the real backend handoff values documented in
 `docs/runbook.md` and `service/src/private_config.rs`.
 
-## Build And Install
+## Two-Phase Build And Install
+
+Builds must run as the unprivileged operator. Privileged install/restart work
+must run from a root-owned copy of the installer, not from this user-writable
+checkout.
+
+Build:
+
+```sh
+scripts/build-release.sh
+```
+
+Install the audited root installer once, or whenever its committed content
+changes:
+
+```sh
+sudo install -d -o root -g root -m 0755 \
+  /usr/local/libexec/rom-operator-bridge
+sudo install -o root -g root -m 0755 \
+  deploy/admin/install-release-root.sh \
+  /usr/local/libexec/rom-operator-bridge/install-release
+```
+
+Optional narrow passwordless sudo for future Codex-driven deploys:
+
+```sh
+printf '%s\n' \
+  'infra-admin ALL=(root) NOPASSWD: /usr/local/libexec/rom-operator-bridge/install-release' \
+  | sudo tee /etc/sudoers.d/rom-operator-bridge-deploy >/dev/null
+sudo chmod 0440 /etc/sudoers.d/rom-operator-bridge-deploy
+sudo visudo -cf /etc/sudoers.d/rom-operator-bridge-deploy
+```
+
+Do not add `SETENV`, wildcards, arbitrary arguments, or a sudoers entry for a
+script in this repository checkout. The installer accepts no arguments and uses
+fixed deployment paths. If the checkout path changes, update and reinstall the
+root-owned copy after review.
+
+Deploy the already-built release:
+
+```sh
+sudo -n /usr/local/libexec/rom-operator-bridge/install-release
+```
+
+The installer copies the built service binary and static UI into timestamped
+release directories, updates `previous` and `current`, backs up the private env
+file, points `ROM_OPERATOR_BRIDGE_STATIC_PUBLISH_ROOT` at the resolved static
+release directory, installs the hardened systemd unit from embedded content,
+restarts the service, and prints only sanitized PASS/FAIL status.
+
+## Manual Build And Install
 
 Build:
 
@@ -215,3 +265,6 @@ sudo systemctl restart rom-operator-bridge.service
 ```
 
 If the env file changed, restore the operator-private backup before restart.
+The root installer stores env backups under `/etc/rom-operator-bridge/backups/`
+using the release id; restore the matching backup when rolling back a release
+that changed `ROM_OPERATOR_BRIDGE_STATIC_PUBLISH_ROOT`.

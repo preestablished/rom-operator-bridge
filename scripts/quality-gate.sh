@@ -86,4 +86,12 @@ else
   skip_step "scripts/redaction-gate.sh not present; static redaction gate is deferred to bead rom-operator-bridge-25u"
 fi
 
+if [[ -f "$ROOT_DIR/scripts/build-release.sh" || -f "$ROOT_DIR/deploy/admin/install-release-root.sh" ]]; then
+  need_command bash "deployment helper syntax check"
+  [[ -f "$ROOT_DIR/scripts/build-release.sh" ]] &&
+    run_step "build release helper syntax" bash -n scripts/build-release.sh
+  [[ -f "$ROOT_DIR/deploy/admin/install-release-root.sh" ]] &&
+    run_step "root install helper syntax" bash -n deploy/admin/install-release-root.sh
+fi
+
 printf '\nQuality gate passed.\n'
