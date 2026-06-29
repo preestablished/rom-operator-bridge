@@ -74,6 +74,57 @@ describe("capture review and label drawer", () => {
     );
   });
 
+  it("renders captures without previews without requesting a broken preview image", async () => {
+    const client = mockClient({
+      sessionStatus: vi.fn().mockResolvedValue(activeSessionResponse()),
+      runStatus: vi.fn().mockResolvedValue(runStatusResponse()),
+      currentFrame: vi.fn().mockResolvedValue(frameCurrentResponse()),
+      recentCaptures: vi.fn().mockResolvedValue(
+        captureRecentResponse({
+          captures: [
+            {
+              capture_id: "capture-real",
+              frame: 88,
+              status: "completed",
+              labelable: true,
+              has_preview: false,
+              labels: [],
+              created_at: "2026-06-24T09:03:00Z"
+            }
+          ]
+        })
+      ),
+      captureDetail: vi.fn().mockResolvedValue(
+        captureDetailResponse({
+          capture_id: "capture-real",
+          frame: 88,
+          has_preview: false,
+          preview_image_url: null,
+          privileged_features_available: false,
+          labels: [],
+          sanitized_provenance: {
+            capture_source: "hypervisor",
+            layout_hash: "sha256:layout-public",
+            capture_spec_hash: "private-capture-spec",
+            map_hash: "sha256:map-public"
+          }
+        })
+      ),
+      labelsSnapshot: vi.fn().mockResolvedValue(labelsSnapshotResponse()),
+      captureFeatures: vi.fn()
+    });
+    const root = document.createElement("div");
+
+    mountOperatorApp(root, config, client, null);
+    await flushPromises();
+
+    expect(root.querySelector("[data-capture-preview]")).toBeNull();
+    expect(root.querySelector(".capture-preview-empty")?.textContent).toContain(
+      "Preview unavailable"
+    );
+    expect(root.textContent).toContain("capture-real");
+  });
+
   it("renders unavailable privileged feature maps without calling the privileged route", async () => {
     const captureFeatures = vi.fn().mockResolvedValue(captureFeaturesResponse());
     const client = mockClient({
@@ -208,6 +259,7 @@ describe("capture review and label drawer", () => {
       captureDetailResponse({
         capture_id: captureId,
         frame: captureId === "capture-004" ? 46 : 43,
+        has_preview: true,
         preview_image_url: `/api/capture/${captureId}/preview`,
         labels: labelsByCapture.get(captureId) ?? []
       })
@@ -615,6 +667,7 @@ function captureDetailResponse(overrides: Partial<CaptureDetailResponse> = {}): 
     frame: 43,
     status: "completed",
     labelable: true,
+    has_preview: true,
     preview_image_url: "/api/capture/capture-001/preview",
     privileged_features_available: true,
     labels: ["first_boss", "needs_review"],

@@ -1,9 +1,11 @@
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
+    future::Future,
     str::FromStr,
     sync::{Arc, Mutex, mpsc},
     thread,
+    time::Duration,
 };
 use thiserror::Error;
 
@@ -28,6 +30,9 @@ use crate::{
     private_config::{BridgePrivateConfig, RealRuntimeConfig},
     real_capture::{ResolvedCaptureSpec, resolve_capture_spec},
 };
+
+const REAL_WORKER_RPC_TIMEOUT: Duration = Duration::from_secs(15);
+const REAL_WORKER_REPLY_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1111,16 +1116,24 @@ impl BridgeBackend for RealBackend {
 
         let slot = match self.worker.status(session.lease.slot_id) {
             Ok(slot) => slot,
-            Err(error) => {
-                let mut inner = self.inner.lock().expect("real backend mutex poisoned");
-                if inner
-                    .active
-                    .as_ref()
-                    .is_some_and(|active| active.session_id == session.session_id)
-                {
-                    inner.active = None;
-                }
-                return Err(error.into());
+            Err(_) => {
+                let status = {
+                    let mut inner = self.inner.lock().expect("real backend mutex poisoned");
+                    let active = inner
+                        .active
+                        .as_mut()
+                        .filter(|active| active.session_id == session.session_id)
+                        .ok_or(BackendError::BackendUnavailable)?;
+                    active.state = SessionState::Faulted;
+                    active.input_in_flight = false;
+                    active.status(self.mode())
+                };
+                let _ = self.append_real_event(
+                    &session.run_id,
+                    "session_faulted",
+                    "real backend status check failed",
+                );
+                return Ok(status);
             }
         };
 
@@ -1742,8 +1755,7 @@ impl RealWorkerThread {
         self.tx
             .send(RealWorkerCommand::Start { command, reply })
             .map_err(|_| RealWorkerFailure::BackendUnavailable)?;
-        rx.recv()
-            .map_err(|_| RealWorkerFailure::BackendUnavailable)?
+        recv_worker_reply(rx)
     }
 
     fn stop(&self, lease: dh::Lease) -> RealWorkerResult<()> {
@@ -1751,8 +1763,7 @@ impl RealWorkerThread {
         self.tx
             .send(RealWorkerCommand::Stop { lease, reply })
             .map_err(|_| RealWorkerFailure::BackendUnavailable)?;
-        rx.recv()
-            .map_err(|_| RealWorkerFailure::BackendUnavailable)?
+        recv_worker_reply(rx)
     }
 
     fn pause(&self, lease: dh::Lease) -> RealWorkerResult<RealPauseOutcome> {
@@ -1760,8 +1771,7 @@ impl RealWorkerThread {
         self.tx
             .send(RealWorkerCommand::Pause { lease, reply })
             .map_err(|_| RealWorkerFailure::BackendUnavailable)?;
-        rx.recv()
-            .map_err(|_| RealWorkerFailure::BackendUnavailable)?
+        recv_worker_reply(rx)
     }
 
     fn resume(&self, lease: dh::Lease) -> RealWorkerResult<RealRunOutcome> {
@@ -1769,8 +1779,7 @@ impl RealWorkerThread {
         self.tx
             .send(RealWorkerCommand::Resume { lease, reply })
             .map_err(|_| RealWorkerFailure::BackendUnavailable)?;
-        rx.recv()
-            .map_err(|_| RealWorkerFailure::BackendUnavailable)?
+        recv_worker_reply(rx)
     }
 
     fn status(&self, slot_id: u64) -> RealWorkerResult<RealSlotStatus> {
@@ -1778,8 +1787,7 @@ impl RealWorkerThread {
         self.tx
             .send(RealWorkerCommand::Status { slot_id, reply })
             .map_err(|_| RealWorkerFailure::BackendUnavailable)?;
-        rx.recv()
-            .map_err(|_| RealWorkerFailure::BackendUnavailable)?
+        recv_worker_reply(rx)
     }
 
     fn framebuffer(&self, lease: dh::Lease) -> RealWorkerResult<RealFramebufferOutcome> {
@@ -1787,8 +1795,7 @@ impl RealWorkerThread {
         self.tx
             .send(RealWorkerCommand::Framebuffer { lease, reply })
             .map_err(|_| RealWorkerFailure::BackendUnavailable)?;
-        rx.recv()
-            .map_err(|_| RealWorkerFailure::BackendUnavailable)?
+        recv_worker_reply(rx)
     }
 
     fn frame_counter(&self, lease: dh::Lease) -> RealWorkerResult<RealFrameCounterOutcome> {
@@ -1796,8 +1803,7 @@ impl RealWorkerThread {
         self.tx
             .send(RealWorkerCommand::FrameCounter { lease, reply })
             .map_err(|_| RealWorkerFailure::BackendUnavailable)?;
-        rx.recv()
-            .map_err(|_| RealWorkerFailure::BackendUnavailable)?
+        recv_worker_reply(rx)
     }
 
     fn inject_input(
@@ -1815,8 +1821,7 @@ impl RealWorkerThread {
                 reply,
             })
             .map_err(|_| RealWorkerFailure::BackendUnavailable)?;
-        rx.recv()
-            .map_err(|_| RealWorkerFailure::BackendUnavailable)?
+        recv_worker_reply(rx)
     }
 
     fn capture(
@@ -1832,13 +1837,17 @@ impl RealWorkerThread {
                 reply,
             })
             .map_err(|_| RealWorkerFailure::BackendUnavailable)?;
-        rx.recv()
-            .map_err(|_| RealWorkerFailure::BackendUnavailable)?
+        recv_worker_reply(rx)
     }
 }
 
 type RealWorkerResult<T> = Result<T, RealWorkerFailure>;
 type WorkerClient = dh::hypervisor_worker_client::HypervisorWorkerClient<tonic::transport::Channel>;
+
+fn recv_worker_reply<T>(rx: mpsc::Receiver<RealWorkerResult<T>>) -> RealWorkerResult<T> {
+    rx.recv_timeout(REAL_WORKER_REPLY_TIMEOUT)
+        .map_err(|_| RealWorkerFailure::BackendUnavailable)?
+}
 
 enum RealWorkerCommand {
     Start {
@@ -1999,25 +2008,25 @@ fn run_real_worker_thread(
     while let Ok(command) = rx.recv() {
         match command {
             RealWorkerCommand::Start { command, reply } => {
-                let _ = reply.send(runtime.block_on(state.start(command)));
+                let _ = reply.send(run_worker_future(&runtime, state.start(command)));
             }
             RealWorkerCommand::Stop { lease, reply } => {
-                let _ = reply.send(runtime.block_on(state.stop(lease)));
+                let _ = reply.send(run_worker_future(&runtime, state.stop(lease)));
             }
             RealWorkerCommand::Pause { lease, reply } => {
-                let _ = reply.send(runtime.block_on(state.pause(lease)));
+                let _ = reply.send(run_worker_future(&runtime, state.pause(lease)));
             }
             RealWorkerCommand::Resume { lease, reply } => {
-                let _ = reply.send(runtime.block_on(state.resume(lease)));
+                let _ = reply.send(run_worker_future(&runtime, state.resume(lease)));
             }
             RealWorkerCommand::Status { slot_id, reply } => {
-                let _ = reply.send(runtime.block_on(state.status(slot_id)));
+                let _ = reply.send(run_worker_future(&runtime, state.status(slot_id)));
             }
             RealWorkerCommand::Framebuffer { lease, reply } => {
-                let _ = reply.send(runtime.block_on(state.framebuffer(lease)));
+                let _ = reply.send(run_worker_future(&runtime, state.framebuffer(lease)));
             }
             RealWorkerCommand::FrameCounter { lease, reply } => {
-                let _ = reply.send(runtime.block_on(state.frame_counter(lease)));
+                let _ = reply.send(run_worker_future(&runtime, state.frame_counter(lease)));
             }
             RealWorkerCommand::InjectInput {
                 lease,
@@ -2025,18 +2034,34 @@ fn run_real_worker_thread(
                 pad_word,
                 reply,
             } => {
-                let _ =
-                    reply.send(runtime.block_on(state.inject_input(lease, target_frame, pad_word)));
+                let _ = reply.send(run_worker_future(
+                    &runtime,
+                    state.inject_input(lease, target_frame, pad_word),
+                ));
             }
             RealWorkerCommand::Capture {
                 lease,
                 capture_spec,
                 reply,
             } => {
-                let _ = reply.send(runtime.block_on(state.capture(lease, capture_spec)));
+                let _ = reply.send(run_worker_future(
+                    &runtime,
+                    state.capture(lease, capture_spec),
+                ));
             }
         }
     }
+}
+
+fn run_worker_future<T>(
+    runtime: &tokio::runtime::Runtime,
+    future: impl Future<Output = RealWorkerResult<T>>,
+) -> RealWorkerResult<T> {
+    runtime.block_on(async {
+        tokio::time::timeout(REAL_WORKER_RPC_TIMEOUT, future)
+            .await
+            .map_err(|_| RealWorkerFailure::BackendUnavailable)?
+    })
 }
 
 fn reply_unavailable(command: RealWorkerCommand) {
@@ -2335,6 +2360,8 @@ async fn connect_real_worker(
         let uds_path = path.to_path_buf();
         return Endpoint::try_from("http://[::]:0")
             .map_err(|_| RealWorkerFailure::BackendUnavailable)?
+            .connect_timeout(REAL_WORKER_RPC_TIMEOUT)
+            .timeout(REAL_WORKER_RPC_TIMEOUT)
             .connect_with_connector(service_fn(move |_uri: tonic::transport::Uri| {
                 let path = uds_path.clone();
                 async move {
@@ -2352,6 +2379,8 @@ async fn connect_real_worker(
         .ok_or(RealWorkerFailure::BackendUnavailable)?;
     Endpoint::from_shared(uri.to_owned())
         .map_err(|_| RealWorkerFailure::BackendUnavailable)?
+        .connect_timeout(REAL_WORKER_RPC_TIMEOUT)
+        .timeout(REAL_WORKER_RPC_TIMEOUT)
         .connect()
         .await
         .map(dh::hypervisor_worker_client::HypervisorWorkerClient::new)

@@ -546,6 +546,7 @@
         "frame",
         "status",
         "labelable",
+        "has_preview",
         "preview_image_url",
         "privileged_features_available",
         "labels",
@@ -557,9 +558,15 @@
         "frame": { "$ref": "#/$defs/u64" },
         "status": { "$ref": "#/$defs/captureStatus" },
         "labelable": { "type": "boolean" },
+        "has_preview": { "type": "boolean" },
         "preview_image_url": {
-          "type": "string",
-          "pattern": "^/api/capture/[A-Za-z0-9._:-]+/preview(\\?frame=[0-9]+)?$"
+          "oneOf": [
+            {
+              "type": "string",
+              "pattern": "^/api/capture/[A-Za-z0-9._:-]+/preview(\\?frame=[0-9]+)?$"
+            },
+            { "type": "null" }
+          ]
         },
         "privileged_features_available": { "type": "boolean" },
         "labels": {

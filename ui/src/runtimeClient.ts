@@ -199,7 +199,8 @@ export type CaptureDetailResponse = {
   frame: number;
   status: CaptureStatus;
   labelable: boolean;
-  preview_image_url: string;
+  has_preview: boolean;
+  preview_image_url: string | null;
   privileged_features_available: boolean;
   labels: LabelRole[];
   sanitized_provenance: {
@@ -1126,6 +1127,7 @@ function parseCaptureDetailResponse(value: unknown): CaptureDetailResponse {
     "frame",
     "status",
     "labelable",
+    "has_preview",
     "preview_image_url",
     "privileged_features_available",
     "labels",
@@ -1138,7 +1140,8 @@ function parseCaptureDetailResponse(value: unknown): CaptureDetailResponse {
     frame: u64Field(record, "frame"),
     status: enumField(record, "status", CAPTURE_STATUSES),
     labelable: booleanField(record, "labelable"),
-    preview_image_url: patternStringField(record, "preview_image_url", CAPTURE_PREVIEW_PATTERN),
+    has_preview: booleanField(record, "has_preview"),
+    preview_image_url: nullablePatternStringField(record, "preview_image_url", CAPTURE_PREVIEW_PATTERN),
     privileged_features_available: booleanField(record, "privileged_features_available"),
     labels: uniqueArray(arrayField(record, "labels").map((label) => enumValue(label, LABEL_ROLES))),
     sanitized_provenance: {
@@ -1573,6 +1576,14 @@ function patternStringField(record: JsonRecord, key: string, pattern: RegExp): s
     throw new Error("expected patterned string");
   }
   return candidate;
+}
+
+function nullablePatternStringField(
+  record: JsonRecord,
+  key: string,
+  pattern: RegExp
+): string | null {
+  return record[key] === null ? null : patternStringField(record, key, pattern);
 }
 
 function boundedStringField(

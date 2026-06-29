@@ -606,6 +606,13 @@ h3 {
   object-fit: contain;
 }
 
+.capture-preview-empty {
+  color: #dce6dc;
+  font-size: 0.86rem;
+  font-weight: 700;
+  text-align: center;
+}
+
 .feature-shell,
 .label-drawer,
 .dedup-editor {

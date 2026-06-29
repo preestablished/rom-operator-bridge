@@ -2010,16 +2010,7 @@ function renderCaptureDetail(model: OperatorViewModel): string {
         <span class="status-pill">${escapeHtml(captureLabelableStatus(detail))}</span>
       </div>
       <div class="capture-detail-grid">
-        <figure class="capture-preview">
-          <img
-            src="${escapeHtml(detail.preview_image_url)}"
-            alt="Capture preview"
-            width="256"
-            height="224"
-            loading="lazy"
-            data-capture-preview
-          />
-        </figure>
+        ${renderCapturePreview(detail)}
         <dl class="provenance-list" aria-label="Sanitized provenance">
           <div><dt>Source</dt><dd>${escapeHtml(detail.sanitized_provenance.capture_source)}</dd></div>
           <div><dt>Layout</dt><dd>${escapeHtml(detail.sanitized_provenance.layout_hash)}</dd></div>
@@ -2030,6 +2021,28 @@ function renderCaptureDetail(model: OperatorViewModel): string {
       ${renderPrivilegedFeatureShell(model)}
       ${renderLabelDrawer(model)}
     </section>
+  `;
+}
+
+function renderCapturePreview(detail: CaptureDetailResponse): string {
+  if (!detail.has_preview || !detail.preview_image_url) {
+    return `
+      <div class="capture-preview capture-preview-empty" role="img" aria-label="Capture preview unavailable">
+        <span>Preview unavailable</span>
+      </div>
+    `;
+  }
+  return `
+    <figure class="capture-preview">
+      <img
+        src="${escapeHtml(detail.preview_image_url)}"
+        alt="Capture preview"
+        width="256"
+        height="224"
+        loading="lazy"
+        data-capture-preview
+      />
+    </figure>
   `;
 }
 

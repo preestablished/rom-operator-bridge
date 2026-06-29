@@ -100,6 +100,21 @@ check_private_file() {
     fail "$label"
     return
   fi
+  if [[ -L "$path" ]]; then
+    fail "$label"
+    return
+  fi
+  local root_real path_dir_real path_real
+  root_real=$(cd "$ROOT_DIR" && pwd -P)
+  path_dir_real=$(cd "$(dirname "$path")" && pwd -P) || {
+    fail "$label"
+    return
+  }
+  path_real="$path_dir_real/${path##*/}"
+  if [[ "$path_real" == "$root_real" || "$path_real" == "$root_real"/* ]]; then
+    fail "$label"
+    return
+  fi
   local mode
   mode=$(stat -c '%a' "$path" 2>/dev/null || true)
   if [[ "$mode" != "600" ]]; then

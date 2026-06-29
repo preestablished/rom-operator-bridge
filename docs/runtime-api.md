@@ -221,7 +221,8 @@ The runtime API may expose:
 - sanitized status;
 - frame counters;
 - boolean capabilities;
-- browser-safe preview URLs;
+- browser-safe preview URLs when `has_preview` is true;
+- `preview_image_url: null` when a capture has no browser-safe preview;
 - high-level capture job state;
 - labels approved for the authenticated operator session;
 - sanitized hashes and provenance names.

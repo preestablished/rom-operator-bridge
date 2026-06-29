@@ -210,6 +210,69 @@ async fn real_restore_snapshot_lifecycle_calls_worker_and_stays_sanitized() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_status_failure_faults_session_and_keeps_stop_available() {
+    let workspace = tempfile::tempdir().expect("tempdir creates");
+    let private_root = workspace.path().join("bridge-private");
+    let reference_checkout = workspace.path().join("reference-workload");
+    let worker = MockWorker::new();
+    let server = WorkerServer::start(worker.clone()).await;
+    let config = real_config_with_start(
+        &private_root,
+        &reference_checkout,
+        &format!("unix://{}", server.uds_path.display()),
+        Some((ENV_REAL_SNAPSHOT_REF, SNAPSHOT_REF.to_string())),
+    );
+    let mut app = router(AppState::from_config(config));
+
+    let start = send_request(
+        &mut app,
+        runtime_request(
+            Method::POST,
+            "/api/session/start",
+            Body::from(start_body("real")),
+        ),
+    )
+    .await;
+    assert_eq!(start.status(), StatusCode::OK);
+    let cookie = response_cookie(&start);
+
+    worker
+        .state
+        .lock()
+        .expect("mock worker mutex poisoned")
+        .list_slots_status = Some(tonic::Code::Unavailable);
+    let status = send_request(
+        &mut app,
+        runtime_request_with_cookie(Method::GET, "/api/run/status", &cookie, Body::empty()),
+    )
+    .await;
+    assert_eq!(status.status(), StatusCode::OK);
+    let status_body = body_json(status).await;
+    assert_eq!(status_body["state"], "faulted");
+    assert_eq!(status_body["backend_mode"], "real");
+    assert_public_json_sanitized(&status_body, &private_root, &reference_checkout, &server);
+
+    let stop = send_request(
+        &mut app,
+        runtime_request_with_cookie(
+            Method::POST,
+            "/api/session/stop",
+            &cookie,
+            Body::from(stop_body("real-session-0000")),
+        ),
+    )
+    .await;
+    assert_eq!(stop.status(), StatusCode::OK);
+    let stop_body = body_json(stop).await;
+    assert_eq!(stop_body["state"], "stopped");
+    assert_public_json_sanitized(&stop_body, &private_root, &reference_checkout, &server);
+
+    let calls = worker.calls();
+    assert!(calls.iter().any(|call| *call == "list_slots"));
+    assert!(calls.iter().any(|call| *call == "destroy_vm"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_capture_trigger_calls_take_snapshot_and_writes_private_index() {
     let workspace = tempfile::tempdir().expect("tempdir creates");
     let private_root = workspace.path().join("bridge-private");
@@ -339,7 +402,8 @@ async fn real_capture_trigger_calls_take_snapshot_and_writes_private_index() {
         "private-capture-spec"
     );
     assert_eq!(detail_body["frame"], 12);
-    assert_eq!(detail_body["has_preview"], Value::Null);
+    assert_eq!(detail_body["has_preview"], false);
+    assert_eq!(detail_body["preview_image_url"], Value::Null);
     assert_eq!(detail_body["privileged_features_available"], false);
     assert_public_json_sanitized(&detail_body, &private_root, &reference_checkout, &server);
 
@@ -1969,6 +2033,7 @@ struct MockWorkerState {
     inject_status: Option<tonic::Code>,
     inject_scheduled: u32,
     run_status: Option<tonic::Code>,
+    list_slots_status: Option<tonic::Code>,
     take_snapshot_status: Option<tonic::Code>,
     take_snapshot_response: dh::TakeSnapshotResponse,
     framebuffer_status: Option<tonic::Code>,
@@ -1989,6 +2054,7 @@ impl Default for MockWorkerState {
             inject_status: None,
             inject_scheduled: 1,
             run_status: None,
+            list_slots_status: None,
             take_snapshot_status: None,
             take_snapshot_response: MockWorker::take_snapshot_response(),
             framebuffer_status: None,
@@ -2288,6 +2354,12 @@ impl HypervisorWorker for MockWorker {
     ) -> Result<TonicResponse<dh::ListSlotsResponse>, Status> {
         let mut state = self.state.lock().expect("mock worker mutex poisoned");
         state.calls.push("list_slots");
+        if let Some(code) = state.list_slots_status {
+            return Err(Status::new(
+                code,
+                "private list slots worker failure at /private/status",
+            ));
+        }
         Ok(TonicResponse::new(dh::ListSlotsResponse {
             slots: state.active_slot.clone().into_iter().collect(),
         }))

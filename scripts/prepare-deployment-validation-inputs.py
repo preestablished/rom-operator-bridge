@@ -23,6 +23,7 @@ PORT = "443"
 SERVICE_PORT = "7410"
 PRIVATE_FILE_MODE = 0o600
 PRIVATE_DIR_MODE = 0o700
+ROOT_DIR = Path(__file__).resolve().parents[1]
 
 
 class ResolvedHTTPSConnection(http.client.HTTPSConnection):
@@ -58,6 +59,14 @@ def path_arg(value: str | None, env_name: str) -> Path:
 def ensure_private_parent(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.parent.chmod(PRIVATE_DIR_MODE)
+
+
+def ensure_outside_repo(path: Path, label: str) -> Path:
+    resolved = path.expanduser().resolve(strict=False)
+    repo = ROOT_DIR.resolve()
+    if resolved == repo or repo in resolved.parents:
+        raise RuntimeError(f"{label} must be outside the repository checkout")
+    return resolved
 
 
 def write_private_text(path: Path, contents: str) -> None:
@@ -156,8 +165,8 @@ def create_cookie_jar(
         set_cookie_headers = [
             value for key, value in response.getheaders() if key.lower() == "set-cookie"
         ]
-        write_cookie_jar(cookie_jar, set_cookie_headers if 200 <= response.status < 300 else [])
         if not (200 <= response.status < 300):
+            write_cookie_jar(cookie_jar, [])
             code, message = sanitized_error(response_body)
             print(
                 f"validation-inputs: FAIL session_cookie_http status={response.status} "
@@ -165,6 +174,16 @@ def create_cookie_jar(
                 file=sys.stderr,
             )
             raise RuntimeError("session request failed")
+        session_cookie_headers = []
+        for header in set_cookie_headers:
+            cookie = http.cookies.SimpleCookie()
+            cookie.load(header)
+            if "rom_operator_bridge_session" in cookie:
+                session_cookie_headers.append(header)
+        if not session_cookie_headers:
+            write_cookie_jar(cookie_jar, [])
+            raise RuntimeError("session response did not set operator session cookie")
+        write_cookie_jar(cookie_jar, session_cookie_headers)
     finally:
         conn.close()
 
@@ -222,6 +241,10 @@ def main(argv: list[str]) -> int:
         session_response = path_arg(args.session_response, "SESSION_RESPONSE")
         network_evidence = path_arg(args.network_evidence, "NETWORK_EVIDENCE")
         bridge_ip = args.bridge_ip or require_value("BRIDGE_IP")
+        start_session_json = ensure_outside_repo(start_session_json, "start session JSON")
+        cookie_jar = ensure_outside_repo(cookie_jar, "cookie jar")
+        session_response = ensure_outside_repo(session_response, "session response")
+        network_evidence = ensure_outside_repo(network_evidence, "network evidence")
         create_start_session_json(start_session_json)
         print("validation-inputs: PASS start_session_json")
         create_cookie_jar(start_session_json, cookie_jar, session_response, bridge_ip)
