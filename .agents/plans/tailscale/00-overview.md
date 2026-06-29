@@ -25,18 +25,26 @@ serves the static UI, `/api/...`, `/ws/...`, auth, private-root writes, capture
 state, and redaction controls. Replacing it with Flutter, Java, or Tauri would
 not remove the backend work required for HTTP Origin and cookie handling.
 
-Recommended topology:
+Recommended coexistence topology:
 
 ```text
 tailnet browser
   -> http://tailrombridge.birb.homes:80
   -> reverse proxy listening only on <tailscale-ip>:80
-  -> rom-operator-bridge on 127.0.0.1:7410
+  -> existing rom-operator-bridge upstream
 ```
 
-This keeps the bridge process off the tailnet interface while still presenting
-the operator URL on the Tailscale name. If the existing validator must keep
-port `7410`, only the proxy listens on port `80`.
+Do not switch the current `https://rombridge.birb.homes/` service into
+HTTP-only mode in place. The implementation must either:
+
+- add route profiles to the existing service so HTTPS and Tailscale HTTP are
+  selected per request by validated Host/Origin; or
+- run a separate Tailscale-only service instance with its own private env,
+  upstream port, session secret, and validation.
+
+The first option is preferred because it preserves the current real-backend
+state and avoids two bridge processes racing over the same private runtime.
+The second option is acceptable only if it is explicitly isolated and validated.
 
 ## Required Product Changes
 
@@ -47,6 +55,8 @@ port `7410`, only the proxy listens on port `80`.
   for the Tailscale HTTP route.
 - Echo the accepted request Origin on runtime responses instead of always
   returning the HTTPS origin.
+- Select static CSP and cookie policy per validated route so the HTTPS route
+  never receives Tailscale HTTP headers.
 - Add a deployment validation path for HTTP over Tailscale. Do not weaken the
   existing HTTPS deployment checks for `rombridge.birb.homes`.
 - Add sanitized docs for the Tailscale route, rollback, and evidence boundary.
@@ -66,6 +76,8 @@ The future agent should leave the repository and host in this state:
 - HTTPS mode still sets `HttpOnly; Secure; SameSite=Strict` cookies.
 - Only the Tailscale route uses insecure cookies. The current HTTPS route keeps
   the stricter behavior.
+- `https://rombridge.birb.homes/` is revalidated after the Tailscale route is
+  added.
 - Raw private evidence, credentials, cookies, endpoint addresses, capture IDs,
   screenshots, and logs stay outside the repository.
 

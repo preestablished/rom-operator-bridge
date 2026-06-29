@@ -24,6 +24,11 @@ Expected implementation cost is moderate and localized:
 - deploy validation scripts;
 - docs and tests.
 
+If preserving the existing HTTPS route in the same process, this also includes
+per-route profile selection by Host/Origin. If that becomes too invasive, use a
+separate Tailscale service instance rather than changing the HTTPS service into
+HTTP mode.
+
 ## Tauri Option
 
 Use Tauri only if browser HTTP is rejected as a product decision after the
@@ -120,6 +125,8 @@ Choose the smallest stack that satisfies:
 - working cookie auth in browsers;
 - same-origin API and WebSockets;
 - no weakening of the existing HTTPS route;
+- either per-route profiles in one bridge process or a separate isolated
+  Tailscale service instance;
 - repeatable validation and rollback.
 
 Under that rule, the current Rust/Vite stack plus a local HTTP reverse proxy is

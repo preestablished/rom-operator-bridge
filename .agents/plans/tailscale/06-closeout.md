@@ -17,9 +17,10 @@ Suggested acceptance criteria:
 The bridge is available at http://tailrombridge.birb.homes/ from an approved
 tailnet client without TLS; runtime API and WebSockets work same-origin; HTTP
 mode uses non-Secure HttpOnly SameSite=Strict cookies; wrong Origins are
-rejected; the existing HTTPS deployment remains unchanged; validation and
-redaction gates pass; public docs contain no private endpoint addresses,
-credentials, cookies, raw evidence, screenshots, or capture IDs.
+rejected; wrong Host requests do not serve the bridge; the existing HTTPS
+deployment remains unchanged and is revalidated; validation and redaction gates
+pass; public docs contain no private endpoint addresses, credentials, cookies,
+raw evidence, screenshots, or capture IDs.
 ```
 
 If implementation unblocks real operator smoke, record that as a note on
@@ -62,11 +63,16 @@ command lines into committed docs.
 Ask reviewers to focus on:
 
 - HTTP mode cannot accidentally disable `Secure` cookies for HTTPS origins;
+- same-process coexistence uses per-route profiles, or separate-instance
+  coexistence has isolated env, session secret, upstream port, and private root;
 - accepted Origin is echoed only after allowlist validation;
 - wrong, absent, and `null` Origins remain rejected;
+- wrong Host and direct IP-literal requests do not serve the bridge route;
 - WebSocket handshakes use the same Origin and cookie policy;
 - CSP allows `ws://tailrombridge.birb.homes` only in Tailscale HTTP mode;
 - validators make loopback binds valid only for proxy mode;
+- route-specific redaction rules allow only the exact Tailscale HTTP/WS origins
+  and keep them out of HTTPS output;
 - deployment scripts do not print private paths, addresses, cookies, or raw
   evidence;
 - existing `https://rombridge.birb.homes/` behavior stays intact.

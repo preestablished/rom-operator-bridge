@@ -10,6 +10,11 @@ Suggested fields:
 
 ```rust
 pub struct DeploymentSecurityConfig {
+    pub profiles: Vec<DeploymentProfile>,
+}
+
+pub struct DeploymentProfile {
+    pub id: String,
     pub public_origin: Origin,
     pub allowed_origins: Vec<Origin>,
     pub cookie_secure: bool,
@@ -42,8 +47,16 @@ Validation rules:
 - `cookie_secure=false` is valid only when every allowed origin is `http://`
   and `exposure_mode=tailscale-http`;
 - `cookie_secure=true` is required for any `https://` allowed origin;
-- do not permit mixed HTTP and HTTPS allowed origins in one process unless the
-  implementation has explicit tests proving cookie behavior is safe.
+- a profile's public-origin host must match the Host values that may serve its
+  static UI;
+- do not use one profile with mixed HTTP and HTTPS allowed origins;
+- multi-route coexistence must use separate profiles, not one process-wide
+  `cookie_secure=false` switch.
+
+For the MVP, non-Secure cookies are valid only for the
+`http://tailrombridge.birb.homes` profile and only when deployment validation
+proves either a Tailscale-bound proxy or an explicitly reviewed direct-tailnet
+listener. HTTPS origins must never inherit the non-Secure cookie setting.
 
 ## Origin Validation
 
@@ -60,8 +73,18 @@ validate_origin(headers)
 Target shape:
 
 ```rust
-validate_runtime_request(headers, uri, origin_policy)
-validate_origin(headers, origin_policy) -> Result<AllowedOrigin, AuthError>
+validate_runtime_request(headers, uri, deployment_profiles)
+validate_origin(headers, deployment_profiles) -> Result<RuntimeAuthContext, AuthError>
+```
+
+The auth context should carry the accepted profile and a header-safe Origin:
+
+```rust
+pub struct RuntimeAuthContext {
+    pub profile_id: DeploymentProfileId,
+    pub origin: HeaderValue,
+    pub cookie_secure: bool,
+}
 ```
 
 The returned allowed origin should be used when writing CORS headers. Runtime
@@ -74,6 +97,13 @@ Vary: Origin
 
 Do not return wildcard CORS for credentialed runtime routes.
 
+Carry this context through all runtime handlers that currently call
+`authenticate_runtime_request(...) -> Result<(), Response>`. That includes
+session status, run status, frame/image routes, capture routes, labels,
+validation status, pause/resume, stop, and frame-hint query paths. WebSocket
+handshakes should use the same context for Origin validation and response
+headers.
+
 Keep these rejection rules:
 
 - absent Origin is rejected for browser runtime requests;
@@ -83,7 +113,7 @@ Keep these rejection rules:
 
 ## Cookie Headers
 
-Change cookie formatting to take the configured secure policy:
+Change cookie formatting to take the accepted profile's secure policy:
 
 ```rust
 session_cookie_header(session, cookie_secure)
@@ -104,10 +134,22 @@ rom_operator_bridge_session=<value>; Path=/; Max-Age=14400; HttpOnly; SameSite=S
 
 Keep one active operator session and the existing session TTL.
 
+In a multi-profile service, login should format `Set-Cookie` from the accepted
+Origin profile. A login from the HTTPS origin must set `Secure`; a login from
+the Tailscale HTTP origin must omit `Secure`. Do not infer this from
+`X-Forwarded-Proto` alone.
+
 ## Static CSP
 
-Replace the hard-coded `STATIC_CSP` with a generated policy derived from the
-configured public origin.
+Replace hard-coded CSP values with generated policies derived from the selected
+public origin. There are currently two CSP sources:
+
+- the Rust service's `STATIC_CSP`;
+- the Vite preview/test `SPA_RESPONSE_HEADERS` in `ui/vite.config.ts`.
+
+Update both, or explicitly keep Vite preview on the HTTPS profile while the
+service-served static route is profile-aware. Tests must document whichever
+choice is made.
 
 For `http://tailrombridge.birb.homes`, expected CSP:
 
@@ -121,20 +163,21 @@ For `https://rombridge.birb.homes`, keep:
 default-src 'self'; connect-src 'self' wss://rombridge.birb.homes; img-src 'self' blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'
 ```
 
-If multiple allowed origins are supported later, include only the WebSocket
-origins that correspond to the selected public origin for that process. Avoid
-one static CSP that authorizes unrelated deployment hosts.
+For static responses, select the CSP by validated Host/public origin, not by
+untrusted query string or request body. Avoid one static CSP that authorizes
+both unrelated deployment hosts.
 
 ## Runtime Headers
 
-Change `apply_runtime_headers` so it can use a dynamic origin string:
+Change `apply_runtime_headers` so it can use the accepted auth context:
 
 ```rust
-fn apply_runtime_headers(headers: &mut HeaderMap, origin: Option<&str>)
+fn apply_runtime_headers(headers: &mut HeaderMap, context: Option<&RuntimeAuthContext>)
 ```
 
-Use `HeaderValue::from_str` with sanitized config values. Fail config loading
-early if an origin cannot become a header value.
+Use `HeaderValue::from_str` with sanitized config values while loading config,
+then store header-safe values in the profile/context. Fail config loading early
+if an origin cannot become a header value.
 
 Static responses do not need CORS, but they do need the generated CSP and the
 existing no-store, referrer, frame, and nosniff headers.
@@ -162,6 +205,8 @@ Add focused tests before broad quality gates:
 - Tailscale HTTP config emits no `Secure` attribute.
 - Tailscale HTTP config returns the HTTP origin in
   `Access-Control-Allow-Origin`.
+- a multi-profile process keeps HTTPS `Secure` cookies while HTTP login omits
+  `Secure`.
 - wrong, absent, and `null` origins fail in both modes.
 - static CSP changes between HTTPS and HTTP modes.
 - WebSocket handshake accepts the configured HTTP Origin with a valid cookie.

@@ -56,13 +56,51 @@ Do not include `Secure` for the Tailscale HTTP route. Only allow this when the
 configured public origin has `http://` and the exposure mode is explicitly
 Tailscale-only.
 
-Before implementing, also verify that browsers will not force HTTPS for this
+Before implementing, verify that browsers will not force HTTPS for this
 subdomain through HSTS. At the time this plan was written, command-line probes
 of `https://birb.homes/` and `https://rombridge.birb.homes/` did not show a
 `Strict-Transport-Security` header. Recheck this from the implementation
-machine. If the parent domain later enables `includeSubDomains`, browser HTTP
-access to `tailrombridge.birb.homes` may be impossible without changing the
-hostname or using TLS.
+machine, and also check the browser HSTS preload list and a fresh browser
+profile. If the parent domain later enables `includeSubDomains`, or if a
+browser profile has cached HSTS for the name, browser HTTP access to
+`tailrombridge.birb.homes` may be impossible without changing the hostname,
+clearing operator-local HSTS state, or using TLS.
+
+## Coexistence Decision
+
+The implementation must preserve `https://rombridge.birb.homes/`. Do not change
+the single existing service env to:
+
+```text
+ROM_OPERATOR_BRIDGE_PUBLIC_ORIGIN=http://tailrombridge.birb.homes
+ROM_OPERATOR_BRIDGE_COOKIE_SECURE=false
+```
+
+unless the HTTPS route has first been moved to a separate validated service
+instance. A single global HTTP profile would break the current route's cookie,
+CSP, and Origin contract.
+
+Preferred model:
+
+```text
+one bridge service process
+  -> profile selected from validated Host for static responses
+  -> profile selected from validated Origin for runtime HTTP and WebSockets
+  -> HTTPS profile keeps Secure cookies and wss CSP
+  -> Tailscale HTTP profile uses non-Secure cookies and ws CSP
+```
+
+Fallback model:
+
+```text
+existing HTTPS bridge service remains unchanged
+separate Tailscale bridge service binds a distinct loopback port
+separate private env, session secret, validation directory, and rollback path
+```
+
+If the fallback model shares the real backend, add an operator policy that only
+one service instance may hold a real session at a time. Prefer separate private
+runtime roots so capture, label, event, and validation files cannot collide.
 
 ## Recommended Routing Decision
 
@@ -73,7 +111,7 @@ Recommended:
 
 ```text
 Nginx or Traefik listens on <tailscale-ip>:80
-rom-operator-bridge listens on 127.0.0.1:7410
+rom-operator-bridge listens on <bridge-upstream>:<bridge-port>
 proxy forwards Host, Origin, WebSocket Upgrade, and X-Forwarded-Proto
 ```
 
@@ -85,14 +123,29 @@ Reasons:
 - rollback can remove the proxy without changing private runtime data;
 - the same bridge binary continues to serve static UI, API, and WebSockets.
 
-The current operator env validator rejects loopback binds. The implementation
-should add an explicit Tailscale HTTP proxy mode that permits
-`127.0.0.1:7410`, or it should document a safer equivalent. Do not silently make
-loopback valid for every deployment mode.
+If the chosen topology moves a bridge service behind a loopback-only proxy, the
+operator env validator must allow that only for the explicit Tailscale proxy
+mode or a documented full-proxy migration. Do not silently make loopback valid
+for every deployment mode.
 
 ## Origin Policy Decision
 
-Support multiple deployments without weakening either one:
+Support multiple deployments without weakening either one. Exact env names can
+change, but the model should support route profiles rather than a single global
+HTTP-or-HTTPS switch:
+
+```text
+ROM_OPERATOR_BRIDGE_DEPLOYMENT_PROFILES=https-origin,tailscale-http
+ROM_OPERATOR_BRIDGE_PROFILE_HTTPS_PUBLIC_ORIGIN=https://rombridge.birb.homes
+ROM_OPERATOR_BRIDGE_PROFILE_HTTPS_ALLOWED_ORIGINS=https://rombridge.birb.homes
+ROM_OPERATOR_BRIDGE_PROFILE_HTTPS_COOKIE_SECURE=true
+ROM_OPERATOR_BRIDGE_PROFILE_TAIL_PUBLIC_ORIGIN=http://tailrombridge.birb.homes
+ROM_OPERATOR_BRIDGE_PROFILE_TAIL_ALLOWED_ORIGINS=http://tailrombridge.birb.homes
+ROM_OPERATOR_BRIDGE_PROFILE_TAIL_COOKIE_SECURE=false
+```
+
+For a separate Tailscale-only service instance, the same profile can be reduced
+to a single-process HTTP configuration:
 
 ```text
 ROM_OPERATOR_BRIDGE_PUBLIC_ORIGIN=http://tailrombridge.birb.homes
@@ -101,21 +154,14 @@ ROM_OPERATOR_BRIDGE_COOKIE_SECURE=false
 ROM_OPERATOR_BRIDGE_EXPOSURE_MODE=tailscale-http
 ```
 
-For the existing HTTPS route:
+Do not use the reduced single-process HTTP configuration for the existing HTTPS
+service.
 
-```text
-ROM_OPERATOR_BRIDGE_PUBLIC_ORIGIN=https://rombridge.birb.homes
-ROM_OPERATOR_BRIDGE_ALLOWED_ORIGINS=https://rombridge.birb.homes
-ROM_OPERATOR_BRIDGE_COOKIE_SECURE=true
-ROM_OPERATOR_BRIDGE_EXPOSURE_MODE=https-origin
-```
+The implementation should keep these concerns separate:
 
-The exact env names can change during implementation, but the model should keep
-these concerns separate:
-
-- public origin used for docs, CSP, and static headers;
+- public origin used for docs, CSP, static headers, and Host matching;
 - allowed runtime origins used for Origin validation;
-- cookie secure policy;
+- cookie secure policy selected from the accepted profile;
 - exposure mode used by validators and deployment scripts.
 
 ## Validation Decision

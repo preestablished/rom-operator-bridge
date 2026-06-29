@@ -40,7 +40,9 @@ Inputs:
 ROM_BRIDGE_TAILSCALE_BASE_URL=http://tailrombridge.birb.homes
 ROM_BRIDGE_TAILSCALE_ORIGIN=http://tailrombridge.birb.homes
 ROM_BRIDGE_TAILSCALE_VALIDATION_DIR=<private-validation-dir>/tailscale-http/<run-id>
-ROM_BRIDGE_TAILSCALE_COOKIE_FILE=<private-cookie-file>
+ROM_BRIDGE_TAILSCALE_START_SESSION_JSON=<private-start-session-json>
+ROM_BRIDGE_TAILSCALE_SESSION_RESPONSE=<private-session-response-json>
+ROM_BRIDGE_TAILSCALE_COOKIE_FILE=<private-cookie-file-written-by-checker>
 ROM_BRIDGE_TAILSCALE_NETWORK_EVIDENCE_FILE=<private-network-evidence-file>
 ROM_BRIDGE_TAILSCALE_NETWORK_EVIDENCE_REVIEWED=1
 ROM_BRIDGE_FORBID_FILE=<private-forbid-file>
@@ -50,17 +52,34 @@ The script should reject repo-local validation directories, symlinked private
 inputs, and files with unsafe modes, following the existing deployment checker
 style.
 
+The checker must create or refresh its own throwaway HTTP session. Either
+parameterize `scripts/prepare-deployment-validation-inputs.py` for HTTP, port
+`80`, and `tailrombridge.birb.homes`, or create
+`scripts/prepare-tailscale-http-validation-inputs.py`. The prep path must:
+
+- send `Host: tailrombridge.birb.homes`;
+- send `Origin: http://tailrombridge.birb.homes`;
+- store raw headers and response bodies only under the private validation
+  directory;
+- require a `rom_operator_bridge_session` cookie on 2xx login;
+- assert the session cookie includes `HttpOnly` and `SameSite=Strict`;
+- assert the session cookie omits `Secure`.
+
 ## Expected HTTP Route Checks
 
 The checker should prove:
 
 - DNS resolves `tailrombridge.birb.homes` to the expected Tailscale class of
   address without printing the concrete address;
+- parent-domain HSTS and browser preload checks do not force HTTPS for this
+  hostname, or a fallback hostname is selected before continuing;
 - `http://tailrombridge.birb.homes/` returns the static UI;
 - no HTTPS redirect is returned;
 - no `Strict-Transport-Security` header is returned by the tail route;
 - static responses include no-store, referrer, frame, nosniff, and HTTP-mode
   CSP headers;
+- static CSP contains the exact `ws://tailrombridge.birb.homes` connection
+  target and does not contain the old `wss://rombridge.birb.homes` target;
 - `/health` is reachable and sanitized;
 - unauthenticated `/api/session` returns the sanitized inactive or unauthorized
   shape expected by the current API;
@@ -74,9 +93,16 @@ The checker should prove:
   handshakes;
 - `/ws/events` and `/ws/input` reject unauthenticated and wrong-Origin
   handshakes;
-- bridge listeners are not wildcard and the upstream `7410` port is not
-  reachable from another tailnet client;
+- bridge listeners are not wildcard and the bridge upstream port is not
+  reachable from another tailnet client unless it is the already validated
+  HTTPS upstream;
+- wrong Host and direct IP-literal HTTP requests do not serve the bridge UI,
+  `/health`, `/api/...`, or `/ws/...`;
 - outside-network access is unavailable or rejected.
+
+If the implementation preserves the HTTPS route, also rerun the existing
+deployment-network checker or a focused equivalent for
+`https://rombridge.birb.homes/` after the Tailscale route is active.
 
 ## Private Browser Smoke
 
@@ -95,6 +121,8 @@ Private smoke sequence:
 - open event and input WebSockets;
 - stop the session;
 - verify the browser did not upgrade the URL to HTTPS.
+- verify this from a fresh browser profile or a profile with no cached HSTS
+  state for the hostname.
 
 Do not capture screenshots into the repository. If screenshots are needed, keep
 them under the private validation directory and refer only to a sanitized
@@ -130,6 +158,26 @@ Add or update sanitized docs after validation:
 
 Keep the HTTPS deployment docs intact. Present the Tailscale route as a separate
 operator-private access path with a different trust model.
+
+## Route-Specific Redaction Rules
+
+The existing HTTPS publish rules treat arbitrary `http://` and `ws://` runtime
+links as failures. The Tailscale route intentionally needs these exact strings:
+
+```text
+http://tailrombridge.birb.homes
+ws://tailrombridge.birb.homes
+```
+
+Add route-specific scan rules instead of globally allowing insecure runtime
+links. The Tailscale checker may allowlist only those exact origins in
+Tailscale-mode docs or generated static output. It must still fail:
+
+- any other `http://` or `ws://` runtime endpoint;
+- `https://rombridge.birb.homes` or `wss://rombridge.birb.homes` leaking into
+  the Tailscale static CSP/runtime config;
+- `http://tailrombridge.birb.homes` or `ws://tailrombridge.birb.homes` leaking
+  into the existing HTTPS deployment output.
 
 ## Redaction Boundary
 
