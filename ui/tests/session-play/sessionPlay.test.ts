@@ -134,7 +134,7 @@ describe("session and play surface", () => {
     expect(client.captureJob).toHaveBeenCalledWith("job-001");
     expect(root.textContent).toContain("completed");
     expect(root.textContent).toContain("capture-001");
-    expect(root.textContent).not.toMatch(/\/home\/|operator-secret|raw payload|private\.env/i);
+    expect(root.textContent).not.toMatch(/\/home\/|session-secret|raw payload|private\.env/i);
   });
 
   it("renders current pressed buttons and an in-memory padlog tail from input acknowledgements", async () => {
@@ -243,7 +243,7 @@ describe("session and play surface", () => {
     const alert = root.querySelector<HTMLElement>("[data-capture-alert]");
     expect(alert?.getAttribute("role")).toBe("alert");
     expect(alert?.textContent).toBe("Capture failed.");
-    expect(root.textContent).not.toMatch(/\/home\/|private\.env|operator-secret/i);
+    expect(root.textContent).not.toMatch(/\/home\/|private\.env|session-secret/i);
   });
 });
 

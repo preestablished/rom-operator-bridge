@@ -19,7 +19,6 @@ pub const ENV_CONFIG_FILE: &str = "ROM_OPERATOR_BRIDGE_CONFIG_FILE";
 pub const ENV_PRIVATE_ROOT: &str = "ROM_OPERATOR_BRIDGE_PRIVATE_ROOT";
 pub const ENV_PRIVATE_ROOT_ALIAS: &str = "BRIDGE_PRIVATE_ROOT";
 pub const ENV_STATIC_PUBLISH_ROOT: &str = "ROM_OPERATOR_BRIDGE_STATIC_PUBLISH_ROOT";
-pub const ENV_OPERATOR_CREDENTIAL: &str = "ROM_OPERATOR_BRIDGE_OPERATOR_CREDENTIAL";
 pub const ENV_SESSION_SECRET: &str = "ROM_OPERATOR_BRIDGE_SESSION_SECRET";
 pub const ENV_HYPERVISOR_ENDPOINT: &str = "BRIDGE_HYPERVISOR_ENDPOINT";
 pub const ENV_WORKLOAD_IMAGE_REF: &str = "BRIDGE_WORKLOAD_IMAGE_REF";
@@ -39,7 +38,6 @@ const MIN_PRIVATE_ROOT_COMPONENTS: usize = 3;
 pub struct BridgePrivateConfig {
     root: Option<PrivateRootConfig>,
     static_publish_root: Option<PathBuf>,
-    operator_credential: Option<SecretValue>,
     session_secret: Option<SecretValue>,
     real_runtime: Option<RealRuntimeConfig>,
 }
@@ -49,7 +47,6 @@ impl BridgePrivateConfig {
         Self {
             root: None,
             static_publish_root: None,
-            operator_credential: None,
             session_secret: None,
             real_runtime: None,
         }
@@ -63,7 +60,6 @@ impl BridgePrivateConfig {
             ENV_PRIVATE_ROOT,
             ENV_PRIVATE_ROOT_ALIAS,
             ENV_STATIC_PUBLISH_ROOT,
-            ENV_OPERATOR_CREDENTIAL,
             ENV_SESSION_SECRET,
         ]
         .iter()
@@ -87,10 +83,6 @@ impl BridgePrivateConfig {
         let static_publish_root = optional_path(values, ENV_STATIC_PUBLISH_ROOT)?;
         validate_private_root(&root, static_publish_root.as_deref())?;
 
-        let operator_credential = SecretValue::new(
-            ENV_OPERATOR_CREDENTIAL,
-            required_value(values, ENV_OPERATOR_CREDENTIAL)?,
-        )?;
         let session_secret = SecretValue::new(
             ENV_SESSION_SECRET,
             required_value(values, ENV_SESSION_SECRET)?,
@@ -104,7 +96,6 @@ impl BridgePrivateConfig {
         let config = Self {
             root: Some(PrivateRootConfig { path: root }),
             static_publish_root,
-            operator_credential: Some(operator_credential),
             session_secret: Some(session_secret),
             real_runtime,
         };
@@ -115,7 +106,6 @@ impl BridgePrivateConfig {
     pub fn is_placeholder(&self) -> bool {
         self.root.is_none()
             && self.static_publish_root.is_none()
-            && self.operator_credential.is_none()
             && self.session_secret.is_none()
             && self.real_runtime.is_none()
     }
@@ -126,10 +116,6 @@ impl BridgePrivateConfig {
 
     pub fn static_publish_root(&self) -> Option<&Path> {
         self.static_publish_root.as_deref()
-    }
-
-    pub fn operator_credential_configured(&self) -> bool {
-        self.operator_credential.is_some()
     }
 
     pub fn session_secret_configured(&self) -> bool {
@@ -148,9 +134,6 @@ impl BridgePrivateConfig {
         if let Some(root) = self.static_publish_root() {
             sanitizer = sanitizer.with_private_root(root);
         }
-        if let Some(secret) = &self.operator_credential {
-            sanitizer = sanitizer.with_forbidden_literal(secret.as_str());
-        }
         if let Some(secret) = &self.session_secret {
             sanitizer = sanitizer.with_forbidden_literal(secret.as_str());
         }
@@ -158,12 +141,6 @@ impl BridgePrivateConfig {
             sanitizer = real_runtime.add_to_sanitizer(sanitizer);
         }
         sanitizer
-    }
-
-    pub fn verify_operator_credential(&self, candidate: &str) -> bool {
-        self.operator_credential
-            .as_ref()
-            .is_some_and(|credential| constant_time_eq(candidate.as_bytes(), credential.as_bytes()))
     }
 
     pub fn sign_session_token(
@@ -379,10 +356,6 @@ impl fmt::Debug for BridgePrivateConfig {
             .field(
                 "static_publish_root_configured",
                 &self.static_publish_root.is_some(),
-            )
-            .field(
-                "operator_credential_configured",
-                &self.operator_credential.is_some(),
             )
             .field("session_secret_configured", &self.session_secret.is_some())
             .field("real_runtime_configured", &self.real_runtime.is_some())
@@ -1294,18 +1267,6 @@ impl fmt::Debug for PrivateConfigError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(self, formatter)
     }
-}
-
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    let mut diff = left.len() ^ right.len();
-    let max_len = left.len().max(right.len());
-    for index in 0..max_len {
-        let left_byte = left.get(index).copied().unwrap_or_default();
-        let right_byte = right.get(index).copied().unwrap_or_default();
-        diff |= (left_byte ^ right_byte) as usize;
-    }
-
-    diff == 0
 }
 
 fn hex_lower(bytes: &[u8]) -> String {

@@ -105,7 +105,7 @@ node "$ROOT_DIR/scripts/redaction-gate.mjs" self-test
 FIXTURE_ROOT="$TMP_DIR/fixture-root"
 mkdir -p "$FIXTURE_ROOT/docs" "$FIXTURE_ROOT/contracts" "$FIXTURE_ROOT/ui/public" "$FIXTURE_ROOT/ui/dist"
 printf 'opened /home/operator/.agents/private-note.md\n' >"$FIXTURE_ROOT/docs/private-path.md"
-printf '"operator_credential": "operator-secret"\n' >"$FIXTURE_ROOT/ui/public/runtime-config.json"
+printf '"session_secret": "session-secret-value"\n' >"$FIXTURE_ROOT/ui/public/runtime-config.json"
 printf 'connect to 10.0.0.106:7410\n' >"$FIXTURE_ROOT/README.md"
 printf 'blob\0payload\n' >"$FIXTURE_ROOT/contracts/preview-cache.bin"
 ln -s /tmp "$FIXTURE_ROOT/docs/private-symlink"

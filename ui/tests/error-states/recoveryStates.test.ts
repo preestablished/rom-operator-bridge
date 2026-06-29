@@ -326,7 +326,7 @@ function recovery(root: ParentNode, code: string): HTMLElement | null {
 
 function expectSafe(root: ParentNode): void {
   expect(root.textContent ?? "").not.toMatch(
-    /\/home\/|private\.env|raw command|command output|feature bytes|validation report|screenshot|operator-secret/i
+    /\/home\/|private\.env|raw command|command output|feature bytes|validation report|screenshot|session-secret/i
   );
 }
 

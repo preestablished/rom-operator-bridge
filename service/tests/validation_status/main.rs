@@ -10,7 +10,7 @@ use rom_operator_bridge_service::{
     artifacts::ARTIFACT_SCHEMA_VERSION,
     auth::ALLOWED_ORIGIN,
     config::ServiceConfig,
-    private_config::{ENV_OPERATOR_CREDENTIAL, ENV_PRIVATE_ROOT, ENV_SESSION_SECRET},
+    private_config::{ENV_PRIVATE_ROOT, ENV_SESSION_SECRET},
     sanitization::PublicSanitizer,
     validation_status::{
         PublicValidationIssue, ValidationRunStatus, ValidationRunUpdate, ValidationStatusError,
@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 use std::{fs, path::PathBuf};
 use tower::ServiceExt;
 
-const GOOD_CREDENTIAL: &str = "operator-credential-from-test-source";
+const SECRET_LITERAL: &str = "private-secret-from-test-source";
 const SESSION_SECRET: &str = "session-secret-from-test-source-32-bytes";
 const PRIVATE_LITERAL: &str = "SECRET_FEATURE_VALUE";
 const UNSAFE_SUMMARY: &str = "stdout: failed at /home/operator/private/validation/report.json with feature_bytes and validation report excerpt SECRET_FEATURE_VALUE";
@@ -174,7 +174,7 @@ async fn validation_status_route_returns_sanitized_public_view() {
     assert_public_safe(
         &PublicSanitizer::new()
             .with_private_root(&private_root)
-            .with_forbidden_literal(GOOD_CREDENTIAL)
+            .with_forbidden_literal(SECRET_LITERAL)
             .with_forbidden_literal(SESSION_SECRET),
         &json,
         &private_root,
@@ -233,10 +233,6 @@ fn private_config() -> (tempfile::TempDir, ServiceConfig, PathBuf) {
             ENV_PRIVATE_ROOT.to_string(),
             private_root.display().to_string(),
         ),
-        (
-            ENV_OPERATOR_CREDENTIAL.to_string(),
-            GOOD_CREDENTIAL.to_string(),
-        ),
         (ENV_SESSION_SECRET.to_string(), SESSION_SECRET.to_string()),
     ])
     .expect("private config loads");
@@ -265,7 +261,6 @@ async fn login(app: axum::Router) -> Login {
                 .body(Body::from(
                     json!({
                         "schema_version": 1,
-                        "operator_credential": GOOD_CREDENTIAL,
                         "backend_mode": "synthetic",
                         "requested_capabilities": ["input"]
                     })
@@ -346,7 +341,7 @@ fn assert_public_safe(sanitizer: &PublicSanitizer, value: &Value, private_root: 
         .expect("validation status is public-safe");
     let serialized = value.to_string();
     assert!(!serialized.contains(&private_root.display().to_string()));
-    assert!(!serialized.contains(GOOD_CREDENTIAL));
+    assert!(!serialized.contains(SECRET_LITERAL));
     assert!(!serialized.contains(SESSION_SECRET));
     assert!(!serialized.contains(PRIVATE_LITERAL));
     assert!(!serialized.contains("stdout"));

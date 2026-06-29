@@ -26,11 +26,11 @@ Recent commits to know about:
 - `rom-operator-bridge.service` is active and running on the expected host.
 - The live route was updated after the service initially kept serving the prior bundle; direct and public checks now both see `index-Ds6jVeRa.js`.
 
-Do not record operator credentials, session secrets, cookie jars, private endpoint addresses, private artifact contents, unsanitized verifier logs, screenshots, or private evidence paths in Git.
+Do not record session secrets, cookie jars, private endpoint addresses, private artifact contents, unsanitized verifier logs, screenshots, or private evidence paths in Git.
 
 ## What Was Just Fixed
 
-The deployed UI accepted the operator credential but appeared to do nothing because the frontend sent `backend_mode: synthetic` by default. The real deployment requires `backend_mode: real`, so `/api/session/start` rejected the request and the UI stayed in a generic unavailable/faulted state.
+The deployed UI appeared to do nothing because the frontend sent `backend_mode: synthetic` by default. The real deployment requires `backend_mode: real`, so `/api/session/start` rejected the request and the UI stayed in a generic unavailable/faulted state.
 
 The fix:
 

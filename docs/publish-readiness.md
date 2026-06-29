@@ -4,7 +4,7 @@ Date: 2026-06-26
 
 This checklist gates publishing the ROM operator bridge static UI. It records
 only sanitized evidence. Private cookie files, raw headers, response bodies,
-network evidence, operator credentials, private roots, and capture artifacts
+network evidence, session secrets, private roots, and capture artifacts
 must remain outside this repository.
 
 ## Status
@@ -61,7 +61,7 @@ The static UI and public docs must not contain:
 
 - real ROM bytes, screenshots, raw framebuffer payloads, or decoded feature
   values;
-- operator credentials, cookies, session secrets, token-shaped values, or
+- cookies, session secrets, token-shaped values, or
   private endpoint addresses;
 - absolute private filesystem paths, private validation report excerpts, raw
   command transcripts, or private log output;

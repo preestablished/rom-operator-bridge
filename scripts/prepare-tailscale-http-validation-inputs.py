@@ -126,7 +126,6 @@ def run_capture(args: list[str]) -> str:
 def create_start_session_json(path: Path) -> None:
     payload = {
         "schema_version": 1,
-        "operator_credential": require_value("ROM_OPERATOR_BRIDGE_OPERATOR_CREDENTIAL"),
         "backend_mode": require_value("ROM_OPERATOR_BRIDGE_BACKEND"),
         "requested_capabilities": ["input", "preview", "capture"],
     }

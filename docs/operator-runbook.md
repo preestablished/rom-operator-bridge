@@ -4,7 +4,7 @@ Date: 2026-06-29
 
 This is the operator entry point for running `rom-operator-bridge` without
 reading service source. It intentionally uses placeholders. Keep instantiated
-operator credentials, session secrets, cookie files, endpoint manifests, private
+session secrets, cookie files, endpoint manifests, private
 artifact paths, raw screenshots, capture payloads, verifier reports, and private
 evidence contents outside the repository and out of chat.
 
@@ -33,7 +33,7 @@ Shared docs and bead notes may include command names, placeholder command
 templates, sanitized pass/fail status, and approved evidence labels. They must
 not include:
 
-- operator credentials, session secrets, cookies, auth headers, or tokens;
+- session secrets, cookies, auth headers, or tokens;
 - private endpoint addresses, private env file contents, or host logs;
 - absolute private roots, ROM paths, bundle paths, screenshot paths, or report
   paths;
@@ -69,7 +69,6 @@ ROM_OPERATOR_BRIDGE_BIND_ADDR=<bridge-private-ip>:7410
 ROM_OPERATOR_BRIDGE_BACKEND=<synthetic-or-real>
 ROM_OPERATOR_BRIDGE_PRIVATE_ROOT=<absolute-private-runtime-root>
 ROM_OPERATOR_BRIDGE_STATIC_PUBLISH_ROOT=<absolute-static-release-dir>
-ROM_OPERATOR_BRIDGE_OPERATOR_CREDENTIAL=<operator-credential>
 ROM_OPERATOR_BRIDGE_SESSION_SECRET=<session-secret>
 ```
 
@@ -179,9 +178,9 @@ Open the operator UI at:
 https://rombridge.birb.homes/
 ```
 
-Authenticate with the operator credential. Runtime responses and WebSocket
-handshakes must remain same-origin, authenticated, and `no-store`. Use the UI
-to start, pause/resume, inspect sanitized run status, drive input, trigger
+Use the UI to start the local/Tailscale operator session. Runtime responses and
+WebSocket handshakes must remain same-origin, cookie-authenticated, and
+`no-store`. Use the UI to pause/resume, inspect sanitized run status, drive input, trigger
 captures, label captures, and stop the session. Public notes may record only
 sanitized status and approved evidence labels.
 
@@ -272,9 +271,8 @@ sudo systemctl restart rom-operator-bridge.service
 ```
 
 If the private env file changed, restore the operator-private backup before
-restart. If rotating credentials, update the private env file, rotate the
-session secret when needed, restart the service, and verify old credentials and
-old sessions fail.
+restart. If rotating the session secret, update the private env file, remove any
+deprecated credential key, restart the service, and verify old sessions fail.
 
 ## 9. Remaining Gaps
 

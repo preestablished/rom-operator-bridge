@@ -39,28 +39,13 @@ export function initialAuthSessionState(): AuthSessionState {
   };
 }
 
-export async function submitCredential(
+export async function startOperatorSession(
   state: AuthSessionState,
   client: RuntimeSessionClient,
-  operatorCredential: string,
   backendMode: BackendMode = "synthetic"
 ): Promise<AuthSessionState> {
-  if (operatorCredential.length === 0) {
-    return {
-      ...state,
-      status: "auth_rejected",
-      error: {
-        code: "auth_rejected",
-        message: "Authentication rejected.",
-        retryable: false,
-        details: {}
-      }
-    };
-  }
-
   try {
     const response = await client.startSession({
-      operatorCredential,
       backendMode,
       requestedCapabilities: ["input", "preview", "capture", "labels", "privileged_features"]
     });

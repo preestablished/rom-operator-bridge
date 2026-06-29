@@ -15,8 +15,6 @@ use thiserror::Error;
 pub const ALLOWED_ORIGIN: &str = "https://rombridge.birb.homes";
 pub const SESSION_COOKIE_NAME: &str = "rom_operator_bridge_session";
 pub const SESSION_TTL_SECONDS: u64 = 4 * 60 * 60;
-pub const MAX_FAILED_AUTH_ATTEMPTS: u32 = 3;
-pub const AUTH_RATE_LIMIT_WINDOW_SECONDS: u64 = 60;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperatorSession {
@@ -64,31 +62,13 @@ impl AuthState {
         }
     }
 
-    pub fn login(
+    pub fn start_session(
         &self,
         private_config: &BridgePrivateConfig,
-        credential: &str,
     ) -> Result<OperatorSession, AuthError> {
         let mut inner = self.inner.lock().expect("auth mutex poisoned");
         let now = self.clock.now_unix_seconds();
         inner.clear_expired(now);
-        inner.clear_stale_failures(now);
-
-        if inner.failed_attempts >= MAX_FAILED_AUTH_ATTEMPTS {
-            return Err(AuthError::RateLimited);
-        }
-
-        if !private_config.verify_operator_credential(credential) {
-            if inner.failed_attempts_started_at.is_none() {
-                inner.failed_attempts_started_at = Some(now);
-            }
-            inner.failed_attempts += 1;
-            return if inner.failed_attempts >= MAX_FAILED_AUTH_ATTEMPTS {
-                Err(AuthError::RateLimited)
-            } else {
-                Err(AuthError::BadCredential)
-            };
-        }
 
         if inner.active.is_some() {
             return Err(AuthError::SessionActiveElsewhere);
@@ -105,8 +85,6 @@ impl AuthState {
             token: session.token.clone(),
             expires_at_unix_seconds: session.expires_at_unix_seconds,
         });
-        inner.failed_attempts = 0;
-        inner.failed_attempts_started_at = None;
 
         Ok(session)
     }
@@ -172,8 +150,6 @@ impl AuthClock {
 struct AuthInner {
     active: Option<ActiveSession>,
     next_nonce: u64,
-    failed_attempts: u32,
-    failed_attempts_started_at: Option<u64>,
 }
 
 impl AuthInner {
@@ -184,15 +160,6 @@ impl AuthInner {
             .is_some_and(|session| session.expires_at_unix_seconds <= now_unix_seconds)
         {
             self.active = None;
-        }
-    }
-
-    fn clear_stale_failures(&mut self, now_unix_seconds: u64) {
-        if self.failed_attempts_started_at.is_some_and(|started_at| {
-            now_unix_seconds.saturating_sub(started_at) >= AUTH_RATE_LIMIT_WINDOW_SECONDS
-        }) {
-            self.failed_attempts = 0;
-            self.failed_attempts_started_at = None;
         }
     }
 }
@@ -211,10 +178,6 @@ pub enum AuthError {
     MissingOrigin,
     #[error("origin is not allowed")]
     OriginRejected,
-    #[error("operator credential is invalid")]
-    BadCredential,
-    #[error("too many failed authentication attempts")]
-    RateLimited,
     #[error("an operator session is already active")]
     SessionActiveElsewhere,
     #[error("session cookie is missing")]

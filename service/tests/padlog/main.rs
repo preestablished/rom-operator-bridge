@@ -2,9 +2,7 @@ use rom_operator_bridge_service::{
     artifacts::{ARTIFACT_SCHEMA_VERSION, ArtifactError, PadLogEventRow, PrivateArtifactStore},
     config::ServiceConfig,
     input::{AppliedInputFrame, PadButton, PadLog, PadLogError, PadWord},
-    private_config::{
-        ENV_OPERATOR_CREDENTIAL, ENV_PRIVATE_ROOT, ENV_SESSION_SECRET, PRIVATE_FILE_MODE,
-    },
+    private_config::{ENV_PRIVATE_ROOT, ENV_SESSION_SECRET, PRIVATE_FILE_MODE},
 };
 use serde_json::Value;
 use std::{
@@ -289,10 +287,6 @@ fn private_config() -> (tempfile::TempDir, ServiceConfig, PathBuf) {
         (
             ENV_PRIVATE_ROOT.to_string(),
             private_root.display().to_string(),
-        ),
-        (
-            ENV_OPERATOR_CREDENTIAL.to_string(),
-            "operator-credential-from-test-source".to_string(),
         ),
         (
             ENV_SESSION_SECRET.to_string(),

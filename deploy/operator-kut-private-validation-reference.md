@@ -28,7 +28,6 @@ set -a
 . "$PRIVATE_ENV"
 set +a
 
-: "${ROM_OPERATOR_BRIDGE_OPERATOR_CREDENTIAL:?missing ROM_OPERATOR_BRIDGE_OPERATOR_CREDENTIAL}"
 : "${ROM_OPERATOR_BRIDGE_SESSION_SECRET:?missing ROM_OPERATOR_BRIDGE_SESSION_SECRET}"
 : "${ROM_OPERATOR_BRIDGE_BIND_ADDR:?missing ROM_OPERATOR_BRIDGE_BIND_ADDR}"
 : "${ROM_OPERATOR_BRIDGE_BACKEND:?missing ROM_OPERATOR_BRIDGE_BACKEND}"
@@ -100,7 +99,7 @@ chmod 700 "$VALIDATION_DIR" "$PRIVATE_ARTIFACT_DIR"
 
 `BRIDGE_IP` must match the trusted private bridge address used by the private
 endpoint manifest from runbook step 4. The preflight refuses to send the
-operator credential if the address is empty, wildcard-like, loopback, or
+session-start request if the address is empty, wildcard-like, loopback, or
 different from the reviewed manifest.
 
 ## 3. Create A Throwaway Session Cookie

@@ -10,13 +10,12 @@ use rom_operator_bridge_service::{
     auth::{ALLOWED_ORIGIN, AuthState, SESSION_TTL_SECONDS},
     backend::{BridgeBackend, SessionState, SyntheticBackend},
     config::ServiceConfig,
-    private_config::{ENV_OPERATOR_CREDENTIAL, ENV_PRIVATE_ROOT, ENV_SESSION_SECRET},
+    private_config::{ENV_PRIVATE_ROOT, ENV_SESSION_SECRET},
 };
 use serde_json::{Value, json};
 use std::{fs, os::unix::fs::PermissionsExt, path::Path, sync::Arc};
 use tower::ServiceExt;
 
-const GOOD_CREDENTIAL: &str = "operator-credential-from-test-source";
 const SESSION_SECRET: &str = "session-secret-from-test-source-32-bytes";
 
 #[tokio::test]
@@ -385,10 +384,6 @@ fn config(private_root: &Path) -> ServiceConfig {
             ENV_PRIVATE_ROOT.to_string(),
             private_root.display().to_string(),
         ),
-        (
-            ENV_OPERATOR_CREDENTIAL.to_string(),
-            GOOD_CREDENTIAL.to_string(),
-        ),
         (ENV_SESSION_SECRET.to_string(), SESSION_SECRET.to_string()),
     ])
     .expect("private config loads")
@@ -402,7 +397,6 @@ async fn start_session(app: axum::Router) -> (Value, String) {
             Body::from(
                 json!({
                     "schema_version": 1,
-                    "operator_credential": GOOD_CREDENTIAL,
                     "backend_mode": "synthetic",
                     "requested_capabilities": ["input"]
                 })

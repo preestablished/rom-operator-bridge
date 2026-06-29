@@ -53,11 +53,9 @@ The env file needs real operator-approved values for these keys:
 | `ROM_OPERATOR_BRIDGE_BACKEND` | `<synthetic-or-real>` |
 | `ROM_OPERATOR_BRIDGE_PRIVATE_ROOT` | `/var/lib/rom-operator-bridge/private` |
 | `ROM_OPERATOR_BRIDGE_STATIC_PUBLISH_ROOT` | `<absolute-static-release-dir>` |
-| `ROM_OPERATOR_BRIDGE_OPERATOR_CREDENTIAL` | `<operator-credential>` |
 | `ROM_OPERATOR_BRIDGE_SESSION_SECRET` | `<session-secret>` |
 
-Generate missing operator credential and session secret values without printing
-them:
+Generate the missing session secret without printing it:
 
 ```sh
 sudo python3 scripts/generate-operator-auth.py \

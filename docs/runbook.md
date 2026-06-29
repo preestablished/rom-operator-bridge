@@ -16,7 +16,6 @@ Use placeholders exactly as placeholders in shared docs:
 ROM_OPERATOR_BRIDGE_CONFIG_FILE=<absolute-path-to-uncommitted-env-file>
 ROM_OPERATOR_BRIDGE_PRIVATE_ROOT=<absolute-private-runtime-root>
 ROM_OPERATOR_BRIDGE_STATIC_PUBLISH_ROOT=<absolute-static-publish-root>
-ROM_OPERATOR_BRIDGE_OPERATOR_CREDENTIAL=<operator-credential-from-secret-source>
 ROM_OPERATOR_BRIDGE_SESSION_SECRET=<session-secret-from-secret-source>
 ```
 
@@ -86,8 +85,7 @@ Expected shape:
 ```
 
 `GET /health` must not expose private paths, credentials, runtime artifact refs,
-or host-control details. Authenticated runtime requests must use the private
-operator credential source; do not paste credential-bearing request bodies into
+or host-control details. Runtime requests must not put credentials in URLs or
 shared logs.
 
 ## Agent-Runnable Synthetic Checks
@@ -258,8 +256,8 @@ write durable private capture payloads plus `captures/index.jsonl`.
 
 ## Deployment Checks
 
-The deployment route, bind, proxy, credential-source, TTL, restart, and rollback
-contract is recorded in `docs/deployment-note.md`.
+The deployment route, bind, proxy, session-secret source, TTL, restart, and
+rollback contract is recorded in `docs/deployment-note.md`.
 
 Future deployment checks once a service and route exist:
 

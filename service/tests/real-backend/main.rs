@@ -20,9 +20,9 @@ use rom_operator_bridge_service::{
     config::{ENV_BACKEND_MODE, ServiceConfig},
     input::{PadButton, PadLog, PadWord},
     private_config::{
-        ENV_CAPTURE_SPEC_REF, ENV_CREATE_VM_CONFIG_REF, ENV_HYPERVISOR_ENDPOINT,
-        ENV_OPERATOR_CREDENTIAL, ENV_PRIVATE_ROOT, ENV_REAL_SNAPSHOT_REF,
-        ENV_REFERENCE_WORKLOAD_CHECKOUT, ENV_SESSION_SECRET, ENV_WORKLOAD_IMAGE_REF,
+        ENV_CAPTURE_SPEC_REF, ENV_CREATE_VM_CONFIG_REF, ENV_HYPERVISOR_ENDPOINT, ENV_PRIVATE_ROOT,
+        ENV_REAL_SNAPSHOT_REF, ENV_REFERENCE_WORKLOAD_CHECKOUT, ENV_SESSION_SECRET,
+        ENV_WORKLOAD_IMAGE_REF,
     },
     sanitization::PublicSanitizer,
 };
@@ -38,7 +38,7 @@ use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
 use tonic::{Request as TonicRequest, Response as TonicResponse, Status, transport::Server};
 use tower::{Service, ServiceExt};
 
-const GOOD_CREDENTIAL: &str = "operator-credential-from-test-source";
+const SECRET_LITERAL: &str = "private-secret-from-test-source";
 const SESSION_SECRET: &str = "session-secret-from-test-source-32-bytes";
 const WORKLOAD_IMAGE_REF: &str = "private-workload-image-ref-from-test";
 const CAPTURE_SPEC_REF: &str = "private-capture-spec-ref-from-test";
@@ -60,7 +60,6 @@ async fn real_start_without_attached_worker_returns_sanitized_backend_unavailabl
             Body::from(
                 json!({
                     "schema_version": 1,
-                    "operator_credential": GOOD_CREDENTIAL,
                     "backend_mode": "real",
                     "requested_capabilities": ["input", "preview", "capture"]
                 })
@@ -1694,10 +1693,6 @@ fn real_config_with_start(
             ENV_PRIVATE_ROOT.to_string(),
             private_root.display().to_string(),
         ),
-        (
-            ENV_OPERATOR_CREDENTIAL.to_string(),
-            GOOD_CREDENTIAL.to_string(),
-        ),
         (ENV_SESSION_SECRET.to_string(), SESSION_SECRET.to_string()),
         (ENV_HYPERVISOR_ENDPOINT.to_string(), endpoint.to_string()),
         (
@@ -1772,7 +1767,6 @@ fn start_body(backend_mode: &str) -> String {
 fn start_body_with_capabilities(backend_mode: &str, capabilities: &[&str]) -> String {
     json!({
         "schema_version": 1,
-        "operator_credential": GOOD_CREDENTIAL,
         "backend_mode": backend_mode,
         "requested_capabilities": capabilities
     })
@@ -1867,7 +1861,7 @@ fn assert_public_json_sanitized_with_worker_text(
     let lease_token = String::from_utf8(LEASE_TOKEN.to_vec()).expect("lease token utf8");
     PublicSanitizer::new()
         .with_private_root(private_root)
-        .with_forbidden_literal(GOOD_CREDENTIAL)
+        .with_forbidden_literal(SECRET_LITERAL)
         .with_forbidden_literal(SESSION_SECRET)
         .with_forbidden_literal(worker_text)
         .with_forbidden_literal(endpoint)

@@ -6,7 +6,7 @@ use rom_operator_bridge_service::{
     },
     private_config::{
         ENV_CAPTURE_SPEC_REF, ENV_CONFIG_FILE, ENV_CREATE_VM_CONFIG_REF, ENV_HYPERVISOR_ENDPOINT,
-        ENV_OPERATOR_CREDENTIAL, ENV_PRIVATE_ROOT, ENV_PRIVATE_ROOT_ALIAS, ENV_REAL_SNAPSHOT_REF,
+        ENV_PRIVATE_ROOT, ENV_PRIVATE_ROOT_ALIAS, ENV_REAL_SNAPSHOT_REF,
         ENV_REFERENCE_WORKLOAD_CHECKOUT, ENV_SESSION_SECRET, ENV_STATIC_PUBLISH_ROOT,
         ENV_WORKLOAD_IMAGE_REF, PRIVATE_DIR_MODE, PRIVATE_FILE_MODE, PRIVATE_ROOT_MARKER,
         PRIVATE_RUN_DIRS, PrivateConfigError,
@@ -34,7 +34,6 @@ fn placeholder_config_loads_without_private_values() {
     assert!(config.private_config().is_placeholder());
     assert!(config.private_config().private_root().is_none());
     assert!(config.private_config().static_publish_root().is_none());
-    assert!(!config.private_config().operator_credential_configured());
     assert!(!config.private_config().session_secret_configured());
 }
 
@@ -186,10 +185,6 @@ fn config_file_loads_private_values_and_creates_private_dirs() {
             (ENV_BACKEND_MODE, "synthetic".to_string()),
             (ENV_PRIVATE_ROOT, private_root.display().to_string()),
             (
-                ENV_OPERATOR_CREDENTIAL,
-                "operator-credential-from-test-source".to_string(),
-            ),
-            (
                 ENV_SESSION_SECRET,
                 "session-secret-from-test-source-32-bytes".to_string(),
             ),
@@ -232,7 +227,7 @@ fn complete_private_config_requires_secrets() {
     assert_eq!(
         ServiceConfig::from_pairs([(ENV_PRIVATE_ROOT, private_root.display().to_string())]),
         Err(ConfigError::PrivateConfig(PrivateConfigError::MissingEnv {
-            env: ENV_OPERATOR_CREDENTIAL,
+            env: ENV_SESSION_SECRET,
         }))
     );
 
@@ -339,10 +334,6 @@ fn bridge_private_root_alias_configures_private_root() {
             private_root.display().to_string(),
         ),
         (
-            ENV_OPERATOR_CREDENTIAL.to_string(),
-            "operator-credential-from-test-source".to_string(),
-        ),
-        (
             ENV_SESSION_SECRET.to_string(),
             "session-secret-from-test-source-32-bytes".to_string(),
         ),
@@ -366,15 +357,11 @@ fn placeholder_secret_values_are_rejected() {
                 ENV_PRIVATE_ROOT.to_string(),
                 private_root.display().to_string(),
             ),
-            (ENV_OPERATOR_CREDENTIAL.to_string(), "change-me".to_string()),
-            (
-                ENV_SESSION_SECRET.to_string(),
-                "session-secret-from-test-source-32-bytes".to_string(),
-            ),
+            (ENV_SESSION_SECRET.to_string(), "change-me".to_string()),
         ]),
         Err(ConfigError::PrivateConfig(
             PrivateConfigError::PlaceholderSecret {
-                env: ENV_OPERATOR_CREDENTIAL,
+                env: ENV_SESSION_SECRET,
             }
         ))
     );
@@ -393,7 +380,6 @@ fn env_file_parser_accepts_export_whitespace_and_quotes() {
 # comments and blank lines are ignored
 export {ENV_BIND_ADDR} = "127.0.0.1:8888"
 {ENV_PRIVATE_ROOT} = '{}'
-{ENV_OPERATOR_CREDENTIAL} = "operator-credential-from-test-source"
 {ENV_SESSION_SECRET} = 'session-secret-from-test-source-32-bytes'
 "#,
             private_root.display(),
@@ -427,10 +413,6 @@ fn private_config_file_must_be_0600() {
         &[
             (ENV_PRIVATE_ROOT, private_root.display().to_string()),
             (
-                ENV_OPERATOR_CREDENTIAL,
-                "operator-credential-from-test-source".to_string(),
-            ),
-            (
                 ENV_SESSION_SECRET,
                 "session-secret-from-test-source-32-bytes".to_string(),
             ),
@@ -460,10 +442,6 @@ fn private_config_file_must_not_be_a_symlink() {
         &real_config_file,
         &[
             (ENV_PRIVATE_ROOT, private_root.display().to_string()),
-            (
-                ENV_OPERATOR_CREDENTIAL,
-                "operator-credential-from-test-source".to_string(),
-            ),
             (
                 ENV_SESSION_SECRET,
                 "session-secret-from-test-source-32-bytes".to_string(),
@@ -706,11 +684,6 @@ fn private_config_sanitizer_rejects_configured_root_and_secrets() {
     );
     assert!(
         sanitizer
-            .inspect_text("operator-credential-from-test-source")
-            .is_err()
-    );
-    assert!(
-        sanitizer
             .inspect_text("session-secret-from-test-source-32-bytes")
             .is_err()
     );
@@ -796,7 +769,6 @@ fn committed_files_do_not_include_private_config_or_values() {
             }
 
             for secret_env in [
-                ENV_OPERATOR_CREDENTIAL,
                 ENV_SESSION_SECRET,
                 ENV_HYPERVISOR_ENDPOINT,
                 ENV_WORKLOAD_IMAGE_REF,
@@ -836,13 +808,6 @@ fn committed_scan_detects_assignment_variants() {
     );
     assert_eq!(
         assignment_value(
-            "ROM_OPERATOR_BRIDGE_OPERATOR_CREDENTIAL=<operator-credential-from-secret-source>",
-            ENV_OPERATOR_CREDENTIAL,
-        ),
-        Some("<operator-credential-from-secret-source>".to_string())
-    );
-    assert_eq!(
-        assignment_value(
             "BRIDGE_CAPTURE_SPEC_REF='$BRIDGE_CAPTURE_SPEC_REF'",
             ENV_CAPTURE_SPEC_REF
         ),
@@ -862,10 +827,6 @@ fn complete_private_pairs(private_root: &Path) -> Vec<(String, String)> {
         (
             ENV_PRIVATE_ROOT.to_string(),
             private_root.display().to_string(),
-        ),
-        (
-            ENV_OPERATOR_CREDENTIAL.to_string(),
-            "operator-credential-from-test-source".to_string(),
         ),
         (
             ENV_SESSION_SECRET.to_string(),

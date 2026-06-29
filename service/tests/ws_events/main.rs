@@ -16,7 +16,7 @@ use rom_operator_bridge_service::{
         StoppedSession,
     },
     config::ServiceConfig,
-    private_config::{ENV_OPERATOR_CREDENTIAL, ENV_PRIVATE_ROOT, ENV_SESSION_SECRET},
+    private_config::{ENV_PRIVATE_ROOT, ENV_SESSION_SECRET},
     sanitization::PublicSanitizer,
     validation_status::{ValidationRunStatus, ValidationRunUpdate},
 };
@@ -38,7 +38,7 @@ use tokio_tungstenite::{
 };
 use tower::ServiceExt;
 
-const GOOD_CREDENTIAL: &str = "operator-credential-from-test-source";
+const SECRET_LITERAL: &str = "private-secret-from-test-source";
 const SESSION_SECRET: &str = "session-secret-from-test-source-32-bytes";
 const SESSION_ID: &str = "synthetic-session-events";
 const RUN_ID: &str = "synthetic-run-events";
@@ -380,7 +380,7 @@ fn assert_matches_runtime_schema(json: &Value) {
 fn assert_sanitized_ordered_events(messages: &[Value], private_root: &Path) {
     let sanitizer = PublicSanitizer::new()
         .with_private_root(private_root)
-        .with_forbidden_literal(GOOD_CREDENTIAL)
+        .with_forbidden_literal(SECRET_LITERAL)
         .with_forbidden_literal(SESSION_SECRET);
     let mut last_seq = 0;
 
@@ -401,7 +401,7 @@ fn assert_sanitized_ordered_events(messages: &[Value], private_root: &Path) {
             .inspect_event(message)
             .expect("event is public-safe");
         let serialized = message.to_string();
-        assert!(!serialized.contains(GOOD_CREDENTIAL));
+        assert!(!serialized.contains(SECRET_LITERAL));
         assert!(!serialized.contains(SESSION_SECRET));
         assert!(!serialized.contains(&private_root.display().to_string()));
         assert!(!serialized.contains("raw_payload"));
@@ -427,7 +427,6 @@ async fn login_cookie(app: axum::Router) -> String {
                 .body(Body::from(
                     json!({
                         "schema_version": 1,
-                        "operator_credential": GOOD_CREDENTIAL,
                         "backend_mode": "synthetic",
                         "requested_capabilities": ["input", "preview", "capture"]
                     })
@@ -504,10 +503,6 @@ fn config(private_root: &Path) -> ServiceConfig {
         (
             ENV_PRIVATE_ROOT.to_string(),
             private_root.display().to_string(),
-        ),
-        (
-            ENV_OPERATOR_CREDENTIAL.to_string(),
-            GOOD_CREDENTIAL.to_string(),
         ),
         (ENV_SESSION_SECRET.to_string(), SESSION_SECRET.to_string()),
     ])

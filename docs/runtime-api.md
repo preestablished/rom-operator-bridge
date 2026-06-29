@@ -31,6 +31,10 @@ boundary includes:
 { "schema_version": 1 }
 ```
 
+The passwordless session-start shape is a deliberate breaking deployment cutover
+within runtime API version 1. Deploy the UI and service together; older clients
+that still send a password field are rejected as invalid start-session requests.
+
 Service behavior:
 
 - reject inbound HTTP JSON with a missing or non-`1` `schema_version` as
@@ -83,7 +87,7 @@ Route-to-schema map:
 | --- | --- | --- | --- |
 | `GET /health` | none | `healthResponse` | Public liveness; no private paths. |
 | `GET /api/session` | none | `sessionResponse` | Requires authenticated session cookie when active. |
-| `POST /api/session/start` | `startSessionRequest` | `startSessionResponse` | Only route that accepts `operator_credential`. |
+| `POST /api/session/start` | `startSessionRequest` | `startSessionResponse` | Creates the single local/Tailscale operator session. |
 | `POST /api/session/stop` | `stopSessionRequest` | `stopSessionResponse` | Releases backend lease/slot when present. |
 | `GET /api/run/status` | none | `runStatusResponse` | Runtime no-store headers required. |
 | `POST /api/run/pause` | `sessionOnlyRequest` | `runStateResponse` | Real backend maps to `Pause`; synthetic mirrors state. |
@@ -130,8 +134,8 @@ Phase 0 freezes these deviations from the initial
 
 ## Auth And Session
 
-- `POST /api/session/start` is the only route that accepts
-  `operator_credential`.
+- `POST /api/session/start` does not accept a password field. The deployment
+  boundary is the local or Tailscale network plus same-origin/Host validation.
 - Successful session start sets an `HttpOnly; Secure; SameSite=Strict` cookie
   scoped to `/`.
 - WebSocket handshakes authenticate with the same cookie.
@@ -234,7 +238,7 @@ The runtime API must not expose:
 
 - private filesystem paths;
 - worker lease tokens;
-- operator credentials;
+- session secrets or cookies;
 - raw framebuffer bytes except through no-store image response bodies;
 - feature bytes;
 - decoded feature arrays outside the authenticated privileged feature route;

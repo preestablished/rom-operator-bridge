@@ -4,7 +4,7 @@ use rom_operator_bridge_service::{
         ChangedOffsetRange, DedupGroup, DedupRelation, DedupStatus, LabelSnapshot,
         LabelTargetSnapshot, StatusLabelRole, StatusLabelSnapshot,
     },
-    private_config::{ENV_OPERATOR_CREDENTIAL, ENV_PRIVATE_ROOT, ENV_SESSION_SECRET},
+    private_config::{ENV_PRIVATE_ROOT, ENV_SESSION_SECRET},
     verifier::{PrivateVerifierPath, VerifierTransformError, write_phase4_verifier_inputs},
 };
 use serde_json::{Value, json};
@@ -13,7 +13,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const GOOD_CREDENTIAL: &str = "operator-credential-from-test-source";
 const SESSION_SECRET: &str = "session-secret-from-test-source-32-bytes";
 
 #[test]
@@ -365,10 +364,6 @@ fn private_config() -> (tempfile::TempDir, ServiceConfig, PathBuf) {
         (
             ENV_PRIVATE_ROOT.to_string(),
             private_root.display().to_string(),
-        ),
-        (
-            ENV_OPERATOR_CREDENTIAL.to_string(),
-            GOOD_CREDENTIAL.to_string(),
         ),
         (ENV_SESSION_SECRET.to_string(), SESSION_SECRET.to_string()),
     ])

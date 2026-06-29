@@ -26,7 +26,6 @@ REQUIRED_KEYS = (
     "ROM_OPERATOR_BRIDGE_BACKEND",
     "ROM_OPERATOR_BRIDGE_PRIVATE_ROOT",
     "ROM_OPERATOR_BRIDGE_STATIC_PUBLISH_ROOT",
-    "ROM_OPERATOR_BRIDGE_OPERATOR_CREDENTIAL",
     "ROM_OPERATOR_BRIDGE_SESSION_SECRET",
 )
 
@@ -35,6 +34,8 @@ REAL_REQUIRED_KEYS = (
     "BRIDGE_CAPTURE_SPEC_REF",
     "BRIDGE_REFERENCE_WORKLOAD_CHECKOUT",
 )
+
+DEPRECATED_KEYS = ("ROM_OPERATOR_BRIDGE_OPERATOR_CREDENTIAL",)
 
 PLACEHOLDER_VALUES = {
     "changeme",
@@ -442,7 +443,10 @@ def validate_backend(values: dict[str, str], reporter: Reporter) -> None:
 def validate_values(values: dict[str, str], reporter: Reporter) -> None:
     for key in REQUIRED_KEYS:
         require_nonempty(values, key, reporter)
-    for key in ("ROM_OPERATOR_BRIDGE_OPERATOR_CREDENTIAL", "ROM_OPERATOR_BRIDGE_SESSION_SECRET"):
+    for key in DEPRECATED_KEYS:
+        if values.get(key, "").strip():
+            reporter.warn("deprecated_key", f"{key} is ignored; remove it after session-secret rotation")
+    for key in ("ROM_OPERATOR_BRIDGE_SESSION_SECRET",):
         reject_placeholder(values, key, reporter)
 
     validate_bind_addr(values, reporter)

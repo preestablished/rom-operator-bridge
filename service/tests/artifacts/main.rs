@@ -6,10 +6,7 @@ use rom_operator_bridge_service::{
         RunManifest, ValidationRunRow,
     },
     backend::BackendMode,
-    private_config::{
-        ENV_OPERATOR_CREDENTIAL, ENV_PRIVATE_ROOT, ENV_SESSION_SECRET, PRIVATE_DIR_MODE,
-        PRIVATE_FILE_MODE,
-    },
+    private_config::{ENV_PRIVATE_ROOT, ENV_SESSION_SECRET, PRIVATE_DIR_MODE, PRIVATE_FILE_MODE},
 };
 use serde_json::Value;
 use std::{
@@ -449,10 +446,6 @@ fn private_config() -> (
         (
             ENV_PRIVATE_ROOT.to_string(),
             private_root.display().to_string(),
-        ),
-        (
-            ENV_OPERATOR_CREDENTIAL.to_string(),
-            "operator-credential-from-test-source".to_string(),
         ),
         (
             ENV_SESSION_SECRET.to_string(),

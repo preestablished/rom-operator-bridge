@@ -108,7 +108,7 @@ static release or after changing any of the following:
   endpoint manifest;
 - runtime authentication, Origin/CORS, WebSocket, cache headers, static asset
   generation, or redaction rules;
-- operator credential, session secret, private forbid file, or real backend
+- session secret, private forbid file, or real backend
   handoff values.
 
 ## References

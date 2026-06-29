@@ -39,7 +39,7 @@ describe("mounted auth/session screen", () => {
     expect(root.textContent).toContain("session-001");
   });
 
-  it("clears submitted form credentials and ignores stale refresh results", async () => {
+  it("starts from the locked form and ignores stale refresh results", async () => {
     const refresh = deferred(activeSessionResponse("stale-session"));
     const start = deferred(startSessionResponse("session-002"));
     const client = mockClient({
@@ -49,15 +49,11 @@ describe("mounted auth/session screen", () => {
     const root = document.createElement("div");
 
     mountOperatorApp(root, config, client, null);
-    const input = root.querySelector<HTMLInputElement>("input[name='operator_credential']");
     const form = root.querySelector<HTMLFormElement>("form[data-session-form='start']");
-    expect(input).not.toBeNull();
     expect(form).not.toBeNull();
 
-    input!.value = "operator-secret";
     form!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
 
-    expect(root.querySelector<HTMLInputElement>("input[name='operator_credential']")?.value).toBe("");
     expect(root.querySelector<HTMLButtonElement>("button[type='submit']")?.disabled).toBe(true);
     await flushPromises();
     expect(client.startSession).toHaveBeenCalledTimes(1);
@@ -69,7 +65,6 @@ describe("mounted auth/session screen", () => {
     start.resolve(startSessionResponse("session-002"));
     await flushPromises();
     expect(root.textContent).toContain("session-002");
-    expect(root.textContent).not.toContain("operator-secret");
   });
 
   it("uses the health backend mode when starting a session", async () => {
@@ -81,16 +76,13 @@ describe("mounted auth/session screen", () => {
 
     mountOperatorApp(root, config, client, null);
     await flushPromises();
-    const input = root.querySelector<HTMLInputElement>("input[name='operator_credential']");
     const form = root.querySelector<HTMLFormElement>("form[data-session-form='start']");
 
-    input!.value = "operator-secret";
     form!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
     await flushPromises();
     await flushPromises();
 
     expect(client.startSession).toHaveBeenCalledWith({
-      operatorCredential: "operator-secret",
       backendMode: "real",
       requestedCapabilities: ["input", "preview", "capture", "labels", "privileged_features"]
     });
@@ -140,10 +132,8 @@ describe("mounted auth/session screen", () => {
     try {
       mountOperatorApp(root, config, client, null);
       const liveRegion = root.querySelector(".session-live");
-      const input = root.querySelector<HTMLInputElement>("input[name='operator_credential']");
       const form = root.querySelector<HTMLFormElement>("form[data-session-form='start']");
 
-      input!.value = "bad-secret";
       form!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
       await flushPromises();
 

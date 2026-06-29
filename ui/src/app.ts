@@ -2,7 +2,7 @@ import {
   initialAuthSessionState,
   logoutSession,
   refreshSession,
-  submitCredential,
+  startOperatorSession,
   type AuthSessionState,
   type RuntimeSessionClient
 } from "./authSession";
@@ -430,7 +430,7 @@ export function mountOperatorApp(
   const appRegion = root.querySelector<HTMLElement>("[data-operator-app]");
   const liveRegion = root.querySelector<HTMLElement>(".session-live");
 
-  const render = (focusTarget?: "alert" | "credential" | "logout") => {
+  const render = (focusTarget?: "alert" | "start" | "logout") => {
     if (!appRegion || !liveRegion) {
       return;
     }
@@ -738,7 +738,7 @@ export function mountOperatorApp(
       recoveryEvents = [];
       clearInputSources(false);
       padlogTail = [];
-      render("credential");
+      render("start");
       return;
     }
 
@@ -1060,9 +1060,6 @@ export function mountOperatorApp(
       return;
     }
 
-    const formData = new FormData(form);
-    const credential = String(formData.get("operator_credential") ?? "");
-    form.reset();
     const requestSeq = ++authRequestSeq;
     auth = { ...auth, status: "starting", error: null };
     validationStatus = INITIAL_VALIDATION_STATUS;
@@ -1074,7 +1071,7 @@ export function mountOperatorApp(
     previewRequestSeq += 1;
     render();
     refreshServiceBackendMode()
-      .then((backendMode) => submitCredential(auth, client, credential, backendMode))
+      .then((backendMode) => startOperatorSession(auth, client, backendMode))
       .then((next) => {
         applyAuthResult(requestSeq, next);
       });
@@ -1680,7 +1677,7 @@ export function mountOperatorApp(
   globalThis.addEventListener?.("pagehide", () => updateFocusState("hidden"));
 
   void refreshServiceBackendMode();
-  render("credential");
+  render("start");
   const refreshSeq = ++authRequestSeq;
   refreshSession(auth, client).then((next) => {
     applyAuthResult(refreshSeq, next);
@@ -2727,20 +2724,8 @@ function renderSessionPanel(model: OperatorViewModel): string {
               <div><dt>Focus</dt><dd>${focusLabel(model.focusState)}</dd></div>
             </dl>`
           : `<form class="session-form" data-session-form="start" autocomplete="off">
-              <label>
-                Operator credential
-                <input
-                  type="password"
-                  name="operator_credential"
-                  data-credential-input
-                  autocomplete="one-time-code"
-                  autocapitalize="none"
-                  spellcheck="false"
-                  required
-                />
-              </label>
               <div class="button-row">
-                <button type="submit" ${auth.status === "starting" ? "disabled" : ""}>Start</button>
+                <button type="submit" data-start-session-button ${auth.status === "starting" ? "disabled" : ""}>Start</button>
                 <button type="button" disabled>Pause</button>
                 <button type="button" disabled>Resume</button>
                 <button type="button" class="danger" disabled>Stop</button>
@@ -2875,20 +2860,20 @@ function focusLabel(state: FocusState): string {
   }
 }
 
-function focusTargetForAuth(auth: AuthSessionState): "alert" | "credential" | "logout" {
+function focusTargetForAuth(auth: AuthSessionState): "alert" | "start" | "logout" {
   if (auth.error) {
     return "alert";
   }
   if (auth.status === "active") {
     return "logout";
   }
-  return "credential";
+  return "start";
 }
 
-function focusSessionTarget(root: HTMLElement, target: "alert" | "credential" | "logout"): void {
+function focusSessionTarget(root: HTMLElement, target: "alert" | "start" | "logout"): void {
   const selector = {
     alert: "[data-session-alert]",
-    credential: "[data-credential-input]",
+    start: "[data-start-session-button]",
     logout: "[data-session-action='logout']"
   }[target];
   root.querySelector<HTMLElement>(selector)?.focus();

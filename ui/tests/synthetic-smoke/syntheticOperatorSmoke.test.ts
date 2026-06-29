@@ -117,15 +117,12 @@ describe("synthetic operator smoke", () => {
 
     mountOperatorApp(root, config, client, socketClient.client);
     await flushPromises();
-    root.querySelector<HTMLInputElement>("input[name='operator_credential']")!.value =
-      "synthetic-operator-credential";
     root
       .querySelector<HTMLFormElement>("form[data-session-form='start']")!
       .dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
     await flushPromises();
 
     expect(client.startSession).toHaveBeenCalledWith({
-      operatorCredential: "synthetic-operator-credential",
       backendMode: "synthetic",
       requestedCapabilities: ["input", "preview", "capture", "labels", "privileged_features"]
     });
@@ -228,7 +225,7 @@ describe("synthetic operator smoke", () => {
     await flushPromises();
     expect(client.stopSession).toHaveBeenCalledWith("session-001");
     expect(root.querySelector("form[data-session-form='start']")).not.toBeNull();
-    expect(root.textContent ?? "").not.toMatch(/synthetic-operator-credential|private\.env/i);
+    expect(root.textContent ?? "").not.toMatch(/session-secret-from-test|private\.env/i);
   });
 
   it("redacts failed synthetic auth during the smoke startup path", async () => {
@@ -236,7 +233,7 @@ describe("synthetic operator smoke", () => {
       startSession: vi.fn().mockRejectedValue(
         new RuntimeApiError({
           code: "auth_rejected",
-          message: "bad credential at /home/operator/private.env with synthetic-operator-credential",
+          message: "bad session secret at /home/operator/private.env with session-secret-from-test",
           retryable: false,
           details: {}
         })
@@ -247,8 +244,6 @@ describe("synthetic operator smoke", () => {
 
     mountOperatorApp(root, config, client, null);
     await flushPromises();
-    root.querySelector<HTMLInputElement>("input[name='operator_credential']")!.value =
-      "synthetic-operator-credential";
     root
       .querySelector<HTMLFormElement>("form[data-session-form='start']")!
       .dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
@@ -256,7 +251,7 @@ describe("synthetic operator smoke", () => {
 
     expect(root.querySelector("[data-session-alert]")?.textContent).toContain("Request failed.");
     expect(root.textContent ?? "").not.toMatch(
-      /\/home\/|private\.env|synthetic-operator-credential/i
+      /\/home\/|private\.env|session-secret-from-test/i
     );
   });
 });

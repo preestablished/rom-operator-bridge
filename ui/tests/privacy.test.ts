@@ -18,9 +18,9 @@ const FORBIDDEN_STATIC_PAYLOADS = [
       /(?:^|[\s:=("'`])(?:\/(?:home|Users|opt|srv|mnt|Volumes|tmp)\/|\/var\/(?:lib|log|tmp|run|secrets?)\/|\/run\/(?:dh|private|secret|rom|operator)\/|[A-Za-z]:\\(?:Users|rombridge|private)\\)[^\s"'`<>)]+/i
   },
   {
-    label: "operator credential or token value",
+    label: "secret or token value",
     pattern:
-      /operator-secret|(?:operator_credential|credential|password|secret|token)\s*[:=]\s*["']?(?![A-Za-z_$]{1,3}\.)[A-Za-z0-9._:/+=-]{6,}|Bearer\s+[A-Za-z0-9._-]{8,}/i
+      /session-secret|(?:credential|password|secret|token)\s*[:=]\s*["']?(?![A-Za-z_$]{1,3}\.)[A-Za-z0-9._:/+=-]{6,}|Bearer\s+[A-Za-z0-9._-]{8,}/i
   },
   {
     label: "real-run capture id",
@@ -101,7 +101,7 @@ describe("browser privacy boundaries", () => {
       textFile("private-path-srv.txt", "root: /srv/corpus/private"),
       textFile("private-path-mnt.txt", "bundle=/mnt/private/capture.bin"),
       textFile("private-path-volume.txt", "report: /Volumes/private/report.json"),
-      textFile("credential.txt", '"operator_credential": "operator-secret"'),
+      textFile("secret.txt", '"session_secret": "session-secret"'),
       textFile("token.txt", "token: abcdef123456"),
       textFile("capture-id.txt", "real-capture-9f86d081884c7d65"),
       textFile("preview.txt", "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAA"),

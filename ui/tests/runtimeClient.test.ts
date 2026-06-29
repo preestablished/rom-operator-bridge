@@ -50,7 +50,6 @@ describe("runtime API client", () => {
 
     const health = await client.health();
     const started = await client.startSession({
-      operatorCredential: "operator-secret",
       requestedCapabilities: ["input", "preview"]
     });
     const model = applyRunStatus(modelFromStartSession(started), await client.runStatus());
@@ -121,10 +120,10 @@ describe("runtime API client", () => {
       "/api/labels",
       "/api/labels"
     ]);
-    expect(fetcher.calls[1]?.url).not.toContain("operator-secret");
-    expect(bodyAt(fetcher, 1)).toMatchObject({
+    expect(bodyAt(fetcher, 1)).toEqual({
       schema_version: 1,
-      operator_credential: "operator-secret"
+      backend_mode: "synthetic",
+      requested_capabilities: ["input", "preview"]
     });
     expect(bodyAt(fetcher, 5)).toEqual({
       schema_version: 1,
@@ -156,9 +155,7 @@ describe("runtime API client", () => {
     const fetcher = queuedFetch([{ ...startSessionResponse(), schema_version: 2 }]);
     const client = new RuntimeApiClient(config, { fetcher });
 
-    await expect(
-      client.startSession({ operatorCredential: "operator-secret" })
-    ).rejects.toMatchObject({
+    await expect(client.startSession({})).rejects.toMatchObject({
       display: {
         code: "bad_request",
         message: "Runtime schema mismatch.",
@@ -217,7 +214,7 @@ describe("runtime API client", () => {
     }> = [
       {
         payload: { ...startSessionResponse(), session_id: "../private" },
-        request: (client) => client.startSession({ operatorCredential: "operator-secret" })
+        request: (client) => client.startSession({})
       },
       {
         payload: { ...frameCurrentResponse(), image_url: "https://example.test/private.png" },

@@ -7,13 +7,10 @@ use axum::{
 };
 use rom_operator_bridge_service::{
     api::{AppState, router},
-    auth::{
-        ALLOWED_ORIGIN, AUTH_RATE_LIMIT_WINDOW_SECONDS, AuthState, MAX_FAILED_AUTH_ATTEMPTS,
-        SESSION_COOKIE_NAME, SESSION_TTL_SECONDS,
-    },
+    auth::{ALLOWED_ORIGIN, AuthState, SESSION_COOKIE_NAME, SESSION_TTL_SECONDS},
     config::{ENV_BACKEND_MODE, ENV_DEPLOYMENT_PROFILES, ServiceConfig},
     private_config::{
-        ENV_CAPTURE_SPEC_REF, ENV_OPERATOR_CREDENTIAL, ENV_PRIVATE_ROOT, ENV_REAL_SNAPSHOT_REF,
+        ENV_CAPTURE_SPEC_REF, ENV_PRIVATE_ROOT, ENV_REAL_SNAPSHOT_REF,
         ENV_REFERENCE_WORKLOAD_CHECKOUT, ENV_SESSION_SECRET, ENV_WORKLOAD_IMAGE_REF,
     },
 };
@@ -21,7 +18,7 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 use tower::ServiceExt;
 
-const GOOD_CREDENTIAL: &str = "operator-credential-from-test-source";
+const QUERY_SECRET: &str = "private-secret-from-test-source";
 const SESSION_SECRET: &str = "session-secret-from-test-source-32-bytes";
 const TAILSCALE_ORIGIN: &str = "http://tailrombridge.birb.homes";
 
@@ -39,29 +36,17 @@ async fn missing_session_cookie_is_rejected_without_private_details() {
 }
 
 #[tokio::test]
-async fn bad_credential_and_credential_in_query_are_rejected_without_leaks() {
+async fn query_strings_are_rejected_without_leaks() {
     let (_workspace, app, private_root) = auth_app();
-
-    let bad_response = app
-        .clone()
-        .oneshot(runtime_request(
-            Method::POST,
-            "/api/session/start",
-            Body::from(start_session_body("wrong-credential")),
-        ))
-        .await
-        .expect("bad credential request runs");
-    assert_eq!(bad_response.status(), StatusCode::UNAUTHORIZED);
-    assert_auth_safe_error(bad_response, "auth_rejected", &private_root).await;
 
     let query_response = app
         .oneshot(runtime_request(
             Method::POST,
-            "/api/session/start?next=operator-credential-from-test-source",
-            Body::from(start_session_body(GOOD_CREDENTIAL)),
+            "/api/session/start?next=private-secret-from-test-source",
+            Body::from(start_session_body()),
         ))
         .await
-        .expect("query credential request runs");
+        .expect("query request runs");
     assert_eq!(query_response.status(), StatusCode::BAD_REQUEST);
     assert_auth_safe_error(query_response, "auth_rejected", &private_root).await;
 }
@@ -83,7 +68,7 @@ async fn unrelated_absent_and_null_origins_are_rejected() {
             .clone()
             .oneshot(
                 builder
-                    .body(Body::from(start_session_body(GOOD_CREDENTIAL)))
+                    .body(Body::from(start_session_body()))
                     .expect("request builds"),
             )
             .await
@@ -92,6 +77,34 @@ async fn unrelated_absent_and_null_origins_are_rejected() {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert_auth_safe_error(response, "origin_rejected", &private_root).await;
     }
+}
+
+#[tokio::test]
+async fn legacy_start_body_still_requires_valid_origin_first() {
+    let (_workspace, app, private_root) = auth_app();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/session/start")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "schema_version": 1,
+                        "operator_credential": "deprecated-secret",
+                        "backend_mode": "synthetic",
+                        "requested_capabilities": ["input"]
+                    })
+                    .to_string(),
+                ))
+                .expect("request builds"),
+        )
+        .await
+        .expect("legacy body request runs");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_auth_safe_error(response, "origin_rejected", &private_root).await;
 }
 
 #[tokio::test]
@@ -107,7 +120,7 @@ async fn runtime_requests_reject_host_origin_profile_mismatches() {
             runtime_request_with_origin(
                 Method::POST,
                 "/api/session/start",
-                Body::from(start_session_body(GOOD_CREDENTIAL)),
+                Body::from(start_session_body()),
                 TAILSCALE_ORIGIN,
             )
             .with_header(HOST, "rombridge.birb.homes"),
@@ -128,7 +141,7 @@ async fn successful_login_sets_strict_cookie_and_allows_session_status() {
         .oneshot(runtime_request(
             Method::POST,
             "/api/session/start",
-            Body::from(start_session_body(GOOD_CREDENTIAL)),
+            Body::from(start_session_body()),
         ))
         .await
         .expect("login runs");
@@ -193,7 +206,7 @@ async fn tailscale_http_origin_sets_non_secure_cookie_and_allows_session_status(
         .oneshot(runtime_request_with_origin(
             Method::POST,
             "/api/session/start",
-            Body::from(start_session_body(GOOD_CREDENTIAL)),
+            Body::from(start_session_body()),
             TAILSCALE_ORIGIN,
         ))
         .await
@@ -260,7 +273,7 @@ async fn multi_profile_https_origin_keeps_secure_cookie() {
         .oneshot(runtime_request(
             Method::POST,
             "/api/session/start",
-            Body::from(start_session_body(GOOD_CREDENTIAL)),
+            Body::from(start_session_body()),
         ))
         .await
         .expect("https login runs");
@@ -297,7 +310,7 @@ async fn expired_session_cookie_is_rejected() {
         .oneshot(runtime_request(
             Method::POST,
             "/api/session/start",
-            Body::from(start_session_body(GOOD_CREDENTIAL)),
+            Body::from(start_session_body()),
         ))
         .await
         .expect("login runs");
@@ -331,7 +344,7 @@ async fn only_one_operator_session_can_be_active() {
         .oneshot(runtime_request(
             Method::POST,
             "/api/session/start",
-            Body::from(start_session_body(GOOD_CREDENTIAL)),
+            Body::from(start_session_body()),
         ))
         .await
         .expect("first login runs");
@@ -341,54 +354,12 @@ async fn only_one_operator_session_can_be_active() {
         .oneshot(runtime_request(
             Method::POST,
             "/api/session/start",
-            Body::from(start_session_body(GOOD_CREDENTIAL)),
+            Body::from(start_session_body()),
         ))
         .await
         .expect("second login runs");
     assert_eq!(second.status(), StatusCode::CONFLICT);
     assert_auth_safe_error(second, "session_active_elsewhere", &private_root).await;
-}
-
-#[tokio::test]
-async fn failed_auth_attempts_are_rate_limited() {
-    let workspace = tempfile::tempdir().expect("tempdir creates");
-    let private_root = workspace.path().join("bridge-private");
-    let auth = AuthState::fixed_for_tests(1_000);
-    let app = router(AppState::synthetic_for_tests_with_auth(
-        config(&private_root),
-        auth.clone(),
-    ));
-
-    let mut last_response = None;
-    for _ in 0..MAX_FAILED_AUTH_ATTEMPTS {
-        last_response = Some(
-            app.clone()
-                .oneshot(runtime_request(
-                    Method::POST,
-                    "/api/session/start",
-                    Body::from(start_session_body("wrong-credential")),
-                ))
-                .await
-                .expect("bad credential request runs"),
-        );
-    }
-
-    let response = last_response.expect("at least one response");
-    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-    assert_auth_safe_error(response, "auth_rejected", &private_root).await;
-
-    auth.advance_for_tests(AUTH_RATE_LIMIT_WINDOW_SECONDS);
-
-    let recovered = app
-        .oneshot(runtime_request(
-            Method::POST,
-            "/api/session/start",
-            Body::from(start_session_body(GOOD_CREDENTIAL)),
-        ))
-        .await
-        .expect("post-cooldown credential request runs");
-
-    assert_eq!(recovered.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -402,7 +373,7 @@ async fn backend_start_failure_does_not_leave_session_locked() {
         .oneshot(runtime_request(
             Method::POST,
             "/api/session/start",
-            Body::from(start_session_body_for_backend(GOOD_CREDENTIAL, "real")),
+            Body::from(start_session_body_for_backend("real")),
         ))
         .await
         .expect("first backend failure request runs");
@@ -413,7 +384,7 @@ async fn backend_start_failure_does_not_leave_session_locked() {
         .oneshot(runtime_request(
             Method::POST,
             "/api/session/start",
-            Body::from(start_session_body_for_backend(GOOD_CREDENTIAL, "real")),
+            Body::from(start_session_body_for_backend("real")),
         ))
         .await
         .expect("second backend failure request runs");
@@ -433,7 +404,7 @@ async fn websocket_handshake_uses_same_origin_and_cookie_auth() {
         .oneshot(runtime_request(
             Method::POST,
             "/api/session/start",
-            Body::from(start_session_body(GOOD_CREDENTIAL)),
+            Body::from(start_session_body()),
         ))
         .await
         .expect("login runs");
@@ -469,7 +440,7 @@ async fn websocket_handshake_accepts_tailscale_http_origin() {
         .oneshot(runtime_request_with_origin(
             Method::POST,
             "/api/session/start",
-            Body::from(start_session_body(GOOD_CREDENTIAL)),
+            Body::from(start_session_body()),
             TAILSCALE_ORIGIN,
         ))
         .await
@@ -521,10 +492,6 @@ fn config(private_root: &std::path::Path) -> ServiceConfig {
             ENV_PRIVATE_ROOT.to_string(),
             private_root.display().to_string(),
         ),
-        (
-            ENV_OPERATOR_CREDENTIAL.to_string(),
-            GOOD_CREDENTIAL.to_string(),
-        ),
         (ENV_SESSION_SECRET.to_string(), SESSION_SECRET.to_string()),
     ])
     .expect("private config loads")
@@ -567,10 +534,6 @@ fn private_pairs(private_root: &std::path::Path) -> Vec<(String, String)> {
             ENV_PRIVATE_ROOT.to_string(),
             private_root.display().to_string(),
         ),
-        (
-            ENV_OPERATOR_CREDENTIAL.to_string(),
-            GOOD_CREDENTIAL.to_string(),
-        ),
         (ENV_SESSION_SECRET.to_string(), SESSION_SECRET.to_string()),
     ]
 }
@@ -585,10 +548,6 @@ fn real_config(private_root: &std::path::Path) -> ServiceConfig {
         (
             ENV_PRIVATE_ROOT.to_string(),
             private_root.display().to_string(),
-        ),
-        (
-            ENV_OPERATOR_CREDENTIAL.to_string(),
-            GOOD_CREDENTIAL.to_string(),
         ),
         (ENV_SESSION_SECRET.to_string(), SESSION_SECRET.to_string()),
         (
@@ -706,14 +665,13 @@ fn cookie_has_attribute(set_cookie: &str, attribute: &str) -> bool {
         .any(|candidate| candidate.eq_ignore_ascii_case(attribute))
 }
 
-fn start_session_body(credential: &str) -> String {
-    start_session_body_for_backend(credential, "synthetic")
+fn start_session_body() -> String {
+    start_session_body_for_backend("synthetic")
 }
 
-fn start_session_body_for_backend(credential: &str, backend_mode: &str) -> String {
+fn start_session_body_for_backend(backend_mode: &str) -> String {
     json!({
         "schema_version": 1,
-        "operator_credential": credential,
         "backend_mode": backend_mode,
         "requested_capabilities": ["input"]
     })
@@ -741,7 +699,7 @@ async fn assert_auth_safe_error(
     assert_eq!(json["schema_version"], 1);
     assert_eq!(json["error"]["code"], expected_code);
     assert_eq!(json["error"]["details"], json!({}));
-    assert!(!body.contains(GOOD_CREDENTIAL));
+    assert!(!body.contains(QUERY_SECRET));
     assert!(!body.contains(SESSION_SECRET));
     assert!(!body.contains(&private_root.display().to_string()));
 }

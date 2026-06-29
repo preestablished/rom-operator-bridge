@@ -21,7 +21,7 @@ use rom_operator_bridge_service::{
         ChangedOffsetRange, DedupGroup, DedupOp, DedupRelation, DedupStatus, DedupUpdate,
         LabelState, LabelStoreError,
     },
-    private_config::{ENV_OPERATOR_CREDENTIAL, ENV_PRIVATE_ROOT, ENV_SESSION_SECRET},
+    private_config::{ENV_PRIVATE_ROOT, ENV_SESSION_SECRET},
 };
 use serde_json::{Value, json};
 use std::{
@@ -32,7 +32,6 @@ use std::{
 };
 use tower::ServiceExt;
 
-const GOOD_CREDENTIAL: &str = "operator-credential-from-test-source";
 const SESSION_SECRET: &str = "session-secret-from-test-source-32-bytes";
 const SESSION_ID: &str = "synthetic-session-labels";
 const RUN_ID: &str = "synthetic-run-labels";
@@ -725,7 +724,6 @@ async fn login_cookie(app: axum::Router) -> String {
                 .body(Body::from(
                     json!({
                         "schema_version": 1,
-                        "operator_credential": GOOD_CREDENTIAL,
                         "backend_mode": "synthetic",
                         "requested_capabilities": ["capture", "labels"]
                     })
@@ -816,10 +814,6 @@ fn config(private_root: &Path) -> ServiceConfig {
         (
             ENV_PRIVATE_ROOT.to_string(),
             private_root.display().to_string(),
-        ),
-        (
-            ENV_OPERATOR_CREDENTIAL.to_string(),
-            GOOD_CREDENTIAL.to_string(),
         ),
         (ENV_SESSION_SECRET.to_string(), SESSION_SECRET.to_string()),
     ])

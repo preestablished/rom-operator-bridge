@@ -36,7 +36,6 @@ ROM_OPERATOR_BRIDGE_BIND_ADDR=<bridge-private-ip>:7410
 ROM_OPERATOR_BRIDGE_BACKEND=<synthetic-or-real>
 ROM_OPERATOR_BRIDGE_PRIVATE_ROOT=<absolute-private-runtime-root>
 ROM_OPERATOR_BRIDGE_STATIC_PUBLISH_ROOT=<absolute-static-publish-root>
-ROM_OPERATOR_BRIDGE_OPERATOR_CREDENTIAL=<operator-credential>
 ROM_OPERATOR_BRIDGE_SESSION_SECRET=<session-secret>
 ```
 

@@ -21,7 +21,7 @@ use rom_operator_bridge_service::{
     },
     config::ServiceConfig,
     framebuffer::{SYNTHETIC_FRAME_HEIGHT, SYNTHETIC_FRAME_WIDTH, synthetic_frame_png},
-    private_config::{ENV_OPERATOR_CREDENTIAL, ENV_PRIVATE_ROOT, ENV_SESSION_SECRET},
+    private_config::{ENV_PRIVATE_ROOT, ENV_SESSION_SECRET},
     sanitization::PublicSanitizer,
 };
 use serde_json::{Value, json};
@@ -42,7 +42,7 @@ use tokio_tungstenite::{
 };
 use tower::ServiceExt;
 
-const GOOD_CREDENTIAL: &str = "operator-credential-from-test-source";
+const SECRET_LITERAL: &str = "private-secret-from-test-source";
 const SESSION_SECRET: &str = "session-secret-from-test-source-32-bytes";
 const SESSION_ID: &str = "synthetic-session-capture";
 const RUN_ID: &str = "synthetic-run-capture";
@@ -320,7 +320,7 @@ async fn capture_completes_to_recent_detail_and_preview_after_durable_private_in
     );
     PublicSanitizer::new()
         .with_private_root(&private_root)
-        .with_forbidden_literal(GOOD_CREDENTIAL)
+        .with_forbidden_literal(SECRET_LITERAL)
         .with_forbidden_literal(SESSION_SECRET)
         .inspect_json(&detail)
         .expect("capture detail is public-safe");
@@ -345,7 +345,7 @@ async fn capture_completes_to_recent_detail_and_preview_after_durable_private_in
     assert_eq!(features["features"][1]["value"], 0.5);
     PublicSanitizer::new()
         .with_private_root(&private_root)
-        .with_forbidden_literal(GOOD_CREDENTIAL)
+        .with_forbidden_literal(SECRET_LITERAL)
         .with_forbidden_literal(SESSION_SECRET)
         .inspect_json(&features)
         .expect("capture features response is route-scoped and public-safe");
@@ -366,7 +366,7 @@ async fn capture_completes_to_recent_detail_and_preview_after_durable_private_in
     );
     PublicSanitizer::new()
         .with_private_root(&private_root)
-        .with_forbidden_literal(GOOD_CREDENTIAL)
+        .with_forbidden_literal(SECRET_LITERAL)
         .with_forbidden_literal(SESSION_SECRET)
         .inspect_json(&unauthenticated_features)
         .expect("unauthenticated feature error is public-safe");
@@ -427,7 +427,7 @@ async fn capture_features_route_requires_privileged_capability_grant() {
     assert_eq!(body["error"]["details"], json!({}));
     PublicSanitizer::new()
         .with_private_root(&private_root)
-        .with_forbidden_literal(GOOD_CREDENTIAL)
+        .with_forbidden_literal(SECRET_LITERAL)
         .with_forbidden_literal(SESSION_SECRET)
         .inspect_json(&body)
         .expect("non-privileged feature error is public-safe");
@@ -544,7 +544,7 @@ async fn synthetic_capture_labels_round_trip_private_files_and_event_refreshes()
     assert!(!labels.to_string().contains(note));
     PublicSanitizer::new()
         .with_private_root(&private_root)
-        .with_forbidden_literal(GOOD_CREDENTIAL)
+        .with_forbidden_literal(SECRET_LITERAL)
         .with_forbidden_literal(SESSION_SECRET)
         .inspect_json(&labels)
         .expect("label response is public-safe");
@@ -807,7 +807,6 @@ async fn login_cookie_with_capabilities(app: axum::Router, capabilities: &[&str]
                 .body(Body::from(
                     json!({
                         "schema_version": 1,
-                        "operator_credential": GOOD_CREDENTIAL,
                         "backend_mode": "synthetic",
                         "requested_capabilities": capabilities
                     })
@@ -1010,10 +1009,6 @@ fn config(private_root: &Path) -> ServiceConfig {
         (
             ENV_PRIVATE_ROOT.to_string(),
             private_root.display().to_string(),
-        ),
-        (
-            ENV_OPERATOR_CREDENTIAL.to_string(),
-            GOOD_CREDENTIAL.to_string(),
         ),
         (ENV_SESSION_SECRET.to_string(), SESSION_SECRET.to_string()),
     ])

@@ -356,7 +356,6 @@ export class RuntimeApiClient {
   }
 
   startSession(input: {
-    operatorCredential: string;
     backendMode?: BackendMode;
     requestedCapabilities?: CapabilityName[];
   }): Promise<StartSessionResponse> {
@@ -364,7 +363,6 @@ export class RuntimeApiClient {
       method: "POST",
       body: {
         schema_version: RUNTIME_API_SCHEMA_VERSION,
-        operator_credential: input.operatorCredential,
         backend_mode: input.backendMode ?? "synthetic",
         requested_capabilities: input.requestedCapabilities ?? ["input"]
       }

@@ -264,7 +264,6 @@ const VALIDATION_REPORT_PATTERNS: &[&str] = &[
 ];
 
 const FORBIDDEN_FIELD_NAMES: &[&str] = &[
-    "operatorcredential",
     "workerleasetoken",
     "privatepath",
     "privateroot",

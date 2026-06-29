@@ -25,7 +25,7 @@ use crate::{
 };
 use axum::{
     Json, Router,
-    body::Body,
+    body::{Body, to_bytes},
     extract::{Path, State, ws::WebSocketUpgrade},
     http::{
         HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri,
@@ -1034,13 +1034,18 @@ async fn start_session(
     State(state): State<AppState>,
     headers: HeaderMap,
     uri: Uri,
-    Json(request): Json<StartSessionRequest>,
+    body: Body,
 ) -> Response {
     let auth_context =
         match validate_runtime_request(&headers, &uri, state.config.deployment_security()) {
             Ok(context) => context,
             Err(error) => return auth_error(error).into_response(),
         };
+
+    let request = match parse_start_session_request(body).await {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
 
     if request.schema_version != RUNTIME_API_SCHEMA_VERSION {
         return AppError::new(
@@ -1069,10 +1074,7 @@ async fn start_session(
     let granted_capabilities =
         grant_capabilities(state.backend.capabilities(), requested_capabilities);
 
-    let operator_session = match state
-        .auth
-        .login(state.config.private_config(), &request.operator_credential)
-    {
+    let operator_session = match state.auth.start_session(state.config.private_config()) {
         Ok(session) => session,
         Err(error) => return auth_error(error).into_response(),
     };
@@ -1140,6 +1142,27 @@ async fn start_session(
         .expect("session cookie contains only valid header characters"),
     );
     response
+}
+
+async fn parse_start_session_request(body: Body) -> Result<StartSessionRequest, Response> {
+    let bytes = to_bytes(body, 16 * 1024).await.map_err(|_| {
+        AppError::new(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::BadRequest,
+            "Invalid session start request.",
+            false,
+        )
+        .into_response()
+    })?;
+    serde_json::from_slice::<StartSessionRequest>(&bytes).map_err(|_| {
+        AppError::new(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::BadRequest,
+            "Invalid session start request.",
+            false,
+        )
+        .into_response()
+    })
 }
 
 async fn session_status(State(state): State<AppState>, headers: HeaderMap, uri: Uri) -> Response {
@@ -2525,7 +2548,6 @@ pub struct HealthResponse {
 #[serde(deny_unknown_fields)]
 pub struct StartSessionRequest {
     pub schema_version: u16,
-    pub operator_credential: String,
     pub backend_mode: BackendMode,
     pub requested_capabilities: Vec<String>,
 }
@@ -3063,17 +3085,11 @@ fn auth_error(error: AuthError) -> AppError {
             "Authentication rejected.",
             false,
         ),
-        AuthError::BadCredential | AuthError::PrivateConfig(_) => AppError::new(
+        AuthError::PrivateConfig(_) => AppError::new(
             StatusCode::UNAUTHORIZED,
             ErrorCode::AuthRejected,
             "Authentication rejected.",
             false,
-        ),
-        AuthError::RateLimited => AppError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            ErrorCode::AuthRejected,
-            "Authentication rejected.",
-            true,
         ),
         AuthError::SessionActiveElsewhere => AppError::new(
             StatusCode::CONFLICT,

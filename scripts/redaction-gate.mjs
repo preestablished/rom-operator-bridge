@@ -48,9 +48,9 @@ const PATTERNS = [
       /(?:^|[\s:=("'`])(?:\/home\/[^/\s"'`<>)]+\/(?:\.agents|private|rom|corpus|secrets?)\b|\/Users\/[^/\s"'`<>)]+\/(?:private|rom|corpus|secrets?)\b)/i
   },
   {
-    kind: "operator_credential",
+    kind: "secret_token",
     pattern:
-      /operator-secret|Bearer\s+[A-Za-z0-9._-]{8,}|(?:operator_credential|credential|password|secret|token)\s*["']?\s*[:=]\s*(?:"[^"'<]{6,}"|'[^'<>]{6,}')/i
+      /Bearer\s+[A-Za-z0-9._-]{8,}|(?:credential|password|secret|token)\s*["']?\s*[:=]\s*(?:"[^"'<]{6,}"|'[^'<>]{6,}')/i
   },
   {
     kind: "real_capture_id",
@@ -162,7 +162,7 @@ function selfTest() {
     ["rom_path", "loaded /srv/corpus/private/operator-rom.sfc"],
     ["private_corpus_root", "private root: /mnt/private/corpus"],
     ["private_absolute_path", "opened /home/operator/.agents/private-note.md"],
-    ["operator_credential", '"operator_credential": "operator-secret"'],
+    ["secret_token", '"session_secret": "session-secret-value"'],
     ["real_capture_id", "real-capture-9f86d081884c7d65"],
     ["screenshot_or_preview_cache", "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAA"],
     ["source_map_private_path", "sourceMappingURL=/home/operator/build/index.js.map"],
@@ -222,7 +222,7 @@ function fixtureTest() {
     "private_absolute_path",
     "binary_or_blob_public_asset",
     "symlink_public_asset",
-    "operator_credential",
+    "secret_token",
     "private_network_literal"
   ]) {
     if (!findings.some((entry) => entry.kind === kind)) {

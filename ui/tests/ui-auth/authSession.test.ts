@@ -6,7 +6,7 @@ import {
   initialAuthSessionState,
   logoutSession,
   refreshSession,
-  submitCredential,
+  startOperatorSession,
   type AuthSessionState
 } from "../../src/authSession";
 import { RuntimeApiClient } from "../../src/runtimeClient";
@@ -29,11 +29,11 @@ const capabilities = {
 };
 
 describe("UI auth and session flow", () => {
-  it("starts a session without putting credentials in URLs or rendered HTML", async () => {
+  it("starts a session without credential material in URLs, bodies, or rendered HTML", async () => {
     const fetcher = queuedFetch([startSessionResponse()]);
     const client = new RuntimeApiClient(config, { fetcher });
 
-    const state = await submitCredential(initialAuthSessionState(), client, "operator-secret");
+    const state = await startOperatorSession(initialAuthSessionState(), client);
     const html = renderOperatorApp(config, state);
 
     expect(state.status).toBe("active");
@@ -44,28 +44,25 @@ describe("UI auth and session flow", () => {
       state: "running"
     });
     expect(fetcher.calls[0]?.url).toBe("/api/session/start");
-    expect(fetcher.calls[0]?.url).not.toContain("operator-secret");
-    expect(bodyAt(fetcher, 0)).toMatchObject({
+    expect(bodyAt(fetcher, 0)).toEqual({
       schema_version: 1,
-      operator_credential: "operator-secret",
       backend_mode: "synthetic",
       requested_capabilities: ["input", "preview", "capture", "labels", "privileged_features"]
     });
     expect(html).toContain("Stop");
-    expect(html).not.toContain("operator-secret");
+    expect(Object.hasOwn(bodyAt(fetcher, 0) as object, ["operator", "credential"].join("_"))).toBe(false);
   });
 
   it("starts real backend sessions when the mount supplies a real backend mode", async () => {
     const fetcher = queuedFetch([startSessionResponse()]);
     const client = new RuntimeApiClient(config, { fetcher });
 
-    const state = await submitCredential(initialAuthSessionState(), client, "operator-secret", "real");
+    const state = await startOperatorSession(initialAuthSessionState(), client, "real");
 
     expect(state.status).toBe("active");
     expect(state.session.backend_mode).toBe("real");
     expect(bodyAt(fetcher, 0)).toMatchObject({
       schema_version: 1,
-      operator_credential: "operator-secret",
       backend_mode: "real"
     });
   });
@@ -74,7 +71,7 @@ describe("UI auth and session flow", () => {
     const fetcher = queuedFetch([errorEnvelope("auth_rejected", "Authentication rejected.")], 401);
     const client = new RuntimeApiClient(config, { fetcher });
 
-    const state = await submitCredential(initialAuthSessionState(), client, "bad-secret");
+    const state = await startOperatorSession(initialAuthSessionState(), client);
     const html = renderOperatorApp(config, state);
 
     expect(state.status).toBe("auth_rejected");
@@ -85,7 +82,6 @@ describe("UI auth and session flow", () => {
     });
     expect(html).toContain('role="alert"');
     expect(html).toContain("Authentication rejected.");
-    expect(html).not.toContain("bad-secret");
   });
 
   it("maps expired sessions to the expired screen state", async () => {
@@ -121,12 +117,11 @@ describe("UI auth and session flow", () => {
     );
     const client = new RuntimeApiClient(config, { fetcher });
 
-    const state = await submitCredential(initialAuthSessionState(), client, "operator-secret");
+    const state = await startOperatorSession(initialAuthSessionState(), client);
     const html = renderOperatorApp(config, state);
 
     expect(state.status).toBe("session_active_elsewhere");
     expect(html).toContain("Session active elsewhere.");
-    expect(html).not.toContain("operator-secret");
   });
 
   it("does not use browser persistence APIs in auth/session source", () => {

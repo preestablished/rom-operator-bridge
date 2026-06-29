@@ -17,7 +17,7 @@ use rom_operator_bridge_service::{
     },
     config::ServiceConfig,
     input::{PAD_MASK, PadLog},
-    private_config::{ENV_OPERATOR_CREDENTIAL, ENV_PRIVATE_ROOT, ENV_SESSION_SECRET},
+    private_config::{ENV_PRIVATE_ROOT, ENV_SESSION_SECRET},
 };
 use serde_json::{Value, json};
 use std::{
@@ -39,7 +39,7 @@ use tokio_tungstenite::{
 };
 use tower::ServiceExt;
 
-const GOOD_CREDENTIAL: &str = "operator-credential-from-test-source";
+const SECRET_LITERAL: &str = "private-secret-from-test-source";
 const SESSION_SECRET: &str = "session-secret-from-test-source-32-bytes";
 const SESSION_ID: &str = "synthetic-session-scaffold";
 const RUN_ID: &str = "synthetic-run-scaffold";
@@ -129,7 +129,7 @@ async fn queue_overflow_returns_sanitized_input_reject() {
     assert_eq!(overflow["payload"]["error"]["code"], "bad_request");
     assert_eq!(overflow["payload"]["error"]["message"], "Input rejected.");
     assert_eq!(overflow["payload"]["error"]["details"], json!({}));
-    assert!(!overflow.to_string().contains(GOOD_CREDENTIAL));
+    assert!(!overflow.to_string().contains(SECRET_LITERAL));
     assert!(backend.injected_requests().is_empty());
 }
 
@@ -540,7 +540,7 @@ async fn synthetic_ws_input_artifact_append_failure_rejects_without_advancing_pa
     let reject_text = reject.to_string();
     for private in [
         private_root.display().to_string(),
-        GOOD_CREDENTIAL.to_string(),
+        SECRET_LITERAL.to_string(),
         "input.padlog".to_string(),
         "padlog-events.jsonl".to_string(),
     ] {
@@ -687,7 +687,6 @@ async fn login_session(app: axum::Router) -> (String, Value) {
                 .body(Body::from(
                     json!({
                         "schema_version": 1,
-                        "operator_credential": GOOD_CREDENTIAL,
                         "backend_mode": "synthetic",
                         "requested_capabilities": ["input"]
                     })
@@ -838,10 +837,6 @@ fn config(private_root: &Path) -> ServiceConfig {
         (
             ENV_PRIVATE_ROOT.to_string(),
             private_root.display().to_string(),
-        ),
-        (
-            ENV_OPERATOR_CREDENTIAL.to_string(),
-            GOOD_CREDENTIAL.to_string(),
         ),
         (ENV_SESSION_SECRET.to_string(), SESSION_SECRET.to_string()),
     ])

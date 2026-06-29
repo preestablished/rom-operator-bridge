@@ -19,7 +19,7 @@ use rom_operator_bridge_service::{
     },
     config::ServiceConfig,
     framebuffer::{SYNTHETIC_FRAME_HEIGHT, SYNTHETIC_FRAME_WIDTH, synthetic_frame_png},
-    private_config::{ENV_OPERATOR_CREDENTIAL, ENV_PRIVATE_ROOT, ENV_SESSION_SECRET},
+    private_config::{ENV_PRIVATE_ROOT, ENV_SESSION_SECRET},
     sanitization::PublicSanitizer,
 };
 use serde_json::{Value, json};
@@ -31,7 +31,7 @@ use std::{
 };
 use tower::ServiceExt;
 
-const GOOD_CREDENTIAL: &str = "operator-credential-from-test-source";
+const SECRET_LITERAL: &str = "private-secret-from-test-source";
 const SESSION_SECRET: &str = "session-secret-from-test-source-32-bytes";
 const SESSION_ID: &str = "synthetic-session-frame";
 const RUN_ID: &str = "synthetic-run-frame";
@@ -57,7 +57,7 @@ async fn current_frame_metadata_and_image_are_schema_safe_and_no_store() {
     assert_matches_runtime_schema(&metadata);
     PublicSanitizer::new()
         .with_private_root(&private_root)
-        .with_forbidden_literal(GOOD_CREDENTIAL)
+        .with_forbidden_literal(SECRET_LITERAL)
         .with_forbidden_literal(SESSION_SECRET)
         .inspect_json(&metadata)
         .expect("metadata is public-safe");
@@ -92,7 +92,7 @@ async fn current_frame_metadata_and_image_are_schema_safe_and_no_store() {
     assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
     assert_eq!(metadata["preview_hash"], sha256_ref(&bytes));
     let image_text = String::from_utf8_lossy(&bytes);
-    assert!(!image_text.contains(GOOD_CREDENTIAL));
+    assert!(!image_text.contains(SECRET_LITERAL));
     assert!(!image_text.contains(SESSION_SECRET));
     assert!(!image_text.contains(&private_root.display().to_string()));
 }
@@ -217,7 +217,7 @@ async fn frame_image_allows_only_numeric_frame_query_hint() {
     let cookie = login_cookie(app.clone()).await;
 
     for uri in [
-        "/api/frame/current/image?next=operator-credential-from-test-source",
+        "/api/frame/current/image?next=private-secret-from-test-source",
         "/api/frame/current/image?frame=",
         "/api/frame/current/image?frame=1&next=2",
     ] {
@@ -279,7 +279,7 @@ async fn assert_auth_safe_error(response: axum::response::Response, private_root
     assert_eq!(json["error"]["code"], "auth_rejected");
     PublicSanitizer::new()
         .with_private_root(private_root)
-        .with_forbidden_literal(GOOD_CREDENTIAL)
+        .with_forbidden_literal(SECRET_LITERAL)
         .with_forbidden_literal(SESSION_SECRET)
         .inspect_json(&json)
         .expect("error is public-safe");
@@ -296,7 +296,7 @@ async fn assert_session_inactive_safe_error(
     assert_eq!(json["error"]["code"], "session_inactive");
     PublicSanitizer::new()
         .with_private_root(private_root)
-        .with_forbidden_literal(GOOD_CREDENTIAL)
+        .with_forbidden_literal(SECRET_LITERAL)
         .with_forbidden_literal(SESSION_SECRET)
         .inspect_json(&json)
         .expect("error is public-safe");
@@ -313,7 +313,6 @@ async fn login_cookie(app: axum::Router) -> String {
                 .body(Body::from(
                     json!({
                         "schema_version": 1,
-                        "operator_credential": GOOD_CREDENTIAL,
                         "backend_mode": "synthetic",
                         "requested_capabilities": ["preview"]
                     })
@@ -366,10 +365,6 @@ fn config(private_root: &Path) -> ServiceConfig {
         (
             ENV_PRIVATE_ROOT.to_string(),
             private_root.display().to_string(),
-        ),
-        (
-            ENV_OPERATOR_CREDENTIAL.to_string(),
-            GOOD_CREDENTIAL.to_string(),
         ),
         (ENV_SESSION_SECRET.to_string(), SESSION_SECRET.to_string()),
     ])

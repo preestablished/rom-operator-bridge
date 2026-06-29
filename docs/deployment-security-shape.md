@@ -66,7 +66,7 @@ wss://birb.homes/rom-bridge/ws/...
   `https://birb.homes/plans/<slug>/` and says that helper only publishes static
   files.
 - `13-deployment-security-checklist.md` requires HTTPS, WSS, Origin checks,
-  no-store runtime headers, credential rotation, and rollback/restart notes.
+  no-store runtime headers, session secret rotation, and rollback/restart notes.
 - `<forgejo-plan-readme>` records the current
   local service-style HTTPS pattern as K3s Traefik plus cert-manager.
 - `/home/infra-admin/gitea/k8s-forgejo-ingress.yaml` shows the active pattern
@@ -150,22 +150,16 @@ X-Content-Type-Options: nosniff
 Do not add a service worker unless it explicitly excludes all runtime API,
 WebSocket, preview, capture, validation, and private artifact routes from caching.
 
-## Auth And Credential Rotation
+## Auth And Session Secret Rotation
 
-- Store the operator credential outside source control, in a private env file,
-  secret manager, or systemd environment file.
 - Do not accept credentials in URLs.
 - Prefer `HttpOnly; Secure; SameSite=Strict` cookie auth scoped to `/`.
 - Authenticate HTTP and WebSocket handshakes.
 - Default session TTL: 4 hours.
 - MVP concurrency: one active operator session.
-- Rate-limit failed auth attempts, log auth failures only to private service logs,
-  and return sanitized public auth errors without credential, path, or stack
-  details.
-- Rotation shape: generate a new credential, update the private secret source,
-  rotate session-signing/cookie secrets if applicable, clear or expire the active
-  session store, restart the bridge service, invalidate existing sessions, then
-  confirm old credentials fail and new credentials work.
+- Rotation shape: generate a new session-signing secret, update the private
+  secret source, clear or expire the active session store, restart the bridge
+  service, and confirm old sessions fail.
 
 ## Restart And Rollback Commands
 

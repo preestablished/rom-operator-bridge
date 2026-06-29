@@ -94,8 +94,7 @@ previous release symlink: /opt/rom-operator-bridge/previous
 service binary: /opt/rom-operator-bridge/current/rom-operator-bridge
 ```
 
-The private env file is the credential source for the operator credential and
-session secret. It must be mode `0600`, must stay out of source control, and
+The private env file is the source for the session secret. It must be mode `0600`, must stay out of source control, and
 must not be copied into shared logs or public handoff text.
 
 ## Auth, TTL, And Rotation
@@ -105,25 +104,21 @@ must not be copied into shared logs or public handoff text.
 - Do not use wildcard CORS with credentials.
 - If responses vary by request `Origin`, include `Vary: Origin`.
 - Authenticate HTTP runtime routes and WebSocket handshakes.
-- Credentials are accepted only in the session-start request body; never in URLs.
+- Password-based operator auth is not accepted; credentials are never accepted in URLs.
 - Auth uses `HttpOnly; Secure; SameSite=Strict` cookies scoped to `/`.
 - Default session TTL is 4 hours.
 - MVP concurrency is one active operator session.
-- Rate-limit failed auth attempts.
-- Log auth failures only to private service logs.
 - Return sanitized public auth errors without credentials, private paths, stack
   traces, host-control details, or artifact identifiers.
 
-Credential rotation procedure:
+Session secret rotation procedure:
 
-1. Generate a new operator credential outside source control.
+1. Generate a new session secret outside source control.
 2. Update `/etc/rom-operator-bridge/rom-operator-bridge.env` with the new
-   operator credential and session secret.
-3. Rotate session-signing or cookie secrets if applicable.
-4. Clear or expire active session state.
-5. Restart `rom-operator-bridge.service`.
-6. Confirm the old credential and old sessions fail, and the new credential
-   works.
+   session secret.
+3. Clear or expire active session state.
+4. Restart `rom-operator-bridge.service`.
+5. Confirm old sessions fail.
 
 ## Headers And Cache Policy
 

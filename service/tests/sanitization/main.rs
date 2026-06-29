@@ -102,7 +102,6 @@ fn rejects_sensitive_field_name_variants() {
         "featureBytes",
         "rawPayload",
         "validationReport",
-        "operatorCredential",
         "workerLeaseToken",
         "privatePath",
         "artifactRef",

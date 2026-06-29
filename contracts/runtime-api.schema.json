@@ -219,16 +219,11 @@
       "additionalProperties": false,
       "required": [
         "schema_version",
-        "operator_credential",
         "backend_mode",
         "requested_capabilities"
       ],
       "properties": {
         "schema_version": { "$ref": "#/$defs/schemaVersion" },
-        "operator_credential": {
-          "type": "string",
-          "minLength": 1
-        },
         "backend_mode": { "$ref": "#/$defs/backendMode" },
         "requested_capabilities": {
           "type": "array",

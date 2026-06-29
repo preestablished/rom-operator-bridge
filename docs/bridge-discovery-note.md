@@ -814,7 +814,7 @@ Auth shape:
 
 - Use `HttpOnly; Secure; SameSite=Strict` cookie auth scoped to `/`.
 - Authenticate HTTP and WebSocket handshakes.
-- Store operator credentials outside source control.
+- Store session secrets outside source control.
 - Default session TTL is 4 hours.
 - MVP concurrency is one active operator session.
 - Do not put credentials in URLs.

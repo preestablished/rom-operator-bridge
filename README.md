@@ -1,7 +1,7 @@
 # rom-operator-bridge
 
 Private browser bridge for operating and validating ROM runs through a
-sanitized web UI. The bridge is built to keep operator credentials, private
+sanitized web UI. The bridge is built to keep session secrets, private
 runtime paths, raw captures, screenshots, verifier reports, and host details
 out of committed files and shared handoff text.
 
@@ -24,7 +24,7 @@ The active operator URL is:
 https://rombridge.birb.homes/
 ```
 
-Do not commit or paste instantiated private env files, operator credentials,
+Do not commit or paste instantiated private env files,
 session secrets, cookie jars, private endpoint manifests, absolute private
 paths, raw command output, screenshots, capture ids, verifier reports, or
 private evidence contents.

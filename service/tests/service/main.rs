@@ -16,9 +16,7 @@ use rom_operator_bridge_service::{
         ServiceConfig,
     },
     input::{PadButton, PadWord},
-    private_config::{
-        ENV_OPERATOR_CREDENTIAL, ENV_PRIVATE_ROOT, ENV_SESSION_SECRET, ENV_STATIC_PUBLISH_ROOT,
-    },
+    private_config::{ENV_PRIVATE_ROOT, ENV_SESSION_SECRET, ENV_STATIC_PUBLISH_ROOT},
 };
 use serde_json::Value;
 use std::{fs, net::SocketAddr, path::Path};
@@ -532,10 +530,6 @@ fn config_with_static_root(private_root: &Path, static_root: &Path) -> ServiceCo
             static_root.display().to_string(),
         ),
         (
-            ENV_OPERATOR_CREDENTIAL.to_string(),
-            "operator-credential-from-test-source".to_string(),
-        ),
-        (
             ENV_SESSION_SECRET.to_string(),
             "session-secret-from-test-source-32-bytes".to_string(),
         ),
@@ -554,10 +548,6 @@ fn config_with_static_root_and_profiles(private_root: &Path, static_root: &Path)
         (
             ENV_STATIC_PUBLISH_ROOT.to_string(),
             static_root.display().to_string(),
-        ),
-        (
-            ENV_OPERATOR_CREDENTIAL.to_string(),
-            "operator-credential-from-test-source".to_string(),
         ),
         (
             ENV_SESSION_SECRET.to_string(),
