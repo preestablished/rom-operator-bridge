@@ -1,8 +1,8 @@
 use crate::{
     artifacts::{InputRejectionRow, PrivateArtifactStore},
     backend::{
-        BackendError, BridgeBackend, FrameCounter, InputScheduleReceipt, InputScheduleRequest,
-        RunStatus, SessionId, SessionState,
+        BackendError, BackendMode, BridgeBackend, FrameCounter, InputScheduleReceipt,
+        InputScheduleRequest, RunStatus, SessionId, SessionState,
     },
     input::PadWord,
 };
@@ -308,6 +308,13 @@ pub struct InputScheduler {
     applied_frames: Vec<AppliedInputFrame>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputAcceptance {
+    Apply,
+    Queue,
+    Reject,
+}
+
 impl Default for InputScheduler {
     fn default() -> Self {
         Self::new()
@@ -357,23 +364,30 @@ impl InputScheduler {
         let status = backend.status(input.session_id.clone())?;
         let key = InputRunKey::from_status(&input.session_id, &status)?;
 
-        if status.state == SessionState::Paused {
-            if self.pending_for_session(&input.session_id) >= PENDING_INPUT_LIMIT_PER_SESSION {
-                let rejection = InputRejectionRecord::new_for_input(
-                    &input,
-                    &key.run_id,
-                    QUEUE_FULL_REASON_CODE,
-                );
-                rejection_sink.record_input_rejection(&rejection)?;
-                return Ok(InputScheduleOutcome::dropped(&input, rejection.notice()));
+        match input_acceptance(&status) {
+            InputAcceptance::Apply => {
+                self.apply_with_status(backend, input, status, key, rejection_sink)
             }
+            InputAcceptance::Queue => {
+                if self.pending_for_session(&input.session_id) >= PENDING_INPUT_LIMIT_PER_SESSION {
+                    let rejection = InputRejectionRecord::new_for_input(
+                        &input,
+                        &key.run_id,
+                        QUEUE_FULL_REASON_CODE,
+                    );
+                    rejection_sink.record_input_rejection(&rejection)?;
+                    return Ok(InputScheduleOutcome::dropped(&input, rejection.notice()));
+                }
 
-            let outcome = InputScheduleOutcome::queued(&input);
-            self.pending.push_back(QueuedInputState { key, input });
-            return Ok(outcome);
+                let outcome = InputScheduleOutcome::queued(&input);
+                self.pending.push_back(QueuedInputState { key, input });
+                Ok(outcome)
+            }
+            InputAcceptance::Reject => Err(InputSchedulerError::SessionNotAcceptingInput {
+                session_id: status.session_id,
+                state: status.state.into(),
+            }),
         }
-
-        self.apply_with_status(backend, input, status, key, rejection_sink)
     }
 
     pub fn flush_pending(
@@ -382,15 +396,27 @@ impl InputScheduler {
         session_id: &str,
         rejection_sink: &mut dyn InputRejectionSink,
     ) -> Result<Vec<InputScheduleOutcome>, InputSchedulerError> {
+        if self.pending_for_session(session_id) == 0 {
+            return Ok(Vec::new());
+        }
         let status = backend.status(session_id.to_string())?;
         let key = InputRunKey::from_status(session_id, &status)?;
-        if status.state == SessionState::Paused {
-            return Ok(self
-                .pending
-                .iter()
-                .filter(|queued| queued.key.session_id == session_id)
-                .map(|queued| InputScheduleOutcome::queued(&queued.input))
-                .collect());
+        match input_acceptance(&status) {
+            InputAcceptance::Queue => {
+                return Ok(self
+                    .pending
+                    .iter()
+                    .filter(|queued| queued.key.session_id == session_id)
+                    .map(|queued| InputScheduleOutcome::queued(&queued.input))
+                    .collect());
+            }
+            InputAcceptance::Reject => {
+                return Err(InputSchedulerError::SessionNotAcceptingInput {
+                    session_id: status.session_id,
+                    state: status.state.into(),
+                });
+            }
+            InputAcceptance::Apply => {}
         }
 
         let mut outcomes = Vec::new();
@@ -444,7 +470,7 @@ impl InputScheduler {
         key: InputRunKey,
         rejection_sink: &mut dyn InputRejectionSink,
     ) -> Result<InputScheduleOutcome, InputSchedulerError> {
-        if status.state != SessionState::Running {
+        if input_acceptance(&status) != InputAcceptance::Apply {
             return Err(InputSchedulerError::SessionNotAcceptingInput {
                 session_id: status.session_id,
                 state: status.state.into(),
@@ -488,7 +514,7 @@ impl InputScheduler {
             return Ok(InputScheduleOutcome::dropped(&input, rejection.notice()));
         }
 
-        if refreshed.state != SessionState::Running {
+        if input_acceptance(&refreshed) != InputAcceptance::Apply {
             return Err(InputSchedulerError::SessionNotAcceptingInput {
                 session_id: refreshed.session_id,
                 state: refreshed.state.into(),
@@ -610,5 +636,16 @@ impl InputScheduler {
             .iter()
             .filter(|queued| queued.key.session_id == session_id)
             .count()
+    }
+}
+
+fn input_acceptance(status: &RunStatus) -> InputAcceptance {
+    match (status.backend_mode, status.state) {
+        (BackendMode::Synthetic, SessionState::Running) => InputAcceptance::Apply,
+        (BackendMode::Synthetic, SessionState::Paused) => InputAcceptance::Queue,
+        (BackendMode::Real, SessionState::Paused) if status.capabilities.input => {
+            InputAcceptance::Apply
+        }
+        _ => InputAcceptance::Reject,
     }
 }

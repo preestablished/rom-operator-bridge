@@ -1,0 +1,167 @@
+# ROM Operator Bridge Deployment
+
+This directory contains sanitized deployment material for
+`https://rombridge.birb.homes/`. Do not commit instantiated private env files,
+endpoint manifests, cookie files, operator-approved refs, raw probe output, or
+host logs.
+
+## Recommended Host Layout
+
+```text
+/opt/rom-operator-bridge/releases/<release-id>/
+/opt/rom-operator-bridge/current -> /opt/rom-operator-bridge/releases/<release-id>
+/opt/rom-operator-bridge/previous -> /opt/rom-operator-bridge/releases/<old-release-id>
+/var/lib/rom-operator-bridge/private/
+/var/lib/rom-operator-bridge/static/releases/<release-id>/
+/var/lib/rom-operator-bridge/static/current -> /var/lib/rom-operator-bridge/static/releases/<release-id>
+/etc/rom-operator-bridge/rom-operator-bridge.env
+```
+
+Use a dedicated `rombridge` system user or another operator-approved service
+account. Ensure the private runtime root is mode `0700`, and the env file plus
+private validation artifacts are mode `0600`.
+
+## Private Env Shape
+
+The installed env file is:
+
+```text
+/etc/rom-operator-bridge/rom-operator-bridge.env
+```
+
+It must contain placeholders replaced with operator-approved private values:
+
+```sh
+ROM_OPERATOR_BRIDGE_BIND_ADDR=<bridge-private-ip>:7410
+ROM_OPERATOR_BRIDGE_BACKEND=<synthetic-or-real>
+ROM_OPERATOR_BRIDGE_PRIVATE_ROOT=<absolute-private-runtime-root>
+ROM_OPERATOR_BRIDGE_STATIC_PUBLISH_ROOT=<absolute-static-publish-root>
+ROM_OPERATOR_BRIDGE_OPERATOR_CREDENTIAL=<operator-credential>
+ROM_OPERATOR_BRIDGE_SESSION_SECRET=<session-secret>
+```
+
+Real backend mode also requires the real backend handoff values documented in
+`docs/runbook.md` and `service/src/private_config.rs`.
+
+## Build And Install
+
+Build:
+
+```sh
+cargo build --manifest-path service/Cargo.toml --release
+npm --prefix ui ci
+npm --prefix ui run build
+```
+
+Install into clean release directories. Record the resolved previous release
+target before switching symlinks; do not point `previous` at the mutable
+`current` symlink.
+
+```sh
+release_id=<release-id>
+old_service_release="$(readlink -f /opt/rom-operator-bridge/current 2>/dev/null || true)"
+old_static_release="$(readlink -f /var/lib/rom-operator-bridge/static/current 2>/dev/null || true)"
+
+sudo install -d -m 0755 /opt/rom-operator-bridge/releases/"$release_id"
+sudo install -m 0755 service/target/release/rom-operator-bridge-service \
+  /opt/rom-operator-bridge/releases/"$release_id"/rom-operator-bridge
+
+sudo install -d -m 0755 /var/lib/rom-operator-bridge/static/releases/"$release_id"
+sudo cp -rf ui/dist/. /var/lib/rom-operator-bridge/static/releases/"$release_id"/
+
+if [ -n "$old_service_release" ]; then
+  sudo ln -sfn "$old_service_release" /opt/rom-operator-bridge/previous
+fi
+if [ -n "$old_static_release" ]; then
+  sudo ln -sfn "$old_static_release" /var/lib/rom-operator-bridge/static/previous
+fi
+sudo ln -sfn /opt/rom-operator-bridge/releases/"$release_id" /opt/rom-operator-bridge/current
+sudo ln -sfn /var/lib/rom-operator-bridge/static/releases/"$release_id" \
+  /var/lib/rom-operator-bridge/static/current
+```
+
+Install and start systemd:
+
+```sh
+sudo install -d -m 0755 /etc/rom-operator-bridge
+sudo install -m 0600 <private-env-source> \
+  /etc/rom-operator-bridge/rom-operator-bridge.env
+sudo install -m 0644 deploy/systemd/rom-operator-bridge.service \
+  /etc/systemd/system/rom-operator-bridge.service
+sudo systemctl daemon-reload
+sudo systemctl restart rom-operator-bridge.service
+```
+
+Inspect service status and logs privately. Do not paste raw output into shared
+docs or bead notes.
+
+## K3s Endpoint And Ingress
+
+`deploy/k8s/rombridge-ingress.yaml` defines the sanitized Namespace, Service,
+and Ingress. The actual endpoint address must be supplied through an
+operator-private manifest outside the repo.
+
+Private endpoint shape:
+
+```yaml
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: rom-operator-bridge
+  namespace: rom-operator-bridge
+subsets:
+  - addresses:
+      - ip: <bridge-private-ip>
+    ports:
+      - name: http
+        port: 7410
+        protocol: TCP
+```
+
+Apply order:
+
+```sh
+KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl apply -f deploy/k8s/rombridge-ingress.yaml
+KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl apply -f <private-endpoint-manifest>
+```
+
+## Validation
+
+Run validation only with private cookie, forbid-file, static-root, and network
+evidence inputs:
+
+```sh
+ROM_BRIDGE_VALIDATION_DIR=<private-validation-dir>/deployment-network-kut/<run-id> \
+ROM_BRIDGE_COOKIE_CURL_CONFIG_FILE=<private-cookie-curl-config> \
+ROM_BRIDGE_STATIC_PUBLISH_ROOT=<absolute-static-publish-root> \
+ROM_BRIDGE_NETWORK_EVIDENCE_FILE=<private-network-evidence-file> \
+ROM_BRIDGE_NETWORK_EVIDENCE_REVIEWED=1 \
+ROM_BRIDGE_OUTSIDE_PROBE_RESULT_FILE=<private-outside-probe-file> \
+ROM_BRIDGE_OUTSIDE_PROBE_REVIEWED=1 \
+ROM_BRIDGE_FORBID_FILE=<private-forbid-file> \
+scripts/deployment-network-check.sh
+```
+
+Run the redaction gate separately with the same private forbid file:
+
+```sh
+ROM_OPERATOR_BRIDGE_FORBID_FILE=<private-forbid-file> \
+ROM_OPERATOR_BRIDGE_REQUIRE_FORBID_FILE=1 \
+bash scripts/redaction-gate.sh
+```
+
+If no `ROM_BRIDGE_RESOLVE_IP` is supplied, also provide
+`ROM_BRIDGE_HOST_SNI_EVIDENCE_FILE` and
+`ROM_BRIDGE_HOST_SNI_EVIDENCE_REVIEWED=1`.
+
+## Rollback
+
+```sh
+sudo systemctl stop rom-operator-bridge.service
+sudo ln -sfn /opt/rom-operator-bridge/previous /opt/rom-operator-bridge/current
+sudo ln -sfn /var/lib/rom-operator-bridge/static/previous \
+  /var/lib/rom-operator-bridge/static/current
+sudo systemctl restart rom-operator-bridge.service
+```
+
+If the env file changed, restore the operator-private backup before restart.

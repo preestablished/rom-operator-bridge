@@ -10,9 +10,10 @@ use rom_operator_bridge_service::{
     api::{AppState, router},
     auth::ALLOWED_ORIGIN,
     backend::{
-        BackendCapabilities, BackendMode, BackendResult, BackendSession, BridgeBackend, CaptureJob,
-        CaptureRequest, FramePreview, InputScheduleReceipt, InputScheduleRequest, RunBoundary,
-        RunStatus, SessionId, SessionState, StartBackendSession, StopReason, StoppedSession,
+        BackendCapabilities, BackendError, BackendMode, BackendResult, BackendSession,
+        BridgeBackend, CaptureJob, CaptureRequest, FramePreview, InputScheduleReceipt,
+        InputScheduleRequest, RunBoundary, RunStatus, SessionId, SessionState, StartBackendSession,
+        StopReason, StoppedSession,
     },
     config::ServiceConfig,
     input::{PAD_MASK, PadLog},
@@ -20,6 +21,7 @@ use rom_operator_bridge_service::{
 };
 use serde_json::{Value, json};
 use std::{
+    collections::VecDeque,
     fs,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -124,6 +126,78 @@ async fn queue_overflow_returns_sanitized_input_reject() {
     assert_eq!(overflow["payload"]["error"]["message"], "Input rejected.");
     assert_eq!(overflow["payload"]["error"]["details"], json!({}));
     assert!(!overflow.to_string().contains(GOOD_CREDENTIAL));
+    assert!(backend.injected_requests().is_empty());
+}
+
+#[tokio::test]
+async fn stale_retry_drop_writes_private_rejection_diagnostic() {
+    let (_workspace, app, backend, private_root) = ws_app_with_private_root(SessionState::Running);
+    backend.push_injection(Err(BackendError::FrameStale {
+        requested_frame: 1,
+        current_frame: 5,
+    }));
+    backend.push_injection(Err(BackendError::FrameStale {
+        requested_frame: 1,
+        current_frame: 6,
+    }));
+    let cookie = login_cookie(app.clone()).await;
+    let server = WsServer::start(app).await;
+    let mut ws = server.connect(&cookie).await;
+
+    let reject = send_input(&mut ws, input_message(7, "keyboard", &["A"])).await;
+
+    assert_eq!(reject["type"], "input_reject");
+    assert_eq!(reject["payload"]["error"]["code"], "frame_stale");
+    assert_eq!(reject["payload"]["error"]["message"], "Input rejected.");
+    assert_eq!(reject["payload"]["error"]["retryable"], true);
+    assert_eq!(backend.injected_requests().len(), 2);
+
+    let rejection_lines = read_lines(
+        &private_root
+            .join("runs")
+            .join(RUN_ID)
+            .join("input-rejections.jsonl"),
+    );
+    assert_eq!(rejection_lines.len(), 1);
+    let rejection: Value = serde_json::from_str(&rejection_lines[0]).expect("rejection row parses");
+    assert_eq!(rejection["run_id"], RUN_ID);
+    assert_eq!(rejection["client_seq"], 7);
+    assert_eq!(rejection["reason_code"], "frame_stale");
+    assert_eq!(rejection["public_message"], "Input rejected.");
+    assert!(
+        !reject
+            .to_string()
+            .contains(&private_root.display().to_string())
+    );
+}
+
+#[tokio::test]
+async fn real_paused_websocket_input_applies_immediately() {
+    let (_workspace, app, backend, _private_root) = ws_real_app(SessionState::Paused, true);
+    let cookie = login_cookie(app.clone()).await;
+    let server = WsServer::start(app).await;
+    let mut ws = server.connect(&cookie).await;
+
+    let ack = send_input(&mut ws, input_message(1, "keyboard", &["A"])).await;
+
+    assert_eq!(ack["type"], "input_ack");
+    assert_eq!(ack["payload"]["status"], "applied");
+    assert_eq!(ack["payload"]["assigned_frame"], 1);
+    assert_eq!(backend.injected_requests().len(), 1);
+}
+
+#[tokio::test]
+async fn real_running_websocket_input_rejects_without_queueing() {
+    let (_workspace, app, backend, _private_root) = ws_real_app(SessionState::Running, true);
+    let cookie = login_cookie(app.clone()).await;
+    let server = WsServer::start(app).await;
+    let mut ws = server.connect(&cookie).await;
+
+    let reject = send_input(&mut ws, input_message(1, "keyboard", &["A"])).await;
+
+    assert_eq!(reject["type"], "input_reject");
+    assert_eq!(reject["payload"]["error"]["code"], "bad_request");
+    assert_eq!(reject["payload"]["error"]["message"], "Input rejected.");
     assert!(backend.injected_requests().is_empty());
 }
 
@@ -685,15 +759,55 @@ fn assert_runtime_security_headers(headers: &tokio_tungstenite::tungstenite::htt
 }
 
 fn ws_app(state: SessionState) -> (tempfile::TempDir, axum::Router, Arc<RecordingBackend>) {
+    let (workspace, app, backend, _private_root) = ws_app_with_private_root(state);
+    (workspace, app, backend)
+}
+
+fn ws_real_app(
+    state: SessionState,
+    input_capability: bool,
+) -> (
+    tempfile::TempDir,
+    axum::Router,
+    Arc<RecordingBackend>,
+    PathBuf,
+) {
+    let mut capabilities = BackendCapabilities::real_input_preview_mvp();
+    capabilities.input = input_capability;
+    ws_app_with_backend(Arc::new(RecordingBackend::new_with_mode(
+        state,
+        BackendMode::Real,
+        capabilities,
+    )))
+}
+
+fn ws_app_with_private_root(
+    state: SessionState,
+) -> (
+    tempfile::TempDir,
+    axum::Router,
+    Arc<RecordingBackend>,
+    PathBuf,
+) {
+    ws_app_with_backend(Arc::new(RecordingBackend::new(state)))
+}
+
+fn ws_app_with_backend(
+    backend: Arc<RecordingBackend>,
+) -> (
+    tempfile::TempDir,
+    axum::Router,
+    Arc<RecordingBackend>,
+    PathBuf,
+) {
     let workspace = tempfile::tempdir().expect("tempdir creates");
     let private_root = workspace.path().join("bridge-private");
-    let backend = Arc::new(RecordingBackend::new(state));
     let app = router(AppState::for_tests_with_backend(
         config(&private_root),
         rom_operator_bridge_service::auth::AuthState::new(),
         backend.clone(),
     ));
-    (workspace, app, backend)
+    (workspace, app, backend, private_root)
 }
 
 fn synthetic_ws_app() -> (tempfile::TempDir, axum::Router, PathBuf) {
@@ -729,14 +843,32 @@ fn config(private_root: &Path) -> ServiceConfig {
 #[derive(Debug)]
 struct RecordingBackend {
     state: Mutex<SessionState>,
+    backend_mode: BackendMode,
+    capabilities: BackendCapabilities,
     injected: Mutex<Vec<InputScheduleRequest>>,
+    injections: Mutex<VecDeque<BackendResult<InputScheduleReceipt>>>,
 }
 
 impl RecordingBackend {
     fn new(state: SessionState) -> Self {
+        Self::new_with_mode(
+            state,
+            BackendMode::Synthetic,
+            BackendCapabilities::synthetic_mvp(),
+        )
+    }
+
+    fn new_with_mode(
+        state: SessionState,
+        backend_mode: BackendMode,
+        capabilities: BackendCapabilities,
+    ) -> Self {
         Self {
             state: Mutex::new(state),
+            backend_mode,
+            capabilities,
             injected: Mutex::new(Vec::new()),
+            injections: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -750,15 +882,22 @@ impl RecordingBackend {
             .expect("injected mutex poisoned")
             .clone()
     }
+
+    fn push_injection(&self, result: BackendResult<InputScheduleReceipt>) {
+        self.injections
+            .lock()
+            .expect("injections mutex poisoned")
+            .push_back(result);
+    }
 }
 
 impl BridgeBackend for RecordingBackend {
     fn mode(&self) -> BackendMode {
-        BackendMode::Synthetic
+        self.backend_mode
     }
 
     fn capabilities(&self) -> BackendCapabilities {
-        BackendCapabilities::synthetic_mvp()
+        self.capabilities
     }
 
     fn start_session(&self, _request: StartBackendSession) -> BackendResult<BackendSession> {
@@ -793,6 +932,7 @@ impl BridgeBackend for RecordingBackend {
             capabilities: self.capabilities(),
             last_applied_input_frame: 0,
             last_preview_frame: 0,
+            preview_stale: false,
             active_capture_job_id: None,
         })
     }
@@ -803,6 +943,7 @@ impl BridgeBackend for RecordingBackend {
             session_id,
             state: SessionState::Paused,
             current_frame: 0,
+            preview_stale: false,
         })
     }
 
@@ -812,6 +953,7 @@ impl BridgeBackend for RecordingBackend {
             session_id,
             state: SessionState::Running,
             current_frame: 0,
+            preview_stale: false,
         })
     }
 
@@ -820,6 +962,14 @@ impl BridgeBackend for RecordingBackend {
             .lock()
             .expect("injected mutex poisoned")
             .push(request.clone());
+        if let Some(result) = self
+            .injections
+            .lock()
+            .expect("injections mutex poisoned")
+            .pop_front()
+        {
+            return result;
+        }
         Ok(InputScheduleReceipt {
             session_id: request.session_id,
             assigned_frame: request.target_frame,
@@ -842,6 +992,7 @@ impl BridgeBackend for RecordingBackend {
             job_id: "synthetic-capture-job-scaffold".to_string(),
             status: rom_operator_bridge_service::backend::CaptureJobStatus::Pending,
             capture_id: None,
+            public: None,
         })
     }
 
@@ -850,6 +1001,7 @@ impl BridgeBackend for RecordingBackend {
             job_id,
             status: rom_operator_bridge_service::backend::CaptureJobStatus::Pending,
             capture_id: None,
+            public: None,
         })
     }
 }

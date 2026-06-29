@@ -7,6 +7,7 @@ pub mod framebuffer;
 pub mod input;
 pub mod labels;
 pub mod private_config;
+mod real_capture;
 pub mod sanitization;
 pub mod telemetry;
 pub mod validation_status;

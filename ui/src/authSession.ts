@@ -7,6 +7,7 @@ import {
   type RuntimeSessionModel,
   type SessionResponse
 } from "./runtimeClient";
+import type { BackendMode } from "./runtimeContract";
 
 export type AuthSessionStatus =
   | "locked"
@@ -41,7 +42,8 @@ export function initialAuthSessionState(): AuthSessionState {
 export async function submitCredential(
   state: AuthSessionState,
   client: RuntimeSessionClient,
-  operatorCredential: string
+  operatorCredential: string,
+  backendMode: BackendMode = "synthetic"
 ): Promise<AuthSessionState> {
   if (operatorCredential.length === 0) {
     return {
@@ -59,11 +61,12 @@ export async function submitCredential(
   try {
     const response = await client.startSession({
       operatorCredential,
+      backendMode,
       requestedCapabilities: ["input", "preview", "capture", "labels", "privileged_features"]
     });
     return {
       status: "active",
-      session: modelFromStartSession(response),
+      session: modelFromStartSession(response, backendMode),
       error: null
     };
   } catch (error) {

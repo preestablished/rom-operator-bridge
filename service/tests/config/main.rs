@@ -2,8 +2,10 @@ use rom_operator_bridge_service::{
     backend::BackendMode,
     config::{ConfigError, ENV_BACKEND_MODE, ENV_BIND_ADDR, ServiceConfig},
     private_config::{
-        ENV_CONFIG_FILE, ENV_OPERATOR_CREDENTIAL, ENV_PRIVATE_ROOT, ENV_SESSION_SECRET,
-        ENV_STATIC_PUBLISH_ROOT, PRIVATE_DIR_MODE, PRIVATE_FILE_MODE, PRIVATE_ROOT_MARKER,
+        ENV_CAPTURE_SPEC_REF, ENV_CONFIG_FILE, ENV_CREATE_VM_CONFIG_REF, ENV_HYPERVISOR_ENDPOINT,
+        ENV_OPERATOR_CREDENTIAL, ENV_PRIVATE_ROOT, ENV_PRIVATE_ROOT_ALIAS, ENV_REAL_SNAPSHOT_REF,
+        ENV_REFERENCE_WORKLOAD_CHECKOUT, ENV_SESSION_SECRET, ENV_STATIC_PUBLISH_ROOT,
+        ENV_WORKLOAD_IMAGE_REF, PRIVATE_DIR_MODE, PRIVATE_FILE_MODE, PRIVATE_ROOT_MARKER,
         PRIVATE_RUN_DIRS, PrivateConfigError,
     },
 };
@@ -25,6 +27,7 @@ fn placeholder_config_loads_without_private_values() {
     assert_eq!(config.backend_mode(), BackendMode::Synthetic);
     assert!(config.private_config().is_placeholder());
     assert!(config.private_config().private_root().is_none());
+    assert!(config.private_config().static_publish_root().is_none());
     assert!(!config.private_config().operator_credential_configured());
     assert!(!config.private_config().session_secret_configured());
 }
@@ -66,6 +69,7 @@ fn config_file_loads_private_values_and_creates_private_dirs() {
         config.private_config().private_root(),
         Some(private_root.as_path())
     );
+    assert!(config.private_config().static_publish_root().is_none());
     assert_eq!(mode(&private_root), PRIVATE_DIR_MODE);
     assert_eq!(
         mode(&private_root.join(PRIVATE_ROOT_MARKER)),
@@ -96,6 +100,117 @@ fn complete_private_config_requires_secrets() {
         Err(ConfigError::PrivateConfig(PrivateConfigError::MissingEnv {
             env: ENV_PRIVATE_ROOT,
         }))
+    );
+}
+
+#[test]
+fn real_mode_requires_private_runtime_inputs() {
+    let workspace = tempfile::tempdir().expect("tempdir creates");
+    let private_root = workspace.path().join("bridge-private");
+    let mut pairs = complete_private_pairs(&private_root);
+    pairs.push((ENV_BACKEND_MODE.to_string(), "real".to_string()));
+
+    assert_eq!(
+        ServiceConfig::from_pairs(pairs),
+        Err(ConfigError::PrivateConfig(PrivateConfigError::MissingEnv {
+            env: ENV_WORKLOAD_IMAGE_REF,
+        }))
+    );
+}
+
+#[test]
+fn real_mode_loads_snapshot_runtime_config_with_default_uds() {
+    let workspace = tempfile::tempdir().expect("tempdir creates");
+    let private_root = workspace.path().join("bridge-private");
+    let reference_checkout = workspace.path().join("reference-workload");
+    let config = ServiceConfig::from_pairs(complete_real_snapshot_pairs(
+        &private_root,
+        &reference_checkout,
+    ))
+    .expect("real config loads");
+
+    assert_eq!(config.backend_mode(), BackendMode::Real);
+    let runtime = config
+        .private_config()
+        .real_runtime_config()
+        .expect("real runtime config exists");
+    assert!(runtime.hypervisor_endpoint().is_unix());
+    assert!(runtime.start_source().is_snapshot());
+
+    let sanitizer = config.private_config().public_sanitizer();
+    assert!(
+        sanitizer
+            .inspect_text("snapshot ref: private-snapshot-ref-from-test")
+            .is_err()
+    );
+    assert!(
+        sanitizer
+            .inspect_text("workload image: private-workload-image-ref-from-test")
+            .is_err()
+    );
+    assert!(
+        sanitizer
+            .inspect_text(&format!("checkout {}", reference_checkout.display()))
+            .is_err()
+    );
+}
+
+#[test]
+fn real_mode_rejects_ambiguous_start_sources_and_bad_endpoint() {
+    let workspace = tempfile::tempdir().expect("tempdir creates");
+    let private_root = workspace.path().join("bridge-private");
+    let reference_checkout = workspace.path().join("reference-workload");
+    let mut pairs = complete_real_snapshot_pairs(&private_root, &reference_checkout);
+    pairs.push((
+        ENV_CREATE_VM_CONFIG_REF.to_string(),
+        "private-create-vm-config-ref-from-test".to_string(),
+    ));
+
+    assert_eq!(
+        ServiceConfig::from_pairs(pairs),
+        Err(ConfigError::PrivateConfig(
+            PrivateConfigError::ConflictingRealStartRefs {
+                envs: &[ENV_REAL_SNAPSHOT_REF, ENV_CREATE_VM_CONFIG_REF],
+            }
+        ))
+    );
+
+    let mut pairs = complete_real_snapshot_pairs(&private_root, &reference_checkout);
+    replace_pair(&mut pairs, ENV_HYPERVISOR_ENDPOINT, "grpc://127.0.0.1:7400");
+
+    assert_eq!(
+        ServiceConfig::from_pairs(pairs),
+        Err(ConfigError::PrivateConfig(
+            PrivateConfigError::InvalidEndpoint {
+                env: ENV_HYPERVISOR_ENDPOINT,
+            }
+        ))
+    );
+}
+
+#[test]
+fn bridge_private_root_alias_configures_private_root() {
+    let workspace = tempfile::tempdir().expect("tempdir creates");
+    let private_root = workspace.path().join("bridge-private");
+    let config = ServiceConfig::from_pairs([
+        (
+            ENV_PRIVATE_ROOT_ALIAS.to_string(),
+            private_root.display().to_string(),
+        ),
+        (
+            ENV_OPERATOR_CREDENTIAL.to_string(),
+            "operator-credential-from-test-source".to_string(),
+        ),
+        (
+            ENV_SESSION_SECRET.to_string(),
+            "session-secret-from-test-source-32-bytes".to_string(),
+        ),
+    ])
+    .expect("alias config loads");
+
+    assert_eq!(
+        config.private_config().private_root(),
+        Some(private_root.as_path())
     );
 }
 
@@ -350,6 +465,29 @@ fn private_root_inside_static_publish_root_is_rejected() {
     );
 }
 
+#[test]
+fn static_publish_root_inside_private_root_is_rejected() {
+    let workspace = tempfile::tempdir().expect("tempdir creates");
+    let private_root = workspace.path().join("bridge-private");
+    let static_root = private_root.join("static-publish");
+
+    let mut pairs = complete_private_pairs(&private_root);
+    pairs.push((
+        ENV_STATIC_PUBLISH_ROOT.to_string(),
+        static_root.display().to_string(),
+    ));
+
+    assert_eq!(
+        ServiceConfig::from_pairs(pairs),
+        Err(ConfigError::PrivateConfig(
+            PrivateConfigError::StaticPublishRootInsidePrivateRoot {
+                private_root,
+                static_publish_root: static_root,
+            }
+        ))
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn symlinked_static_publish_root_alias_is_rejected() {
@@ -402,13 +540,27 @@ fn config_error_debug_does_not_expose_private_paths() {
 fn private_config_sanitizer_rejects_configured_root_and_secrets() {
     let workspace = tempfile::tempdir().expect("tempdir creates");
     let private_root = workspace.path().join("bridge-private");
-    let config =
-        ServiceConfig::from_pairs(complete_private_pairs(&private_root)).expect("config loads");
+    let static_root = workspace.path().join("static-publish");
+    let mut pairs = complete_private_pairs(&private_root);
+    pairs.push((
+        ENV_STATIC_PUBLISH_ROOT.to_string(),
+        static_root.display().to_string(),
+    ));
+    let config = ServiceConfig::from_pairs(pairs).expect("config loads");
+    assert_eq!(
+        config.private_config().static_publish_root(),
+        Some(static_root.as_path())
+    );
     let sanitizer = config.private_config().public_sanitizer();
 
     assert!(
         sanitizer
             .inspect_text(&format!("opened {}", private_root.display()))
+            .is_err()
+    );
+    assert!(
+        sanitizer
+            .inspect_text(&format!("served {}", static_root.display()))
             .is_err()
     );
     assert!(
@@ -495,16 +647,28 @@ fn committed_files_do_not_include_private_config_or_values() {
                     "committed file contains a concrete private root assignment: {path}"
                 );
             }
+            if let Some(value) = assignment_value(line, ENV_PRIVATE_ROOT_ALIAS) {
+                assert!(
+                    !value.starts_with('/'),
+                    "committed file contains a concrete private root assignment: {path}"
+                );
+            }
 
             for secret_env in [
                 ENV_OPERATOR_CREDENTIAL,
                 ENV_SESSION_SECRET,
+                ENV_HYPERVISOR_ENDPOINT,
+                ENV_WORKLOAD_IMAGE_REF,
+                ENV_CAPTURE_SPEC_REF,
+                ENV_REFERENCE_WORKLOAD_CHECKOUT,
+                ENV_REAL_SNAPSHOT_REF,
+                ENV_CREATE_VM_CONFIG_REF,
                 "PRIVATE_ROM_PATH",
                 "WORKER_LEASE_TOKEN",
             ] {
                 if let Some(value) = assignment_value(line, secret_env) {
                     assert!(
-                        value.starts_with('<'),
+                        value.starts_with('<') || value.contains('$'),
                         "committed file contains a concrete private config assignment: {path}"
                     );
                 }
@@ -536,6 +700,20 @@ fn committed_scan_detects_assignment_variants() {
         ),
         Some("<operator-credential-from-secret-source>".to_string())
     );
+    assert_eq!(
+        assignment_value(
+            "BRIDGE_CAPTURE_SPEC_REF='$BRIDGE_CAPTURE_SPEC_REF'",
+            ENV_CAPTURE_SPEC_REF
+        ),
+        Some("$BRIDGE_CAPTURE_SPEC_REF".to_string())
+    );
+    assert_eq!(
+        assignment_value(
+            "BRIDGE_HYPERVISOR_ENDPOINT=\"unix://$O73_WORKER_UDS\"",
+            ENV_HYPERVISOR_ENDPOINT,
+        ),
+        Some("unix://$O73_WORKER_UDS".to_string())
+    );
 }
 
 fn complete_private_pairs(private_root: &Path) -> Vec<(String, String)> {
@@ -553,6 +731,41 @@ fn complete_private_pairs(private_root: &Path) -> Vec<(String, String)> {
             "session-secret-from-test-source-32-bytes".to_string(),
         ),
     ]
+}
+
+fn complete_real_snapshot_pairs(
+    private_root: &Path,
+    reference_checkout: &Path,
+) -> Vec<(String, String)> {
+    let mut pairs = complete_private_pairs(private_root);
+    pairs.extend([
+        (ENV_BACKEND_MODE.to_string(), "real".to_string()),
+        (
+            ENV_WORKLOAD_IMAGE_REF.to_string(),
+            "private-workload-image-ref-from-test".to_string(),
+        ),
+        (
+            ENV_CAPTURE_SPEC_REF.to_string(),
+            "private-capture-spec-ref-from-test".to_string(),
+        ),
+        (
+            ENV_REFERENCE_WORKLOAD_CHECKOUT.to_string(),
+            reference_checkout.display().to_string(),
+        ),
+        (
+            ENV_REAL_SNAPSHOT_REF.to_string(),
+            "private-snapshot-ref-from-test".to_string(),
+        ),
+    ]);
+    pairs
+}
+
+fn replace_pair(pairs: &mut Vec<(String, String)>, key: &str, value: &str) {
+    if let Some((_, existing)) = pairs.iter_mut().find(|(candidate, _)| candidate == key) {
+        *existing = value.to_string();
+    } else {
+        pairs.push((key.to_string(), value.to_string()));
+    }
 }
 
 fn assignment_value(line: &str, key: &str) -> Option<String> {

@@ -48,10 +48,26 @@ describe("UI auth and session flow", () => {
     expect(bodyAt(fetcher, 0)).toMatchObject({
       schema_version: 1,
       operator_credential: "operator-secret",
+      backend_mode: "synthetic",
       requested_capabilities: ["input", "preview", "capture", "labels", "privileged_features"]
     });
     expect(html).toContain("Stop");
     expect(html).not.toContain("operator-secret");
+  });
+
+  it("starts real backend sessions when the mount supplies a real backend mode", async () => {
+    const fetcher = queuedFetch([startSessionResponse()]);
+    const client = new RuntimeApiClient(config, { fetcher });
+
+    const state = await submitCredential(initialAuthSessionState(), client, "operator-secret", "real");
+
+    expect(state.status).toBe("active");
+    expect(state.session.backend_mode).toBe("real");
+    expect(bodyAt(fetcher, 0)).toMatchObject({
+      schema_version: 1,
+      operator_credential: "operator-secret",
+      backend_mode: "real"
+    });
   });
 
   it("renders auth_rejected as a sanitized locked-screen alert", async () => {

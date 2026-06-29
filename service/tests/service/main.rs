@@ -2,7 +2,7 @@ use axum::{
     body::{Body, to_bytes},
     http::{
         HeaderMap, HeaderName, Request, StatusCode,
-        header::{CACHE_CONTROL, PRAGMA},
+        header::{CACHE_CONTROL, CONTENT_TYPE, PRAGMA},
     },
 };
 use rom_operator_bridge_service::{
@@ -13,14 +13,20 @@ use rom_operator_bridge_service::{
     },
     config::{ConfigError, DEFAULT_BIND_ADDR, ENV_BACKEND_MODE, ENV_BIND_ADDR, ServiceConfig},
     input::{PadButton, PadWord},
+    private_config::{
+        ENV_OPERATOR_CREDENTIAL, ENV_PRIVATE_ROOT, ENV_SESSION_SECRET, ENV_STATIC_PUBLISH_ROOT,
+    },
 };
 use serde_json::Value;
-use std::net::SocketAddr;
+use std::{fs, net::SocketAddr, path::Path};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
 use tower::ServiceExt;
+
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
 
 #[tokio::test]
 async fn health_route_returns_schema_v1_without_private_paths() {
@@ -121,6 +127,199 @@ async fn unsupported_method_uses_common_error_envelope() {
     assert_eq!(json["error"]["code"], "bad_request");
     assert_eq!(json["error"]["message"], "Method not allowed.");
     assert_matches_runtime_schema(&json);
+}
+
+#[tokio::test]
+async fn configured_static_root_serves_ui_shell_with_security_headers() {
+    let workspace = tempfile::tempdir().expect("tempdir creates");
+    let private_root = workspace.path().join("bridge-private");
+    let static_root = workspace.path().join("static-publish");
+    write_static_file(
+        &static_root.join("index.html"),
+        "<main>ROM operator shell</main>",
+    );
+    write_static_file(
+        &static_root.join("runtime-config.json"),
+        r#"{"schema_version":1}"#,
+    );
+
+    let app = router(AppState::synthetic_for_tests(config_with_static_root(
+        &private_root,
+        &static_root,
+    )));
+
+    let index = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("static index request succeeds");
+
+    assert_eq!(index.status(), StatusCode::OK);
+    assert_static_headers(index.headers());
+    assert_eq!(
+        index
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/html; charset=utf-8")
+    );
+    let body = body_string(index).await;
+    assert!(body.contains("ROM operator shell"));
+    assert!(!body.contains(&static_root.display().to_string()));
+
+    let runtime_config = app
+        .oneshot(
+            Request::builder()
+                .uri("/runtime-config.json")
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("runtime config request succeeds");
+
+    assert_eq!(runtime_config.status(), StatusCode::OK);
+    assert_static_headers(runtime_config.headers());
+    assert_eq!(
+        runtime_config
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json; charset=utf-8")
+    );
+}
+
+#[tokio::test]
+async fn static_spa_fallback_does_not_shadow_runtime_routes() {
+    let workspace = tempfile::tempdir().expect("tempdir creates");
+    let private_root = workspace.path().join("bridge-private");
+    let static_root = workspace.path().join("static-publish");
+    write_static_file(&static_root.join("index.html"), "<main>SPA fallback</main>");
+
+    let app = router(AppState::synthetic_for_tests(config_with_static_root(
+        &private_root,
+        &static_root,
+    )));
+
+    let fallback = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/operator/session")
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("spa fallback request succeeds");
+    assert_eq!(fallback.status(), StatusCode::OK);
+    assert!(body_string(fallback).await.contains("SPA fallback"));
+
+    let missing_api = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/missing")
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("missing api request succeeds");
+    assert_eq!(missing_api.status(), StatusCode::NOT_FOUND);
+    assert_no_store_headers(missing_api.headers());
+    let body = body_string(missing_api).await;
+    assert!(body.contains("Route not found."));
+    assert!(!body.contains("SPA fallback"));
+}
+
+#[tokio::test]
+async fn static_serving_rejects_unsafe_paths_and_source_maps() {
+    let workspace = tempfile::tempdir().expect("tempdir creates");
+    let private_root = workspace.path().join("bridge-private");
+    let static_root = workspace.path().join("static-publish");
+    write_static_file(&static_root.join("index.html"), "<main>safe shell</main>");
+    write_static_file(
+        &static_root.join("assets").join("app.js"),
+        "console.log('ok');",
+    );
+    write_static_file(
+        &static_root.join("assets").join("app.js.map"),
+        r#"{"sources":["private"]}"#,
+    );
+    write_static_file(&static_root.join(".hidden"), "private");
+
+    let app = router(AppState::synthetic_for_tests(config_with_static_root(
+        &private_root,
+        &static_root,
+    )));
+
+    for uri in [
+        "/../private",
+        "/%2e%2e/private",
+        "/.hidden",
+        "/assets/app.js.map",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("unsafe static request succeeds");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "uri={uri}");
+        assert!(
+            !body_string(response)
+                .await
+                .contains(&static_root.display().to_string())
+        );
+    }
+
+    let asset = app
+        .oneshot(
+            Request::builder()
+                .uri("/assets/app.js")
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("safe asset request succeeds");
+    assert_eq!(asset.status(), StatusCode::OK);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn static_serving_rejects_symlinked_files() {
+    let workspace = tempfile::tempdir().expect("tempdir creates");
+    let private_root = workspace.path().join("bridge-private");
+    let static_root = workspace.path().join("static-publish");
+    let secret_file = workspace.path().join("not-public.txt");
+    fs::write(&secret_file, "private static leak").expect("secret fixture writes");
+    write_static_file(&static_root.join("index.html"), "<main>safe shell</main>");
+    symlink(&secret_file, static_root.join("leak.txt")).expect("symlink creates");
+
+    let app = router(AppState::synthetic_for_tests(config_with_static_root(
+        &private_root,
+        &static_root,
+    )));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/leak.txt")
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("symlink request succeeds");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body = body_string(response).await;
+    assert!(!body.contains("private static leak"));
+    assert!(!body.contains(&secret_file.display().to_string()));
 }
 
 #[test]
@@ -243,6 +442,68 @@ fn assert_matches_runtime_schema(json: &Value) {
     validator.validate(json).unwrap_or_else(|error| {
         panic!("runtime schema validation failed: {error}");
     });
+}
+
+async fn body_string(response: axum::response::Response) -> String {
+    let body = to_bytes(response.into_body(), 8192)
+        .await
+        .expect("body reads");
+    String::from_utf8(body.to_vec()).expect("body is utf8")
+}
+
+fn write_static_file(path: &Path, contents: &str) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("static parent creates");
+    }
+    fs::write(path, contents).expect("static file writes");
+}
+
+fn config_with_static_root(private_root: &Path, static_root: &Path) -> ServiceConfig {
+    ServiceConfig::from_pairs([
+        (ENV_BIND_ADDR.to_string(), "127.0.0.1:0".to_string()),
+        (ENV_BACKEND_MODE.to_string(), "synthetic".to_string()),
+        (
+            ENV_PRIVATE_ROOT.to_string(),
+            private_root.display().to_string(),
+        ),
+        (
+            ENV_STATIC_PUBLISH_ROOT.to_string(),
+            static_root.display().to_string(),
+        ),
+        (
+            ENV_OPERATOR_CREDENTIAL.to_string(),
+            "operator-credential-from-test-source".to_string(),
+        ),
+        (
+            ENV_SESSION_SECRET.to_string(),
+            "session-secret-from-test-source-32-bytes".to_string(),
+        ),
+    ])
+    .expect("static root config loads")
+}
+
+fn assert_static_headers(headers: &HeaderMap) {
+    assert_no_store_headers(headers);
+    assert_eq!(
+        headers
+            .get(HeaderName::from_static("content-security-policy"))
+            .and_then(|value| value.to_str().ok()),
+        Some(
+            "default-src 'self'; connect-src 'self' wss://rombridge.birb.homes; img-src 'self' blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+        )
+    );
+    assert_eq!(
+        headers
+            .get(HeaderName::from_static("referrer-policy"))
+            .and_then(|value| value.to_str().ok()),
+        Some("no-referrer")
+    );
+    assert_eq!(
+        headers
+            .get(HeaderName::from_static("x-frame-options"))
+            .and_then(|value| value.to_str().ok()),
+        Some("DENY")
+    );
 }
 
 fn assert_no_store_headers(headers: &HeaderMap) {

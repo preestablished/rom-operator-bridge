@@ -1,11 +1,13 @@
 use crate::{
     api::{ErrorCode, ErrorEnvelope, ErrorObject, RUNTIME_API_SCHEMA_VERSION},
+    artifacts::PrivateArtifactStore,
     backend::BridgeBackend,
     input::{
-        BrowserInputState, FRAME_STALE_REASON_CODE, InputScheduleOutcome, InputScheduleStatus,
-        InputScheduler, InputSchedulerError, NoopInputRejectionSink,
+        BrowserInputState, FRAME_STALE_REASON_CODE, InputRejectionSink, InputScheduleOutcome,
+        InputScheduleStatus, InputScheduler, InputSchedulerError, NoopInputRejectionSink,
         PUBLIC_INPUT_REJECTION_MESSAGE, PadButton, PadWord,
     },
+    private_config::BridgePrivateConfig,
 };
 use axum::extract::ws::{Message, WebSocket};
 use serde::{Deserialize, Serialize};
@@ -48,12 +50,12 @@ impl WsInputState {
         &self,
         backend: &dyn BridgeBackend,
         session_id: &str,
+        rejection_sink: &mut dyn InputRejectionSink,
     ) -> Result<Vec<InputScheduleOutcome>, InputSchedulerError> {
         let mut inner = self.inner.lock().expect("ws input mutex poisoned");
-        let mut rejection_sink = NoopInputRejectionSink;
         inner
             .scheduler
-            .flush_pending(backend, session_id, &mut rejection_sink)
+            .flush_pending(backend, session_id, rejection_sink)
     }
 
     fn handle_text(
@@ -61,6 +63,7 @@ impl WsInputState {
         backend: &dyn BridgeBackend,
         active_session_id: &str,
         text: &str,
+        rejection_sink: &mut dyn InputRejectionSink,
     ) -> Option<String> {
         let incoming = IncomingEnvelope::parse(text)?;
         let mut inner = self.inner.lock().expect("ws input mutex poisoned");
@@ -125,8 +128,7 @@ impl WsInputState {
             }
         };
 
-        let mut rejection_sink = NoopInputRejectionSink;
-        let outcome = match inner.scheduler.submit(backend, input, &mut rejection_sink) {
+        let outcome = match inner.scheduler.submit(backend, input, rejection_sink) {
             Ok(outcome) => outcome,
             Err(error) => {
                 let error = WsInputError::from_scheduler(error);
@@ -164,6 +166,7 @@ pub async fn serve_input_socket(
     backend: Arc<dyn BridgeBackend>,
     input_state: WsInputState,
     active_session_id: String,
+    private_config: BridgePrivateConfig,
 ) {
     while let Some(message) = socket.recv().await {
         let Ok(message) = message else {
@@ -172,7 +175,23 @@ pub async fn serve_input_socket(
 
         let reply = match message {
             Message::Text(text) => {
-                input_state.handle_text(backend.as_ref(), &active_session_id, text.as_str())
+                if private_config.is_placeholder() {
+                    let mut rejection_sink = NoopInputRejectionSink;
+                    input_state.handle_text(
+                        backend.as_ref(),
+                        &active_session_id,
+                        text.as_str(),
+                        &mut rejection_sink,
+                    )
+                } else {
+                    let mut rejection_sink = PrivateArtifactStore::new(&private_config);
+                    input_state.handle_text(
+                        backend.as_ref(),
+                        &active_session_id,
+                        text.as_str(),
+                        &mut rejection_sink,
+                    )
+                }
             }
             Message::Close(_) => break,
             Message::Binary(_) | Message::Ping(_) | Message::Pong(_) => None,
@@ -543,6 +562,11 @@ impl WsInputError {
             }
             InputSchedulerError::Backend(crate::backend::BackendError::FrameStale { .. }) => Self {
                 code: ErrorCode::FrameStale,
+                message: PUBLIC_INPUT_REJECTION_MESSAGE,
+                retryable: true,
+            },
+            InputSchedulerError::RejectionSink(_) => Self {
+                code: ErrorCode::BackendUnavailable,
                 message: PUBLIC_INPUT_REJECTION_MESSAGE,
                 retryable: true,
             },

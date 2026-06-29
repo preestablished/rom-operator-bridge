@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import { mountOperatorApp } from "../../src/app";
 import type { RuntimeEventClient, RuntimePreviewClient, RuntimeRunClient } from "../../src/app";
 import type { RuntimeSessionClient } from "../../src/authSession";
-import { RuntimeApiError } from "../../src/runtimeClient";
+import { RuntimeApiClient, RuntimeApiError } from "../../src/runtimeClient";
 import type { RuntimeWsMessage } from "../../src/runtimeClient";
 import type { RuntimeConfig } from "../../src/runtimeConfig";
 
@@ -57,9 +57,10 @@ describe("mounted auth/session screen", () => {
     input!.value = "operator-secret";
     form!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
 
-    expect(client.startSession).toHaveBeenCalledTimes(1);
     expect(root.querySelector<HTMLInputElement>("input[name='operator_credential']")?.value).toBe("");
     expect(root.querySelector<HTMLButtonElement>("button[type='submit']")?.disabled).toBe(true);
+    await flushPromises();
+    expect(client.startSession).toHaveBeenCalledTimes(1);
 
     refresh.resolve(activeSessionResponse("stale-session"));
     await flushPromises();
@@ -69,6 +70,32 @@ describe("mounted auth/session screen", () => {
     await flushPromises();
     expect(root.textContent).toContain("session-002");
     expect(root.textContent).not.toContain("operator-secret");
+  });
+
+  it("uses the health backend mode when starting a session", async () => {
+    const client = mockClient({
+      health: vi.fn().mockResolvedValue(healthResponse("real")),
+      startSession: vi.fn().mockResolvedValue(startSessionResponse("session-real"))
+    });
+    const root = document.createElement("div");
+
+    mountOperatorApp(root, config, client, null);
+    await flushPromises();
+    const input = root.querySelector<HTMLInputElement>("input[name='operator_credential']");
+    const form = root.querySelector<HTMLFormElement>("form[data-session-form='start']");
+
+    input!.value = "operator-secret";
+    form!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    await flushPromises();
+    await flushPromises();
+
+    expect(client.startSession).toHaveBeenCalledWith({
+      operatorCredential: "operator-secret",
+      backendMode: "real",
+      requestedCapabilities: ["input", "preview", "capture", "labels", "privileged_features"]
+    });
+    expect(root.textContent).toContain("real");
+    expect(root.textContent).toContain("session-real");
   });
 
   it("keeps logout pending in the active layout and prevents stale starts", async () => {
@@ -202,7 +229,8 @@ describe("mounted auth/session screen", () => {
   });
 });
 
-type MockRuntimeClient = RuntimeSessionClient & Partial<RuntimePreviewClient & RuntimeRunClient>;
+type MockRuntimeClient = RuntimeSessionClient &
+  Partial<Pick<RuntimeApiClient, "health"> & RuntimePreviewClient & RuntimeRunClient>;
 
 function mockClient(overrides: Partial<MockRuntimeClient> = {}): MockRuntimeClient {
   return {
@@ -280,6 +308,16 @@ function activeSessionResponse(sessionId = "session-001") {
     state: "running",
     current_frame: 12,
     backend_mode: "synthetic"
+  };
+}
+
+function healthResponse(backendMode: "synthetic" | "real" = "synthetic") {
+  return {
+    schema_version: 1,
+    ok: true,
+    service_version: "test",
+    backend_mode: backendMode,
+    runtime_api: 1
   };
 }
 

@@ -271,10 +271,37 @@ curl -i https://rombridge.birb.homes/api/session
 curl -I https://rombridge.birb.homes/api/session
 ```
 
+Repeatable deployment-network check shape:
+
+```sh
+ROM_BRIDGE_VALIDATION_DIR=<private-validation-dir>/deployment-network-kut/<run-id> \
+ROM_BRIDGE_COOKIE_CURL_CONFIG_FILE=<private-cookie-curl-config> \
+ROM_BRIDGE_STATIC_PUBLISH_ROOT=<absolute-static-publish-root> \
+ROM_BRIDGE_NETWORK_EVIDENCE_FILE=<private-network-evidence-file> \
+ROM_BRIDGE_NETWORK_EVIDENCE_REVIEWED=1 \
+ROM_BRIDGE_OUTSIDE_PROBE_RESULT_FILE=<private-outside-probe-file> \
+ROM_BRIDGE_OUTSIDE_PROBE_REVIEWED=1 \
+ROM_BRIDGE_FORBID_FILE=<private-forbid-file> \
+scripts/deployment-network-check.sh
+```
+
+Deployment redaction checks must require the operator-private forbid file:
+
+```sh
+ROM_OPERATOR_BRIDGE_FORBID_FILE=<private-forbid-file> \
+ROM_OPERATOR_BRIDGE_REQUIRE_FORBID_FILE=1 \
+bash scripts/redaction-gate.sh
+```
+
 Expected deployment check results:
 
 - hostname resolves to `<bridge-private-ip>`;
 - TLS is served for `rombridge.birb.homes`;
 - unrelated origins are rejected;
 - unauthenticated API requests are rejected without private details;
-- runtime responses include `Cache-Control: no-store`.
+- runtime responses include `Cache-Control: no-store`;
+- Host/SNI evidence proves unrelated hostnames do not serve the bridge;
+- reviewed listener evidence proves the service does not bind to a wildcard
+  address;
+- the deployed static root is a clean, scanned release directory with no
+  source maps, symlinks, private values, or mixed-content runtime endpoints.

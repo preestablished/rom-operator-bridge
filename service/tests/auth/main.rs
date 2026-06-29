@@ -12,7 +12,10 @@ use rom_operator_bridge_service::{
         SESSION_COOKIE_NAME, SESSION_TTL_SECONDS,
     },
     config::{ENV_BACKEND_MODE, ServiceConfig},
-    private_config::{ENV_OPERATOR_CREDENTIAL, ENV_PRIVATE_ROOT, ENV_SESSION_SECRET},
+    private_config::{
+        ENV_CAPTURE_SPEC_REF, ENV_OPERATOR_CREDENTIAL, ENV_PRIVATE_ROOT, ENV_REAL_SNAPSHOT_REF,
+        ENV_REFERENCE_WORKLOAD_CHECKOUT, ENV_SESSION_SECRET, ENV_WORKLOAD_IMAGE_REF,
+    },
 };
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -370,6 +373,10 @@ fn config(private_root: &std::path::Path) -> ServiceConfig {
 }
 
 fn real_config(private_root: &std::path::Path) -> ServiceConfig {
+    let reference_checkout = private_root
+        .parent()
+        .expect("private root has parent")
+        .join("reference-workload");
     ServiceConfig::from_pairs([
         (ENV_BACKEND_MODE.to_string(), "real".to_string()),
         (
@@ -381,6 +388,22 @@ fn real_config(private_root: &std::path::Path) -> ServiceConfig {
             GOOD_CREDENTIAL.to_string(),
         ),
         (ENV_SESSION_SECRET.to_string(), SESSION_SECRET.to_string()),
+        (
+            ENV_WORKLOAD_IMAGE_REF.to_string(),
+            "private-workload-image-ref-from-test".to_string(),
+        ),
+        (
+            ENV_CAPTURE_SPEC_REF.to_string(),
+            "private-capture-spec-ref-from-test".to_string(),
+        ),
+        (
+            ENV_REFERENCE_WORKLOAD_CHECKOUT.to_string(),
+            reference_checkout.display().to_string(),
+        ),
+        (
+            ENV_REAL_SNAPSHOT_REF.to_string(),
+            "private-snapshot-ref-from-test".to_string(),
+        ),
     ])
     .expect("real private config loads")
 }

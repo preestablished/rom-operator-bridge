@@ -1,6 +1,7 @@
 # ROM Bridge Deployment And Security Shape
 
 Date: 2026-06-23
+Updated: 2026-06-26
 Agent: Codex / Ralph iteration 1
 
 ## Private Operations Note
@@ -26,11 +27,9 @@ This avoids the mixed-content risk called out in the initial plan while avoiding
 the need to share the existing `https://birb.homes/plans/<slug>/` static-publish
 surface with a runtime control API.
 
-Only DNS exists at this point. This branch does not configure TLS or install a
-proxy route for `rombridge.birb.homes`. Until the later deployment bead creates
-the route and smoke checks pass, the hostname should be treated as unavailable
-for bridge operation and may return default virtual-host behavior. The current
-deployment handoff is recorded in `docs/deployment-note.md`.
+Status update: the deployment bead later installed and validated the dedicated
+route. The current live handoff is recorded in `docs/deployment-note.md`, with
+sanitized evidence label `deployment-network-kut/20260626T212016Z`.
 
 ## URLs
 
@@ -95,9 +94,10 @@ bead also replaces the Traefik external-endpoint shape with a host-local reverse
 proxy that can reach loopback.
 
 The dedicated-hostname deployment uses the documented trusted interface above,
-not localhost. The deployment bead must still create the proxy manifest,
-installable service unit, release artifact, and private env file before any
-publish/deploy step.
+not localhost. The later deployment work added the proxy manifest, installable
+service unit, release artifact layout, private env workflow, and
+publish-readiness evidence. Current publish readiness is recorded in
+`docs/publish-readiness.md`.
 
 ## Origin And CORS Allowlist
 
@@ -169,8 +169,8 @@ WebSocket, preview, capture, validation, and private artifact routes from cachin
 
 ## Restart And Rollback Commands
 
-These commands are notes for the later deployment bead. They were not run during
-Phase 0 discovery.
+These commands were planned during Phase 0 discovery and remain the deployed
+restart/rollback shapes.
 
 Bridge service restart:
 
@@ -203,15 +203,15 @@ sudo ln -sfn /opt/rom-operator-bridge/previous /opt/rom-operator-bridge/current
 sudo systemctl restart rom-operator-bridge.service
 ```
 
-The deployment bead must create `deploy/k8s/rombridge-ingress.yaml`,
-`deploy/systemd/rom-operator-bridge.service`, the private env file, and the
-release symlinks before these commands are run. If the unit changes during a
-deployment, run `sudo systemctl daemon-reload` before restart.
+The sanitized ingress and systemd templates now live under `deploy/`. The
+private env file and concrete endpoint manifest remain operator-private. If the
+unit changes during a deployment, run `sudo systemctl daemon-reload` before
+restart.
 
-## Future Deployment Checks
+## Deployment Checks
 
-These command shapes are for the later deployment bead. They were not run during
-Phase 0 discovery because no deployed service instance or proxy route exists yet.
+These command shapes are retained for revalidation. The live deployment passed
+the fuller private checker described in `docs/deployment-checks.md`.
 
 DNS and TLS route:
 
@@ -238,12 +238,10 @@ for `rombridge.birb.homes`, unrelated origins are rejected, unauthenticated API
 requests are rejected without private details, and runtime responses include
 `Cache-Control: no-store`.
 
-## Deployment Blockers For Later Beads
+## Deployment Status
 
-- No committed `rombridge.birb.homes` Traefik/Ingress/Apache/Caddy config exists
-  yet in this repo.
-- The bridge service exists in this repo, but deployment install material does
-  not exist yet.
-- Publish/deploy commands must remain blocked until the redaction scan, auth
-  rejection, origin rejection, no-store header checks, and browser no-persistence
-  checks are green.
+- `deploy/k8s/rombridge-ingress.yaml` records the sanitized K3s route shape.
+- `deploy/systemd/rom-operator-bridge.service` records the installable service
+  unit.
+- `docs/deployment-checks.md` records passing sanitized deployment evidence.
+- `docs/publish-readiness.md` records passing static publish readiness.

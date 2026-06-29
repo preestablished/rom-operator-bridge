@@ -769,6 +769,7 @@ function captureDetailResponse() {
     frame: 13,
     status: "completed",
     labelable: true,
+    has_preview: true,
     preview_image_url: "/api/capture/capture-001/preview",
     privileged_features_available: false,
     labels: ["first_boss"],

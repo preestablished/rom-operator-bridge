@@ -9,6 +9,7 @@ const TEXT_EXTENSIONS = new Set([
   ".json",
   ".md",
   ".mjs",
+  ".service",
   ".svg",
   ".toml",
   ".ts",
@@ -22,6 +23,7 @@ const TEXT_EXTENSIONS = new Set([
 const SCAN_TARGETS = [
   "README.md",
   "contracts",
+  "deploy",
   "docs",
   "ui/README.md",
   "ui/index.html",
