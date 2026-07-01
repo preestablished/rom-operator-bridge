@@ -94,6 +94,17 @@ describe("UI auth and session flow", () => {
     expect(renderOperatorApp(config, state)).toContain("Session inactive.");
   });
 
+  it("keeps a fresh visit locked when the session endpoint reports inactive", async () => {
+    const fetcher = queuedFetch([errorEnvelope("session_inactive", "Session inactive.")], 401);
+    const client = new RuntimeApiClient(config, { fetcher });
+
+    const state = await refreshSession(initialAuthSessionState(), client);
+
+    expect(state.status).toBe("locked");
+    expect(state.error).toBeNull();
+    expect(renderOperatorApp(config, state)).not.toContain("Session inactive.");
+  });
+
   it("logs out with the active session id and returns to the locked state", async () => {
     const fetcher = queuedFetch([stopSessionResponse()]);
     const client = new RuntimeApiClient(config, { fetcher });

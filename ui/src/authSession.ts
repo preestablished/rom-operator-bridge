@@ -121,6 +121,12 @@ function stateFromRuntimeError(state: AuthSessionState, error: unknown): AuthSes
     };
   }
 
+  if (error.display.code === "session_inactive" && !state.session.session_id) {
+    // A fresh visit has no session to expire; treat the inactive response as
+    // the ordinary locked/startable state instead of surfacing expiry copy.
+    return initialAuthSessionState();
+  }
+
   const status = statusFromErrorCode(error.display.code);
   const clearSession =
     status === "auth_rejected" ||
