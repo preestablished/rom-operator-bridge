@@ -211,9 +211,26 @@ pub fn validate_origin(
     headers: &HeaderMap,
     deployment_security: &DeploymentSecurityConfig,
 ) -> Result<RuntimeAuthContext, AuthError> {
-    let origin_header = headers
-        .get(header::ORIGIN)
-        .ok_or(AuthError::MissingOrigin)?;
+    // Browsers omit the Origin header on same-origin GET/HEAD requests, so
+    // its absence cannot mean rejection: fall back to resolving the profile
+    // from the Host header. Cross-site browser requests that carry
+    // credentials always include Origin (and the session cookie is
+    // SameSite=Strict), so this does not weaken the cross-origin check.
+    let Some(origin_header) = headers.get(header::ORIGIN) else {
+        let host = headers
+            .get(header::HOST)
+            .and_then(|value| value.to_str().ok());
+        let profile = deployment_security
+            .profile_for_host_header(host)
+            .ok_or(AuthError::MissingOrigin)?;
+        let origin =
+            HeaderValue::from_str(profile.public_origin()).map_err(|_| AuthError::MissingOrigin)?;
+        return Ok(RuntimeAuthContext {
+            profile_id: profile.id().to_string(),
+            origin,
+            cookie_secure: profile.cookie_secure(),
+        });
+    };
     let origin = origin_header
         .to_str()
         .ok()

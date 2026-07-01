@@ -175,7 +175,10 @@ async fn event_connection_requires_authenticated_browser_origin() {
             .await
             .is_err()
     );
-    assert!(server.try_connect(Some(&cookie), None).await.is_err());
+    // A handshake without an Origin header falls back to the Host-header
+    // profile (browsers always include Origin on WebSocket handshakes), so an
+    // authenticated cookie with the allowed Host still connects.
+    assert!(server.try_connect(Some(&cookie), None).await.is_ok());
 }
 
 #[tokio::test]

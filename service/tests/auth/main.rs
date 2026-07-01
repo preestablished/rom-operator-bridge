@@ -80,6 +80,45 @@ async fn unrelated_absent_and_null_origins_are_rejected() {
 }
 
 #[tokio::test]
+async fn same_origin_get_without_origin_header_uses_host_profile() {
+    let (_workspace, app, private_root) = auth_app();
+
+    // Browsers omit the Origin header on same-origin GET requests; the Host
+    // header must be enough to resolve the deployment profile.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/session")
+                .header(HOST, host_for_origin(ALLOWED_ORIGIN))
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("request runs");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_auth_safe_error(response, "session_inactive", &private_root).await;
+
+    // An unrecognized Host without an Origin header is still rejected.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/session")
+                .header(HOST, "unknown.example.invalid")
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("request runs");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_auth_safe_error(response, "origin_rejected", &private_root).await;
+}
+
+#[tokio::test]
 async fn legacy_start_body_still_requires_valid_origin_first() {
     let (_workspace, app, private_root) = auth_app();
 
