@@ -47,6 +47,10 @@ sudo install -m 0600 <private-env-source> \
 
 The env file needs real operator-approved values for these keys:
 
+Use plain `KEY=value` assignments only. The service loads this file through
+systemd `EnvironmentFile`, so do not use shell `export KEY=value` syntax or
+whitespace around `=`.
+
 | Key | Value |
 |---|---|
 | `ROM_OPERATOR_BRIDGE_BIND_ADDR` | `<bridge-private-ip>:7410` |

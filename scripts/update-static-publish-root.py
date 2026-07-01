@@ -71,8 +71,7 @@ def update_lines(lines: list[str], static_root: Path) -> tuple[list[str], bool]:
             out.append(line)
             continue
 
-        prefix = "export " if line.strip().startswith("export ") else ""
-        replacement = "".join((prefix, key, ASSIGN, value))
+        replacement = "".join((key, ASSIGN, value))
         out.append(replacement)
         seen = True
         changed = changed or current_value.strip().strip("'\"") != value

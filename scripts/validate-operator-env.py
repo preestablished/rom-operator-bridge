@@ -121,6 +121,12 @@ def parse_env_file(path: Path, reporter: Reporter) -> dict[str, str]:
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
+        if (
+            line.startswith("export ")
+            or re.match(r"^[A-Z0-9_]+\s+=", line)
+            or re.match(r"^[A-Z0-9_]+\s*=\s+", line)
+        ):
+            reporter.warn("env_file_systemd_syntax", f"line {line_number}")
         if line.startswith("export "):
             line = line.removeprefix("export ").strip()
         if "=" not in line:

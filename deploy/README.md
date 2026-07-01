@@ -29,6 +29,10 @@ The installed env file is:
 /etc/rom-operator-bridge/rom-operator-bridge.env
 ```
 
+The service loads this file through systemd `EnvironmentFile`; use plain
+`KEY=value` assignments only. Do not use shell `export KEY=value` syntax or
+whitespace around `=` in the deployed env file.
+
 It must contain placeholders replaced with operator-approved private values:
 
 ```sh

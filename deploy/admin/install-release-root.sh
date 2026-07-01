@@ -133,11 +133,10 @@ for line in lines:
     key, value = parsed
     values[key] = value.strip().strip("'\"")
     if key == target_key:
-        prefix = "export " if line.strip().startswith("export ") else ""
-        updated.append(f"{prefix}{target_key}={static_release}")
+        updated.append(f"{target_key}={static_release}")
         seen_static = True
     else:
-        updated.append(line)
+        updated.append(f"{key}={value}")
 
 if not seen_static:
     updated.append(f"{target_key}={static_release}")
