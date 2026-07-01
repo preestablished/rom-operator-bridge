@@ -90,6 +90,10 @@ Recommended two-phase deploy:
 scripts/build-release.sh
 ```
 
+The release build requires Node.js `20.19+`, `22.12+`, or `24+`. If `node
+--version` reports Node 18, activate the operator-approved newer runtime first,
+for example `source ~/.nvm/nvm.sh && nvm use 22`.
+
 Install or refresh the audited root-owned installer:
 
 ```sh

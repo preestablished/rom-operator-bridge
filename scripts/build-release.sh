@@ -19,7 +19,18 @@ need_command() {
 
 need_command cargo
 need_command git
+need_command node
 need_command npm
+
+node_version=$(node --version)
+node_semver=${node_version#v}
+IFS=. read -r node_major node_minor _ <<<"$node_semver"
+if ! [[ "$node_major" =~ ^[0-9]+$ && "$node_minor" =~ ^[0-9]+$ ]] ||
+  ! ((node_major >= 24 || (node_major == 22 && node_minor >= 12) || (node_major == 20 && node_minor >= 19))); then
+  printf 'build-release: FAIL Node.js %s is unsupported; use Node.js 20.19+, 22.12+, or 24+\n' "$node_version" >&2
+  printf 'build-release: hint run `source ~/.nvm/nvm.sh && nvm use 22` before building if nvm is installed\n' >&2
+  exit 1
+fi
 
 if [[ -n "$(git -C "$ROOT_DIR" status --porcelain)" ]]; then
   printf 'build-release: FAIL working tree must be clean before deployment build\n' >&2

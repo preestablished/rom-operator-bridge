@@ -58,6 +58,10 @@ Build:
 scripts/build-release.sh
 ```
 
+The UI toolchain requires Node.js `20.19+`, `22.12+`, or `24+`. If the host
+still resolves `node` to the system Node 18, activate the operator-approved
+newer runtime first, for example `source ~/.nvm/nvm.sh && nvm use 22`.
+
 Install the audited root installer once, or whenever its committed content
 changes:
 
