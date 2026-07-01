@@ -2127,7 +2127,10 @@ impl RealWorkerState {
                         entropy_seed: Vec::new(),
                     })
                     .await
-                    .map_err(|_| RealWorkerFailure::BackendUnavailable)?
+                    .map_err(|status| {
+                        log_worker_rpc_failure("RestoreSnapshot", &status);
+                        RealWorkerFailure::BackendUnavailable
+                    })?
                     .into_inner();
                 let lease = response
                     .lease
@@ -2151,7 +2154,10 @@ impl RealWorkerState {
                         entropy_seed,
                     })
                     .await
-                    .map_err(|_| RealWorkerFailure::BackendUnavailable)?
+                    .map_err(|status| {
+                        log_worker_rpc_failure("CreateVm", &status);
+                        RealWorkerFailure::BackendUnavailable
+                    })?
                     .into_inner();
                 let lease = response
                     .lease
@@ -2171,7 +2177,10 @@ impl RealWorkerState {
             .await?
             .destroy_vm(dh::DestroyVmRequest { lease: Some(lease) })
             .await
-            .map_err(|_| RealWorkerFailure::BackendUnavailable)?;
+            .map_err(|status| {
+                log_worker_rpc_failure("DestroyVm", &status);
+                RealWorkerFailure::BackendUnavailable
+            })?;
         Ok(())
     }
 
@@ -2181,7 +2190,10 @@ impl RealWorkerState {
             .await?
             .pause(dh::PauseRequest { lease: Some(lease) })
             .await
-            .map_err(worker_failure_from_status)?
+            .map_err(|status| {
+                log_worker_rpc_failure("Pause", &status);
+                worker_failure_from_status(status)
+            })?
             .into_inner();
         Ok(RealPauseOutcome {
             current_icount: response.icount,
@@ -2199,7 +2211,10 @@ impl RealWorkerState {
                 until: Some(dh::run_request::Until::FrameBudget(1)),
             })
             .await
-            .map_err(|_| RealWorkerFailure::BackendUnavailable)?
+            .map_err(|status| {
+                log_worker_rpc_failure("Run", &status);
+                RealWorkerFailure::BackendUnavailable
+            })?
             .into_inner();
         let reason =
             dh::StopReason::try_from(response.reason).unwrap_or(dh::StopReason::StopUnspecified);
@@ -2219,13 +2234,19 @@ impl RealWorkerState {
             .await?
             .list_slots(dh::ListSlotsRequest {})
             .await
-            .map_err(|_| RealWorkerFailure::BackendUnavailable)?
+            .map_err(|status| {
+                log_worker_rpc_failure("ListSlots", &status);
+                RealWorkerFailure::BackendUnavailable
+            })?
             .into_inner();
         let slot = response
             .slots
             .into_iter()
             .find(|slot| slot.slot_id == slot_id)
-            .ok_or(RealWorkerFailure::BackendUnavailable)?;
+            .ok_or_else(|| {
+                tracing::warn!(slot_id, "hypervisor slot for active session not found");
+                RealWorkerFailure::BackendUnavailable
+            })?;
         let state = dh::SlotState::try_from(slot.state).unwrap_or(dh::SlotState::SlotUnspecified);
         match state {
             dh::SlotState::PausedS | dh::SlotState::Running => Ok(RealSlotStatus {
@@ -2234,7 +2255,10 @@ impl RealWorkerState {
             dh::SlotState::SlotUnspecified
             | dh::SlotState::Empty
             | dh::SlotState::Frozen
-            | dh::SlotState::FaultedS => Err(RealWorkerFailure::BackendUnavailable),
+            | dh::SlotState::FaultedS => {
+                tracing::warn!(slot_id, state = ?state, "hypervisor slot in unusable state");
+                Err(RealWorkerFailure::BackendUnavailable)
+            }
         }
     }
 
@@ -2244,13 +2268,21 @@ impl RealWorkerState {
             .await?
             .get_framebuffer(dh::GetFramebufferRequest { lease: Some(lease) })
             .await
-            .map_err(|_| RealWorkerFailure::BackendUnavailable)?
+            .map_err(|status| {
+                log_worker_rpc_failure("GetFramebuffer", &status);
+                RealWorkerFailure::BackendUnavailable
+            })?
             .into_inner();
-        let format = match dh::PixelFormat::try_from(response.format)
-            .map_err(|_| RealWorkerFailure::BackendUnavailable)?
-        {
+        let format = match dh::PixelFormat::try_from(response.format).map_err(|_| {
+            tracing::warn!(format = response.format, "framebuffer pixel format unknown");
+            RealWorkerFailure::BackendUnavailable
+        })? {
             dh::PixelFormat::Xrgb8888 => RawFramebufferFormat::Xrgb8888,
             dh::PixelFormat::PfUnspecified | dh::PixelFormat::Rgb565 => {
+                tracing::warn!(
+                    format = response.format,
+                    "framebuffer pixel format unsupported"
+                );
                 return Err(RealWorkerFailure::BackendUnavailable);
             }
         };
@@ -2261,7 +2293,15 @@ impl RealWorkerState {
             format,
             pixels: &response.pixels,
         })
-        .map_err(|_| RealWorkerFailure::BackendUnavailable)?;
+        .map_err(|_| {
+            tracing::warn!(
+                width = response.width,
+                height = response.height,
+                stride = response.stride,
+                "framebuffer png encode failed"
+            );
+            RealWorkerFailure::BackendUnavailable
+        })?;
         Ok(RealFramebufferOutcome {
             frame: u64::from(response.frame_counter),
             icount: response.icount,
@@ -2280,7 +2320,10 @@ impl RealWorkerState {
             .await?
             .get_framebuffer(dh::GetFramebufferRequest { lease: Some(lease) })
             .await
-            .map_err(|_| RealWorkerFailure::BackendUnavailable)?
+            .map_err(|status| {
+                log_worker_rpc_failure("GetFramebuffer", &status);
+                RealWorkerFailure::BackendUnavailable
+            })?
             .into_inner();
         Ok(RealFrameCounterOutcome {
             frame: u64::from(response.frame_counter),
@@ -2308,7 +2351,10 @@ impl RealWorkerState {
                 }],
             })
             .await
-            .map_err(input_worker_failure_from_status)?
+            .map_err(|status| {
+                log_worker_rpc_failure("InjectInputs", &status);
+                input_worker_failure_from_status(status)
+            })?
             .into_inner();
         Ok(RealInjectInputOutcome {
             scheduled: response.scheduled,
@@ -2442,6 +2488,18 @@ fn input_worker_failure_from_status(status: tonic::Status) -> RealWorkerFailure 
         Code::FailedPrecondition => RealWorkerFailure::FailedPrecondition,
         _ => RealWorkerFailure::BackendUnavailable,
     }
+}
+
+// Status codes and messages originate from our own hypervisor worker and are
+// generic protocol strings, so they are safe to log; never log request
+// payloads, leases, or snapshot refs here.
+fn log_worker_rpc_failure(rpc: &'static str, status: &tonic::Status) {
+    tracing::warn!(
+        rpc,
+        code = %status.code(),
+        message = %status.message(),
+        "hypervisor rpc failed"
+    );
 }
 
 fn framebuffer_pixel_format_name(format: i32) -> BackendResult<&'static str> {
