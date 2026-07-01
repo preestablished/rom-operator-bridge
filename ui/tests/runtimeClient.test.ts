@@ -625,6 +625,35 @@ describe("runtime WebSocket clients", () => {
   });
 });
 
+describe("runtime API client default fetcher", () => {
+  it("does not rebind `this` when invoking the global fetch", async () => {
+    // Browsers throw "Illegal invocation" when window.fetch is called with a
+    // foreign `this` (e.g. stored as an instance property and called as a
+    // method). Node's fetch is not `this`-sensitive, so emulate the browser
+    // behavior to keep the default-fetcher path honest.
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = function (this: unknown, ...args: Parameters<typeof fetch>) {
+      if (this !== undefined && this !== globalThis) {
+        throw new TypeError("Failed to execute 'fetch' on 'Window': Illegal invocation");
+      }
+      void args;
+      return Promise.resolve(
+        new Response(JSON.stringify(healthResponse()), {
+          status: 200,
+          headers: { "content-type": "application/json" }
+        })
+      );
+    };
+    try {
+      const client = new RuntimeApiClient(config);
+      const health = await client.health();
+      expect(health.ok).toBe(true);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
 type FetchCall = { url: string; init: RequestInit };
 
 function queuedFetch(payloads: unknown[], status = 200): ((input: RequestInfo | URL, init?: RequestInit) => Promise<Response>) & {

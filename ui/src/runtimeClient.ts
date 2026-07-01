@@ -348,7 +348,10 @@ export class RuntimeApiClient {
     private readonly config: RuntimeConfig,
     options: { fetcher?: Fetcher } = {}
   ) {
-    this.fetcher = options.fetcher ?? fetch;
+    // Wrap the global fetch instead of storing it directly: calling a bare
+    // `fetch` reference as an instance method rebinds `this` to the client,
+    // which browsers reject with "Illegal invocation".
+    this.fetcher = options.fetcher ?? ((input, init) => fetch(input, init));
   }
 
   health(): Promise<HealthResponse> {
