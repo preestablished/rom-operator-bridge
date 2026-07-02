@@ -265,6 +265,8 @@ pub struct RealCapturePublicProjection {
 pub enum BackendError {
     #[error("backend unavailable")]
     BackendUnavailable,
+    #[error("frame not available from backend")]
+    FrameUnavailable,
     #[error("capture already in progress")]
     CaptureInProgress,
     #[error("input target frame is stale")]
@@ -1506,7 +1508,16 @@ impl BridgeBackend for RealBackend {
             return Err(BackendError::BackendUnavailable);
         }
 
-        let outcome = self.worker.framebuffer(session.lease.clone())?;
+        // The worker reports FailedPrecondition when the guest has no
+        // conformant framebuffer to read (e.g. pre-workload snapshots);
+        // surface that as frame-unavailable rather than a backend outage.
+        let outcome = self
+            .worker
+            .framebuffer(session.lease.clone())
+            .map_err(|failure| match failure {
+                RealWorkerFailure::FailedPrecondition => BackendError::FrameUnavailable,
+                other => BackendError::from(other),
+            })?;
         let mut inner = self.inner.lock().expect("real backend mutex poisoned");
         let active = inner
             .active
@@ -2270,7 +2281,7 @@ impl RealWorkerState {
             .await
             .map_err(|status| {
                 log_worker_rpc_failure("GetFramebuffer", &status);
-                RealWorkerFailure::BackendUnavailable
+                worker_failure_from_status(status)
             })?
             .into_inner();
         let format = match dh::PixelFormat::try_from(response.format).map_err(|_| {

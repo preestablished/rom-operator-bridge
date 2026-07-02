@@ -86,6 +86,7 @@ describe("runtime contract constants", () => {
       "session_active_elsewhere",
       "backend_unavailable",
       "frame_stale",
+      "frame_unavailable",
       "capture_in_progress",
       "capture_failed",
       "label_conflict",

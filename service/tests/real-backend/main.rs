@@ -1394,7 +1394,9 @@ async fn real_framebuffer_failure_is_sanitized_and_keeps_session_active() {
         runtime_request_with_cookie(Method::GET, "/api/frame/current", &cookie, Body::empty()),
     )
     .await;
-    assert_eq!(preview.status(), StatusCode::SERVICE_UNAVAILABLE);
+    // Worker FailedPrecondition on the framebuffer path means "no frame to
+    // show", not a backend outage: surfaced as 404 frame_unavailable.
+    assert_eq!(preview.status(), StatusCode::NOT_FOUND);
     assert_ne!(
         preview
             .headers()
@@ -1403,7 +1405,8 @@ async fn real_framebuffer_failure_is_sanitized_and_keeps_session_active() {
         Some("image/png")
     );
     let body = body_json(preview).await;
-    assert_eq!(body["error"]["code"], "backend_unavailable");
+    assert_eq!(body["error"]["code"], "frame_unavailable");
+    assert_eq!(body["error"]["retryable"], true);
     assert_eq!(body["error"]["details"], serde_json::json!({}));
     assert_public_json_sanitized_with_worker_text(
         &body,

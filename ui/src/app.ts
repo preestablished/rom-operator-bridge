@@ -55,7 +55,7 @@ type OperatorViewModel = {
   lastAppliedInputFrame: number;
   lastPreviewFrame: number;
   activeCaptureJobId: string | null;
-  previewState: "waiting" | "fresh" | "stale";
+  previewState: "waiting" | "fresh" | "stale" | "unavailable";
   validationState: "idle" | "queued" | "passed" | "failed";
   validationStatus: ValidationStatusView;
   captureReview: CaptureReviewState;
@@ -80,6 +80,7 @@ type OperatorRuntimeViewState = {
   validationStatus: ValidationStatusView;
   captureReview: CaptureReviewState;
   preview: FrameCurrentResponse | null;
+  previewUnavailable: boolean;
   focusState: FocusState;
   recoveryEvents: RecoveryEvent[];
   captureJob: CaptureJobView | null;
@@ -215,6 +216,7 @@ const EMPTY_RUNTIME_VIEW: OperatorRuntimeViewState = {
   validationStatus: INITIAL_VALIDATION_STATUS,
   captureReview: EMPTY_CAPTURE_REVIEW,
   preview: null,
+  previewUnavailable: false,
   focusState: INITIAL_VIEW_MODEL.focusState,
   recoveryEvents: [],
   captureJob: null,
@@ -249,7 +251,9 @@ export function renderOperatorApp(
     lastPreviewFrame: view.preview?.frame ?? auth.session.last_preview_frame,
     activeCaptureJobId: auth.session.active_capture_job_id,
     previewState: auth.session.active
-      ? auth.session.preview_stale || view.preview?.stale
+      ? view.previewUnavailable
+        ? "unavailable"
+        : auth.session.preview_stale || view.preview?.stale
           ? "stale"
           : view.preview
             ? "fresh"
@@ -406,6 +410,7 @@ export function mountOperatorApp(
   let validationStatus = INITIAL_VALIDATION_STATUS;
   let captureReview = EMPTY_CAPTURE_REVIEW;
   let preview: FrameCurrentResponse | null = null;
+  let previewUnavailable = false;
   let focusState: FocusState = currentFocusState();
   let recoveryEvents: RecoveryEvent[] = [];
   let captureJob: CaptureJobView | null = null;
@@ -444,6 +449,7 @@ export function mountOperatorApp(
       validationStatus,
       captureReview,
       preview,
+      previewUnavailable,
       focusState,
       recoveryEvents,
       captureJob,
@@ -513,6 +519,7 @@ export function mountOperatorApp(
     }
     if (sessionWillReset) {
       preview = null;
+      previewUnavailable = false;
       previewRequestSeq += 1;
       validationRequestSeq += 1;
       captureReviewRequestSeq += 1;
@@ -728,6 +735,7 @@ export function mountOperatorApp(
       captureReview = EMPTY_CAPTURE_REVIEW;
       captureReviewRequestSeq += 1;
       preview = null;
+      previewUnavailable = false;
       previewRequestSeq += 1;
       sessionAction = "idle";
       captureJob = null;
@@ -990,6 +998,7 @@ export function mountOperatorApp(
           return;
         }
         preview = nextPreview;
+        previewUnavailable = false;
         auth = {
           ...auth,
           error: auth.error?.code === "backend_unavailable" ? null : auth.error,
@@ -1003,11 +1012,20 @@ export function mountOperatorApp(
         render();
       })
       .catch((error) => {
-        if (requestSeq === previewRequestSeq) {
-          preview = null;
-          auth = { ...auth, error: runtimeDisplayError(error, "backend_unavailable") };
-          render();
+        if (requestSeq !== previewRequestSeq) {
+          return;
         }
+        preview = null;
+        if (error instanceof RuntimeApiError && error.display.code === "frame_unavailable") {
+          // The backend has no frame to show yet (e.g. the guest has not
+          // produced one); the session itself is healthy, so keep the
+          // preview panel calm instead of raising a recovery alert.
+          previewUnavailable = true;
+          render();
+          return;
+        }
+        auth = { ...auth, error: runtimeDisplayError(error, "backend_unavailable") };
+        render();
       });
   }
 
@@ -1068,6 +1086,7 @@ export function mountOperatorApp(
     captureReviewRequestSeq += 1;
     recoveryEvents = [];
     preview = null;
+    previewUnavailable = false;
     previewRequestSeq += 1;
     render();
     refreshServiceBackendMode()
@@ -1099,6 +1118,7 @@ export function mountOperatorApp(
     auth = { ...auth, status: "stopping", error: null };
     sessionAction = "idle";
     preview = null;
+    previewUnavailable = false;
     previewRequestSeq += 1;
     syncEventStream();
     render();
@@ -1641,6 +1661,7 @@ export function mountOperatorApp(
         return;
       }
       preview = null;
+      previewUnavailable = false;
       previewRequestSeq += 1;
       render();
       const refreshSeq = ++authRequestSeq;
@@ -1793,6 +1814,8 @@ function recoveryTitle(code: RecoveryCode): string {
       return "Backend unavailable";
     case "frame_stale":
       return "Framebuffer stale";
+    case "frame_unavailable":
+      return "Frame not available yet";
     case "capture_in_progress":
       return "Capture in progress";
     case "capture_failed":
@@ -1826,6 +1849,8 @@ function recoveryDefaultMessage(code: RecoveryCode): string {
       return "Controls are disabled while the backend is unavailable; retry status when it recovers.";
     case "frame_stale":
       return "Preview and input are paused until a fresh frame is available.";
+    case "frame_unavailable":
+      return "The guest has not produced a frame yet; the preview will connect when one exists.";
     case "capture_in_progress":
       return "The active capture is still running; duplicate capture requests are disabled.";
     case "capture_failed":
@@ -1858,6 +1883,7 @@ function recoverySeverity(code: RecoveryCode): RecoveryNotice["severity"] {
     case "validation_failed":
       return "critical";
     case "capture_in_progress":
+    case "frame_unavailable":
     case "gamepad_disconnected":
     case "websocket_reconnect":
     case "bad_request":
@@ -2947,7 +2973,10 @@ function stateLabel(state: SessionState): string {
 }
 
 function previewLabel(state: OperatorViewModel["previewState"]): string {
-  return state === "waiting" ? "not connected" : state;
+  if (state === "waiting") {
+    return "not connected";
+  }
+  return state === "unavailable" ? "no frame yet" : state;
 }
 
 function validationLabel(state: OperatorViewModel["validationState"]): string {

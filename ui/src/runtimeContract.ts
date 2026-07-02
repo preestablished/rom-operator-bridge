@@ -88,6 +88,7 @@ export const ERROR_CODES = enumValues(errorCode, "errorCode") as readonly [
   "session_active_elsewhere",
   "backend_unavailable",
   "frame_stale",
+  "frame_unavailable",
   "capture_in_progress",
   "capture_failed",
   "label_conflict",

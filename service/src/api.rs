@@ -2951,6 +2951,7 @@ pub enum ErrorCode {
     SessionActiveElsewhere,
     BackendUnavailable,
     FrameStale,
+    FrameUnavailable,
     CaptureInProgress,
     CaptureFailed,
     LabelConflict,
@@ -3042,6 +3043,12 @@ fn backend_error(error: crate::backend::BackendError) -> AppError {
             ErrorCode::CaptureInProgress,
             "Capture already in progress.",
             false,
+        ),
+        crate::backend::BackendError::FrameUnavailable => AppError::new(
+            StatusCode::NOT_FOUND,
+            ErrorCode::FrameUnavailable,
+            "Frame not available yet.",
+            true,
         ),
         _ => AppError::new(
             StatusCode::SERVICE_UNAVAILABLE,

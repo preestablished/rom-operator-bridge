@@ -80,6 +80,32 @@ describe("session and play surface", () => {
     expect(client.triggerCapture).not.toHaveBeenCalled();
   });
 
+  it("shows a calm no-frame-yet preview when the backend has no frame", async () => {
+    const client = mockClient({
+      sessionStatus: vi.fn().mockResolvedValue(activeSessionResponse()),
+      runStatus: vi.fn().mockResolvedValue(runStatusResponse({ preview_stale: false })),
+      currentFrame: vi.fn().mockRejectedValue(
+        new RuntimeApiError(
+          {
+            code: "frame_unavailable",
+            message: "Frame not available yet.",
+            retryable: true,
+            details: {}
+          },
+          404
+        )
+      )
+    });
+    const root = document.createElement("div");
+
+    mountOperatorApp(root, config, client, null);
+    await flushPromises();
+
+    expect(root.textContent).toContain("no frame yet");
+    expect(root.textContent).not.toContain("Backend unavailable");
+    expect(root.textContent).toContain("running");
+  });
+
   it("uses live stale runtime events to disable controls before preview refresh resolves", async () => {
     const socketClient = mockSocketClient();
     const pendingPreview = deferred(frameCurrentResponse(22, false));

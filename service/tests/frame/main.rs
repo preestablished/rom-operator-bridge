@@ -12,10 +12,10 @@ use rom_operator_bridge_service::{
     api::{AppState, router},
     auth::ALLOWED_ORIGIN,
     backend::{
-        BackendCapabilities, BackendMode, BackendResult, BackendSession, BridgeBackend, CaptureJob,
-        CaptureJobStatus, CaptureRequest, FramePreview, InputScheduleReceipt, InputScheduleRequest,
-        RunBoundary, RunStatus, SessionId, SessionState, StartBackendSession, StopReason,
-        StoppedSession,
+        BackendCapabilities, BackendError, BackendMode, BackendResult, BackendSession,
+        BridgeBackend, CaptureJob, CaptureJobStatus, CaptureRequest, FramePreview,
+        InputScheduleReceipt, InputScheduleRequest, RunBoundary, RunStatus, SessionId,
+        SessionState, StartBackendSession, StopReason, StoppedSession,
     },
     config::ServiceConfig,
     framebuffer::{SYNTHETIC_FRAME_HEIGHT, SYNTHETIC_FRAME_WIDTH, synthetic_frame_png},
@@ -150,6 +150,27 @@ async fn frame_image_serves_the_preview_advertised_by_metadata() {
     assert_eq!(metadata["preview_hash"], sha256_ref(&bytes));
     assert_eq!(bytes.as_ref(), synthetic_frame_png(9).as_slice());
     assert_ne!(bytes.as_ref(), synthetic_frame_png(10).as_slice());
+}
+
+#[tokio::test]
+async fn frame_metadata_reports_frame_unavailable_without_backend_outage_semantics() {
+    let (_workspace, app, _private_root) =
+        frame_app(FrameBackend::new(10, 9).with_frame_unavailable());
+    let cookie = login_cookie(app.clone()).await;
+
+    let response = app
+        .oneshot(runtime_get("/api/frame/current", &cookie))
+        .await
+        .expect("frame metadata request runs");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body = to_bytes(response.into_body(), 8192)
+        .await
+        .expect("error body reads");
+    let envelope: Value = serde_json::from_slice(&body).expect("error json parses");
+
+    assert_matches_runtime_schema(&envelope);
+    assert_eq!(envelope["error"]["code"], "frame_unavailable");
+    assert_eq!(envelope["error"]["retryable"], true);
 }
 
 #[tokio::test]
@@ -387,6 +408,7 @@ struct FrameBackend {
     status_session_id: String,
     preview_session_id: String,
     state: Mutex<SessionState>,
+    frame_unavailable: bool,
 }
 
 impl FrameBackend {
@@ -397,7 +419,13 @@ impl FrameBackend {
             status_session_id: SESSION_ID.to_string(),
             preview_session_id: SESSION_ID.to_string(),
             state: Mutex::new(SessionState::Running),
+            frame_unavailable: false,
         }
+    }
+
+    fn with_frame_unavailable(mut self) -> Self {
+        self.frame_unavailable = true;
+        self
     }
 
     fn with_status_session_id(mut self, session_id: impl Into<String>) -> Self {
@@ -508,6 +536,9 @@ impl BridgeBackend for FrameBackend {
     }
 
     fn framebuffer(&self, _session_id: SessionId) -> BackendResult<FramePreview> {
+        if self.frame_unavailable {
+            return Err(BackendError::FrameUnavailable);
+        }
         let frame = self.preview_frame();
         Ok(FramePreview {
             session_id: self.preview_session_id.clone(),
