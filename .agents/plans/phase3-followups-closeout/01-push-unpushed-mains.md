@@ -43,23 +43,29 @@ git status --short --branch   # MUST show up to date with origin
 
 Notes:
 
-- determinism-hypervisor's dirty working tree (`m9_handoff.rs`,
-  `service.rs`, `Cargo.lock`) does not block a push and must not be
-  touched. `git pull --rebase` with dirty *unrelated* files is fine here
-  because the unpushed commit touches only `.agents/`; if rebase
-  complains about local changes anyway, stop and report rather than
-  stashing someone's in-flight work.
-- If `git pull --rebase` brings in new remote commits, that is fine —
-  push the rebased result; the authorization concern is only about
-  *local* commits beyond the listed ones.
+- determinism-hypervisor's dirty working tree does not block a push and
+  must not be touched. `git pull --rebase` refuses up front on unstaged
+  changes to files the incoming commits touch — if it refuses, stop and
+  report rather than stashing someone's in-flight work.
+- If `git pull --rebase` brings in new remote commits and rebases
+  cleanly, push the rebased result. If the rebase stops with
+  **conflicts**, run `git rebase --abort` (restores pre-pull state,
+  touches nothing else) and report — conflict resolution is not covered
+  by this authorization.
+- **Match the authorized commit by subject line and diff content**
+  (docs-only, `.agents/` paths), not by SHA — a rebase rewrites hashes.
+  The exit criterion is likewise "a commit with that subject reachable
+  from `origin/main`", not the literal SHA.
 
 ## Exit Criteria
 
 - All three repos: `git status --short --branch` reports
   `## main...origin/main` with no ahead/behind.
-- From a scratch directory, `git clone --depth 1` of guest-sdk (or
-  `git fetch && git rev-parse origin/main` in the existing checkout)
-  shows `c03e90b` reachable, and
-  `cd ~/git/preestablished/reference-workload && cargo run --locked -p
-  xtask -- image validate dist/workload-image-0.1.0/workload-image.yaml`
-  still passes (the rev check now satisfiable from origin).
+- `git fetch && git merge-base --is-ancestor <local main> origin/main`
+  (or `git rev-parse origin/main`) in guest-sdk confirms the
+  verification-note commit reached origin — no scratch clone needed.
+- Caveat on proving "satisfiable from origin": `xtask image build`'s rev
+  check reads the **local** sibling checkout, so running it here proves
+  nothing new after the push. The push itself plus the fetch check above
+  is the exit evidence; a fresh-clone build proof is optional and only
+  meaningful from a scratch clone of both repos.

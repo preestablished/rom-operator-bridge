@@ -28,6 +28,8 @@ PARTIAL; Open Items #4) are resolved: `e08e522` locked
 `vm-gates.yaml` to `runs-on: [self-hosted, intel, kvm]`,
 operator-confirmed 2026-07-02. Remaining vm-gates work is unchanged:
 the real-worker legs still wait on the coordinated boot/READY step.
+Open Items #1 and #3 remain open as written; #2 is superseded by the
+later dated sections above.
 ```
 
 Also strike-or-annotate nothing else — the other Open Items (real-image

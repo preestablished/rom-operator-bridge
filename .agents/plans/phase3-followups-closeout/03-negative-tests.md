@@ -18,12 +18,14 @@ precedent, and guest-sdk's corrupted-region `ReverifyRegions` test).
   make `Ready` unreachable — is untested.
 - Why it's untested: `detguest_sdk::register_region` isn't mockable from
   the harness crate.
-- Approach: introduce a narrow test seam — e.g. a `RegionRegistrar`
-  trait (or `fn` injection) owned by the harness with the production
-  impl delegating to `detguest_sdk`, and a test impl returning a
-  non-`AgentUnavailable` error. Assert: fault emitted, `Ready` never
-  sent, process path aborts. Keep the seam private to the crate; do not
-  change the production call shape.
+- Approach (decisions pre-made): use a **crate-private trait**
+  (`RegionRegistrar`) with the production impl inlined where
+  `register_region` is called today, and a test impl returning a
+  non-`AgentUnavailable` error. Assertion target is the **error
+  propagation**, not a literal process abort: `RegionRegFailed` fault
+  emitted, `SetupError::AgentRegistration` returned from the runner
+  path, and `Ready` never emitted. Keep the seam private to the crate;
+  do not change the production call shape.
 
 ## Gap B — Lock-File Mismatch Refusal (Both Locks)
 
@@ -32,8 +34,9 @@ precedent, and guest-sdk's corrupted-region `ReverifyRegions` test).
   (`xtask/tests/image_inputs.rs:96-114`); neither refusal branch is
   exercised.
 - Approach: refactor the two checks to take their inputs (artifact path /
-  expected hash; checkout path / expected rev) as parameters, then unit
-  test: (1) wrong-content bzImage in a tempdir → error message contains
+  expected hash; checkout path / expected rev) as parameters. Put the
+  tests in `xtask/tests/image_inputs.rs` alongside the existing shape
+  tests. Unit test: (1) wrong-content bzImage in a tempdir → error message contains
   the "rebuild in guest-sdk or deliberately bump the lock" guidance and
   the mismatching hashes; (2) a scratch git repo at a different rev →
   rev-mismatch refusal naming both revs. Do not shell out to the real
@@ -44,8 +47,10 @@ precedent, and guest-sdk's corrupted-region `ReverifyRegions` test).
 - Where: `crates/refwork-verify/src/vm_suite.rs` restore-continuity leg
   (~276–284, 341–387) and its tests (`tests/vm_suite.rs`). The existing
   `--nondet-test` negative covers the double-run leg only.
-- Approach: extend the mock worker to support a post-restore divergence
-  mode (e.g. flip one region byte in the restored slot's hash stream at
+- Approach: the mock worker lives in the test files themselves
+  (`crates/refwork-verify/tests/vm_suite.rs`, shared shape with
+  `tests/vm_first_room.rs`). Extend it to support a post-restore
+  divergence mode (e.g. flip one region byte in the restored slot's hash stream at
   frame K), and add a test asserting the restore-continuity comparison
   fails naming the first divergent frame. Mirror the double-run negative
   test's structure (`tests/vm_suite.rs:94-113`).

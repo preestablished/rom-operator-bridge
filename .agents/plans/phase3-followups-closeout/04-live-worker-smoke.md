@@ -15,28 +15,44 @@ testable today and is what this step covers.
 
 ## Approach
 
-Add an env-gated integration test (`REFWORK_VM_TESTS=1`, matching the
-`vm-gates.yaml` convention; plain `cargo test` skips it) that:
+Add an env-gated integration test (`REFWORK_VM_TESTS=1` — note
+`vm-gates.yaml` only *mentions* this gate in a comment today; you are
+introducing its first real use, so also wire the workflow's real-worker
+leg to set it; plain `cargo test` skips the test) that:
 
-1. Builds/locates `dh-workerd` from a **clean hypervisor worktree** —
-   follow the deployed pattern: the operator keeps one at
-   `~/git/preestablished/.dh-clean-ff1e88c` (do not modify it; it backs
-   the deployed binary). Either use its existing `target/debug/dh-workerd`
-   or build in a fresh `git worktree` of your own. Never assume the main
-   hypervisor checkout is clean — it carries in-flight edits.
-2. Launches it with scratch paths:
-   `dh-workerd serve --uds <tmpdir>/grpc.sock --image-cache <tmpdir>/cache
-   --snapstore-uds <tmpdir>/snapstore.sock` (a snapstore may need to be
-   stubbed or launched likewise — check `--help`; if a live snapstore is
-   required for startup, launch `snapstore-server` from its sibling repo
-   the same scratch way). **Never** touch `/run/dh/grpc.sock`.
+1. Locates `dh-workerd` via an env var (`REFWORK_DH_WORKERD_BIN`),
+   skipping with a clear message if unset. Locally, point it at the
+   pre-built binary in the operator's clean worktree
+   (`~/git/preestablished/.dh-clean-ff1e88c/target/debug/dh-workerd`) —
+   **do not run `cargo build` inside that worktree**; writing to its
+   `target/` counts as modifying the artifact backing the deployed
+   binary. If a rebuild is ever needed, make your own `git worktree`.
+   Never assume the main hypervisor checkout is clean — it carries
+   in-flight edits.
+2. Launches it with scratch paths and **`--no-snapstore`** (the flag
+   exists — resolved, no snapstore process needed for this smoke):
+   `dh-workerd serve --uds <tmpdir>/grpc.sock
+   --image-cache <tmpdir>/cache --no-snapstore --skip-preflight` (keep
+   or drop `--skip-preflight` based on runner; note the binary's
+   *defaults* are the deployed paths — every path flag must be passed
+   explicitly). **Never** touch `/run/dh/grpc.sock`.
 3. Through `refwork-dh-client` over the scratch UDS, asserts:
-   - `GetWorkerInfo`/`ListSlots` round-trip (transport + codec proof);
-   - `RestoreSnapshot` with a bogus ref → the distinct, sanitized
-     failure `vm-first-room` maps for it (error-mapping proof);
+   - `worker_info()` round-trip (transport + codec proof; the client
+     exposes no `list_slots` — do not add one for this test);
+   - `restore_snapshot` with a bogus ref → a distinct, sanitized
+     failure mapping (under `--no-snapstore` this may surface as a
+     snapstore-unavailable class rather than bad-ref — assert whichever
+     the worker actually returns, by its stage/code, and record it);
    - connection-refused (worker stopped) → the client's
      unavailable-path error, not a hang (timeout proof).
 4. Tears the worker down and leaves no state outside the tempdir.
+
+CI provisioning for the binary (decide and record which): either the
+`vm-gates.yaml` real-worker leg checks out determinism-hypervisor at a
+pinned rev and `cargo build -p dh-worker` in a job step, setting
+`REFWORK_DH_WORKERD_BIN` to the result, or the CI leg is deferred to a
+follow-up bead if the build is too heavy for the lane — do not leave the
+workflow referencing a host-local path like `.dh-clean-ff1e88c`.
 
 Wire the test into `vm-gates.yaml`'s existing self-hosted lane
 (`[self-hosted, intel, kvm]`) alongside the other gated legs.
