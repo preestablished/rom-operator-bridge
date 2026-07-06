@@ -666,16 +666,20 @@ export function mountOperatorApp(
     if (frameCounter <= lastDisplayedFrame) {
       return;
     }
+    // Mark received-newest up front (so a concurrent older decode is dropped
+    // post-await) and remember which run this frame belongs to.
     lastDisplayedFrame = frameCounter;
+    const decodeRunId = liveFrameRunId;
     let bitmap: ImageBitmap;
     try {
       bitmap = await createImageBitmap(new Blob([buffer.slice(8)], { type: "image/png" }));
     } catch {
       return;
     }
-    // A newer frame may have arrived (and been marked displayed) while this one
-    // decoded; if so, discard this stale decode rather than painting backwards.
-    if (frameCounter < lastDisplayedFrame) {
+    // Discard if a newer frame won the race (don't paint backwards) OR the run
+    // changed while decoding — a Stop->Start could otherwise paint a previous
+    // run's frame onto the new run's canvas.
+    if (frameCounter < lastDisplayedFrame || decodeRunId !== liveFrameRunId) {
       bitmap.close();
       return;
     }
@@ -857,7 +861,12 @@ export function mountOperatorApp(
     render();
     if (message.type === "session_updated" || message.type === "run_updated") {
       syncInputStream();
-      refreshPreview();
+      // During continuous Play the newest frame already arrives over /ws/frames;
+      // skip the per-frame HTTP pull (which fires once per Play frame and would
+      // defeat the live stream). Pull only when paused/single-step/idle.
+      if (!(auth.status === "active" && auth.session.state === "playing")) {
+        refreshPreview();
+      }
     }
   }
 
@@ -2988,6 +2997,10 @@ function capturePanelTitle(model: OperatorViewModel): string {
 
 function captureButtonDisabled(model: OperatorViewModel): boolean {
   return (
+    // Capture needs a settled (Paused) frame and seals the input log; during
+    // continuous Play it would race the loop for the worker slot. Block it —
+    // the operator pauses to capture.
+    model.sessionState === "playing" ||
     model.controlsDisabled ||
     model.capturePending ||
     model.activeCaptureJobId !== null ||

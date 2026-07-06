@@ -13,8 +13,7 @@ use rom_operator_bridge_service::{
         BackendCapabilities, BackendMode, BackendResult, BackendSession, BridgeBackend, CaptureJob,
         CaptureJobStatus, CaptureRequest, FramePreview, InputScheduleReceipt, InputScheduleRequest,
         PlayStepOutcome, RunBoundary, RunStatus, SessionId, SessionState, StartBackendSession,
-        StopReason,
-        StoppedSession,
+        StopReason, StoppedSession,
     },
     config::ServiceConfig,
     private_config::{ENV_PRIVATE_ROOT, ENV_SESSION_SECRET},
@@ -201,6 +200,32 @@ async fn event_connection_rejects_backend_session_mismatch() {
 }
 
 #[tokio::test]
+async fn frames_websocket_rejects_unauthenticated_handshake() {
+    // The live binary framebuffer stream (/ws/frames) is the headline new
+    // surface; it must be authenticated exactly like /ws/events. An
+    // unauthenticated handshake must be rejected and never upgraded to a socket.
+    let (_workspace, app, _private_root) =
+        ws_app(EventBackend::new(SESSION_ID, SessionState::Running, None));
+    let cookie = login_cookie(app.clone()).await;
+    let server = WsServer::start(app).await;
+
+    assert!(
+        server
+            .try_connect_to("/ws/frames", None, Some(ALLOWED_ORIGIN))
+            .await
+            .is_err(),
+        "frames handshake without a session cookie must be rejected"
+    );
+    assert!(
+        server
+            .try_connect_to("/ws/frames", Some(&cookie), Some(ALLOWED_ORIGIN))
+            .await
+            .is_ok(),
+        "frames handshake with a valid session cookie must be accepted"
+    );
+}
+
+#[tokio::test]
 async fn event_snapshot_omits_capture_event_when_no_capture_is_active() {
     let (_workspace, app, private_root) =
         ws_app(EventBackend::new(SESSION_ID, SessionState::Paused, None));
@@ -323,7 +348,16 @@ impl WsServer {
         cookie: Option<&str>,
         origin: Option<&'static str>,
     ) -> Result<TestSocket, tokio_tungstenite::tungstenite::Error> {
-        let mut request = format!("ws://{}/ws/events", self.addr)
+        self.try_connect_to("/ws/events", cookie, origin).await
+    }
+
+    async fn try_connect_to(
+        &self,
+        path: &str,
+        cookie: Option<&str>,
+        origin: Option<&'static str>,
+    ) -> Result<TestSocket, tokio_tungstenite::tungstenite::Error> {
+        let mut request = format!("ws://{}{path}", self.addr)
             .into_client_request()
             .expect("websocket request builds");
         if let Some(origin) = origin {

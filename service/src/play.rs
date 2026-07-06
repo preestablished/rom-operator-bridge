@@ -12,8 +12,8 @@
 //! fault halt the loop: the loop stops issuing Runs before the slot is torn down.
 
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
 };
 use std::thread::JoinHandle;
 
@@ -98,6 +98,21 @@ impl PlayController {
         let _ = self.frames.send(None);
     }
 
+    /// Drop the handle for `session_id` **without** joining. Call this from
+    /// inside the loop thread when it exits on its own (fault / TTL expiry):
+    /// joining would deadlock (self-join), and the thread is already ending, so
+    /// detaching its `JoinHandle` is safe. A later `stop`/`stop_any` then finds
+    /// no handle and simply blanks the frames slot.
+    pub fn deregister(&self, session_id: &str) {
+        let mut guard = self.inner.lock().expect("play mutex poisoned");
+        if guard
+            .as_ref()
+            .is_some_and(|handle| handle.session_id == session_id)
+        {
+            *guard = None;
+        }
+    }
+
     fn finish(handle: Option<PlayHandle>) {
         if let Some(mut handle) = handle {
             handle.stop.store(true, Ordering::SeqCst);
@@ -121,5 +136,77 @@ impl PlayController {
 impl Default for PlayController {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A loop stand-in that exits promptly once its stop flag is set.
+    fn stoppable_thread(stop: Arc<AtomicBool>) -> JoinHandle<()> {
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+        })
+    }
+
+    #[test]
+    fn frame_message_prefixes_little_endian_counter() {
+        let msg = frame_message(0x0102, b"PNG");
+        assert_eq!(&msg[..8], &0x0102u64.to_le_bytes());
+        assert_eq!(&msg[8..], b"PNG");
+    }
+
+    #[test]
+    fn stop_halts_the_session_loop_and_blanks_the_last_frame() {
+        let controller = PlayController::new();
+        let mut rx = controller.subscribe();
+        // Publish a frame as the loop would, then confirm a subscriber sees it.
+        controller
+            .frames_sender()
+            .send(Some(frame_message(5, b"x")))
+            .unwrap();
+        assert!(rx.borrow_and_update().is_some());
+
+        let stop = Arc::new(AtomicBool::new(false));
+        controller.register("s1".into(), stop.clone(), stoppable_thread(stop.clone()));
+        assert!(controller.is_playing("s1"));
+        assert!(!controller.is_playing("other"));
+
+        controller.stop("s1");
+        assert!(!controller.is_playing("s1"));
+        assert!(stop.load(Ordering::SeqCst), "stop flag must be set");
+        // Teardown blanks the slot so a late /ws/frames subscriber gets no stale image.
+        assert!(rx.borrow_and_update().is_none());
+    }
+
+    #[test]
+    fn stop_is_a_noop_for_a_different_session() {
+        let controller = PlayController::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        controller.register("s1".into(), stop.clone(), stoppable_thread(stop.clone()));
+
+        controller.stop("s2");
+        assert!(controller.is_playing("s1"), "wrong session must not be stopped");
+        assert!(!stop.load(Ordering::SeqCst));
+
+        controller.stop_any();
+        assert!(!controller.is_playing("s1"));
+    }
+
+    #[test]
+    fn deregister_drops_the_handle_without_joining() {
+        let controller = PlayController::new();
+        // A thread that has already finished; deregister must not attempt a join.
+        let join = std::thread::spawn(|| {});
+        controller.register("s1".into(), Arc::new(AtomicBool::new(false)), join);
+        assert!(controller.is_playing("s1"));
+
+        controller.deregister("s1");
+        assert!(!controller.is_playing("s1"));
+        // Deregistering a non-current session is a no-op.
+        controller.deregister("s1");
     }
 }

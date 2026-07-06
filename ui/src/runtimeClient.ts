@@ -890,9 +890,11 @@ export class RuntimeWebSocketClient {
     );
   }
 
-  /// Live binary frame stream for continuous play (`/ws/frames`). Delivers raw
-  /// `[u64 frame_counter LE][PNG bytes]` messages to `handlers.onBinary`; reuses
-  /// the shared reconnect infra.
+  /**
+   * Live binary frame stream for continuous play (`/ws/frames`). Delivers raw
+   * `[u64 frame_counter LE][PNG bytes]` messages to `handlers.onBinary`; reuses
+   * the shared reconnect infra.
+   */
   framesSocket(handlers: ConstructorParameters<typeof RuntimeSocket>[2] = {}): RuntimeSocket {
     return new RuntimeSocket(
       this.url("/frames"),

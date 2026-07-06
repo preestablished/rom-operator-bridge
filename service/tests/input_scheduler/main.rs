@@ -3,8 +3,7 @@ use rom_operator_bridge_service::{
         BackendCapabilities, BackendError, BackendMode, BackendResult, BackendSession,
         BridgeBackend, CaptureJob, CaptureRequest, FrameCounter, FramePreview,
         InputScheduleReceipt, InputScheduleRequest, PlayStepOutcome, RunBoundary, RunStatus,
-        SessionId,
-        SessionState, StartBackendSession, StopReason, StoppedSession,
+        SessionId, SessionState, StartBackendSession, StopReason, StoppedSession,
     },
     input::{
         AppliedInputFrame, BrowserInputState, FRAME_STALE_REASON_CODE, InputRejectionRecord,

@@ -974,10 +974,7 @@ pub fn router(state: AppState) -> Router {
             "/api/run/resume",
             post(resume_run).fallback(method_not_allowed),
         )
-        .route(
-            "/api/run/play",
-            post(play_run).fallback(method_not_allowed),
-        )
+        .route("/api/run/play", post(play_run).fallback(method_not_allowed))
         .route(
             "/api/frame/current",
             get(frame_current).fallback(method_not_allowed),
@@ -2017,8 +2014,10 @@ fn run_state_transition(
     }
 
     // Pause (and Resume, which single-steps) must first halt any continuous-play
-    // loop so it stops issuing Runs before we change the run state. `stop` blocks
-    // until the loop exits (~one frame).
+    // loop so it stops issuing Runs before we change the run state. `stop` joins
+    // the loop, briefly parking this async worker for its in-flight iteration
+    // (~1-2 frames) — bounded, and consistent with the backend RPCs that already
+    // block synchronously inside these handlers.
     state.play.stop(&request.session_id);
 
     if transition == RunTransition::Resume
@@ -2079,6 +2078,11 @@ async fn play_run(
     };
     publish_run_boundary_event(&state, &boundary);
 
+    // Stop any prior loop BEFORE spawning the new one so two loops never run
+    // concurrently for the session. (`register` also stops, but only after the
+    // new thread has already started calling `play_step`.)
+    state.play.stop_any();
+
     // Dedicated OS thread: not the axum runtime (would block a worker for
     // minutes) and not the serialized worker thread (must service Stop/Status).
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2105,11 +2109,25 @@ async fn play_run(
 /// buffered input (scheduled for upcoming frames), advance exactly one frame, push
 /// it to `/ws/frames`, and publish `run_updated`. Exits when the stop flag is set
 /// (Pause/Stop) or on the first backend error (fault).
-fn play_loop(state: AppState, session_id: String, stop: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+fn play_loop(
+    state: AppState,
+    session_id: String,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
     use std::sync::atomic::Ordering;
     let frames = state.play.frames_sender();
     loop {
         if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        // Self-terminate when the operator's session TTL lapses mid-Play. A
+        // passive `/ws/frames` viewer sends no authenticated request, so nothing
+        // else detects expiry: without this the loop would pin a core forever and
+        // keep streaming pixels to a now-unauthenticated client. Blank the last
+        // frame and drop the handle on the way out.
+        if !state.auth.active_session_live() {
+            let _ = frames.send(None);
+            state.play.deregister(&session_id);
             break;
         }
         // Inject inputs the client buffered for upcoming frames (best-effort:
@@ -2118,7 +2136,10 @@ fn play_loop(state: AppState, session_id: String, stop: std::sync::Arc<std::sync
 
         match state.backend.play_step(session_id.clone()) {
             Ok(step) => {
-                let _ = frames.send(Some(crate::play::frame_message(step.frame, &step.png_bytes)));
+                let _ = frames.send(Some(crate::play::frame_message(
+                    step.frame,
+                    &step.png_bytes,
+                )));
                 publish_run_boundary_event(
                     &state,
                     &crate::backend::RunBoundary {
@@ -2131,7 +2152,7 @@ fn play_loop(state: AppState, session_id: String, stop: std::sync::Arc<std::sync
             }
             Err(_) => {
                 // Fault or the session went away. Surface the terminal state (if
-                // still resolvable) so the UI flips out of Playing, then stop.
+                // still resolvable) so the UI flips out of Playing.
                 if let Ok(status) = state.backend.status(session_id.clone()) {
                     publish_run_boundary_event(
                         &state,
@@ -2143,6 +2164,11 @@ fn play_loop(state: AppState, session_id: String, stop: std::sync::Arc<std::sync
                         },
                     );
                 }
+                // Clear the last frame so a late `/ws/frames` subscriber is not
+                // handed a stale framebuffer, and drop the now-exited handle
+                // (self-exit: deregister rather than stop_any to avoid self-join).
+                let _ = frames.send(None);
+                state.play.deregister(&session_id);
                 break;
             }
         }

@@ -1417,7 +1417,14 @@ impl BridgeBackend for RealBackend {
             active.clone()
         };
 
-        // Advance exactly one frame.
+        // Advance exactly one frame, then read the framebuffer. This is two
+        // worker RPCs (resume + framebuffer) rather than the plan's single
+        // `Run{frame_budget=1, capture=framebuffer}`; both go through the same
+        // serialized worker slot back-to-back with no other command interleaved
+        // (the loop is the sole caller during Playing), so the pair is
+        // equivalent to one captured Run and reuses the existing, tested
+        // resume/framebuffer paths. Folding into one captured Run is a possible
+        // later optimization to halve the per-frame round-trips.
         let run_outcome = match self.worker.resume(session.lease.clone()) {
             Ok(outcome) => outcome,
             Err(error) => {

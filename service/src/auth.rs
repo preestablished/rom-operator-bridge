@@ -101,6 +101,25 @@ impl AuthState {
         Ok(())
     }
 
+    /// True iff an active session exists and has not expired. Clears an expired
+    /// session as a side effect (so a later handshake also observes it gone).
+    ///
+    /// The Play loop polls this each frame to self-terminate when the operator's
+    /// cookie TTL lapses mid-Play: a purely passive `/ws/frames` viewer issues no
+    /// authenticated request, so nothing else would detect the expiry.
+    pub fn active_session_live(&self) -> bool {
+        let mut inner = self.inner.lock().expect("auth mutex poisoned");
+        let now = self.clock.now_unix_seconds();
+        match inner.active.as_ref() {
+            Some(active) if active.expires_at_unix_seconds > now => true,
+            Some(_) => {
+                inner.active = None;
+                false
+            }
+            None => false,
+        }
+    }
+
     pub fn authenticate_token(&self, token: &str) -> Result<(), AuthError> {
         let mut inner = self.inner.lock().expect("auth mutex poisoned");
         let now = self.clock.now_unix_seconds();
