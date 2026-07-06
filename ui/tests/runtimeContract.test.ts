@@ -26,6 +26,7 @@ describe("runtime contract constants", () => {
       "starting",
       "running",
       "paused",
+      "playing",
       "capture_pending",
       "stopping",
       "stopped",

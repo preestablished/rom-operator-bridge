@@ -93,13 +93,14 @@ type OperatorRuntimeViewState = {
   padlogTail: PadlogTailEntry[];
 };
 
-export type RuntimeEventClient = Pick<RuntimeWebSocketClient, "eventSocket">;
+export type RuntimeEventClient = Pick<RuntimeWebSocketClient, "eventSocket"> &
+  Partial<Pick<RuntimeWebSocketClient, "framesSocket">>;
 export type RuntimeInputClient = Pick<RuntimeWebSocketClient, "inputSocket">;
 export type RuntimePreviewClient = Pick<RuntimeApiClient, "currentFrame">;
 type RuntimeHealthClient = Pick<RuntimeApiClient, "health">;
 export type RuntimeRunClient = Pick<
   RuntimeApiClient,
-  "runStatus" | "pauseRun" | "resumeRun" | "triggerCapture" | "captureJob"
+  "runStatus" | "pauseRun" | "resumeRun" | "playRun" | "triggerCapture" | "captureJob"
 >;
 type RuntimeValidationClient = Pick<RuntimeApiClient, "validationStatus">;
 type RuntimeCaptureReviewClient = Pick<
@@ -235,12 +236,15 @@ export function renderOperatorApp(
   runtimeView: Partial<OperatorRuntimeViewState> = EMPTY_RUNTIME_VIEW
 ): string {
   const view = { ...EMPTY_RUNTIME_VIEW, ...runtimeView };
+  const playing = auth.status === "active" && auth.session.state === "playing";
   const controlsDisabled =
     auth.status !== "active" ||
-    auth.session.state !== "running" ||
+    (auth.session.state !== "running" && auth.session.state !== "playing") ||
     view.focusState === "hidden" ||
     inputBlockingError(auth.error?.code) ||
-    Boolean(auth.session.preview_stale || view.preview?.stale);
+    // During continuous Play frames stream live, so a "stale" pulled preview
+    // must not block input; only gate on staleness while stepping (running).
+    (!playing && Boolean(auth.session.preview_stale || view.preview?.stale));
   const validationStatus = validationStatusForView(view.validationStatus, view.validationState);
   const model: OperatorViewModel = {
     ...INITIAL_VIEW_MODEL,
@@ -430,6 +434,19 @@ export function mountOperatorApp(
   let eventSessionId: string | null = null;
   let inputSocket: ReturnType<RuntimeInputClient["inputSocket"]> | null = null;
   let inputSessionId: string | null = null;
+  let framesSocket: ReturnType<NonNullable<RuntimeEventClient["framesSocket"]>> | null = null;
+  let framesSessionId: string | null = null;
+  // Live-play frame delivery. Frames stream over the frames socket as
+  // [u64 LE frame_counter][PNG]; the newest bitmap is drawn onto a <canvas> via
+  // createImageBitmap (no object/data URLs — those are blocked by the privacy
+  // boundary since they could persist framebuffer pixels). `lastDisplayedFrame`
+  // is the ordering key (deterministic pv-pad frame_counter): a frame renders
+  // only if strictly newer. frame_counter restarts at 0 each run, so it resets
+  // on run_id change. `liveBitmap` is retained so the canvas can be repainted
+  // after a re-render without waiting for the next frame.
+  let liveBitmap: ImageBitmap | null = null;
+  let lastDisplayedFrame = -1;
+  let liveFrameRunId: string | null = null;
   let gamepadPollCancel: (() => void) | null = null;
   root.innerHTML = '<div data-operator-app></div><p class="session-live" aria-live="polite"></p>';
   const appRegion = root.querySelector<HTMLElement>("[data-operator-app]");
@@ -462,6 +479,9 @@ export function mountOperatorApp(
       padlogTail
     });
     liveRegion.textContent = sessionStatusLabel(auth);
+    // The re-render replaced the preview canvas; repaint the retained live frame
+    // so continuous Play does not flicker to black between frames.
+    paintLiveFrame();
     if (focusTarget) {
       focusSessionTarget(appRegion, focusTarget);
     } else if (shouldRestoreInputFocus) {
@@ -542,6 +562,7 @@ export function mountOperatorApp(
     sessionAction = "idle";
     syncEventStream();
     syncInputStream();
+    syncFramesStream();
     render(focusTargetForAuth(auth));
     refreshRunStatus();
     refreshValidationStatus();
@@ -596,6 +617,89 @@ export function mountOperatorApp(
         render();
       }
     });
+  }
+
+  function closeFramesStream() {
+    framesSocket?.close();
+    framesSocket = null;
+    framesSessionId = null;
+    liveBitmap?.close();
+    liveBitmap = null;
+    lastDisplayedFrame = -1;
+    liveFrameRunId = null;
+  }
+
+  // Paint the retained live frame onto the current preview canvas. Called both
+  // when a new frame decodes and after a re-render (which replaces the canvas).
+  function paintLiveFrame() {
+    if (!liveBitmap) {
+      return;
+    }
+    const canvas = appRegion?.querySelector<HTMLCanvasElement>("[data-preview-canvas]");
+    if (!canvas) {
+      return;
+    }
+    if (canvas.width !== liveBitmap.width) {
+      canvas.width = liveBitmap.width;
+    }
+    if (canvas.height !== liveBitmap.height) {
+      canvas.height = liveBitmap.height;
+    }
+    const ctx = canvas.getContext("2d");
+    if (ctx) {
+      ctx.drawImage(liveBitmap, 0, 0);
+    }
+  }
+
+  async function handleLiveFrame(buffer: ArrayBuffer) {
+    if (buffer.byteLength < 8) {
+      return;
+    }
+    const view = new DataView(buffer);
+    const frameCounter = Number(view.getBigUint64(0, true));
+    const runId = auth.status === "active" ? (auth.session.run_id ?? null) : null;
+    if (runId !== liveFrameRunId) {
+      liveFrameRunId = runId;
+      lastDisplayedFrame = -1;
+    }
+    // Newest-by-frame_counter: drop any older/reordered frame.
+    if (frameCounter <= lastDisplayedFrame) {
+      return;
+    }
+    lastDisplayedFrame = frameCounter;
+    let bitmap: ImageBitmap;
+    try {
+      bitmap = await createImageBitmap(new Blob([buffer.slice(8)], { type: "image/png" }));
+    } catch {
+      return;
+    }
+    // A newer frame may have arrived (and been marked displayed) while this one
+    // decoded; if so, discard this stale decode rather than painting backwards.
+    if (frameCounter < lastDisplayedFrame) {
+      bitmap.close();
+      return;
+    }
+    liveBitmap?.close();
+    liveBitmap = bitmap;
+    paintLiveFrame();
+  }
+
+  function syncFramesStream() {
+    if (!eventClient?.framesSocket) {
+      return;
+    }
+    const nextSessionId =
+      auth.status === "active" && auth.session.session_id ? auth.session.session_id : null;
+    if (!nextSessionId) {
+      closeFramesStream();
+      return;
+    }
+    if (framesSocket && framesSessionId === nextSessionId) {
+      return;
+    }
+    closeFramesStream();
+    framesSessionId = nextSessionId;
+    framesSocket = eventClient.framesSocket({ onBinary: handleLiveFrame });
   }
 
   function syncInputStream() {
@@ -1163,6 +1267,10 @@ export function mountOperatorApp(
       return;
     }
 
+    if (action === "play") {
+      void transitionRun("resuming", client.playRun?.bind(client));
+      return;
+    }
     if (action === "pause") {
       void transitionRun("pausing", client.pauseRun?.bind(client));
       return;
@@ -1492,14 +1600,20 @@ export function mountOperatorApp(
   }
 
   function inputControlsDisabled(): boolean {
-    return (
-      auth.status !== "active" ||
-      auth.session.state !== "running" ||
-      auth.session.preview_stale ||
-      focusState === "hidden" ||
-      inputBlockingError(auth.error?.code) ||
-      Boolean(preview?.stale)
-    );
+    const state = auth.status === "active" ? auth.session.state : null;
+    // Input is accepted while single-stepping (running) or continuously playing.
+    if (state !== "running" && state !== "playing") {
+      return true;
+    }
+    if (focusState === "hidden" || inputBlockingError(auth.error?.code)) {
+      return true;
+    }
+    // During live play, frames arrive over /ws/frames, so preview staleness is
+    // not a gate. In single-step mode the existing stale gates apply.
+    if (state === "playing") {
+      return false;
+    }
+    return auth.session.preview_stale || Boolean(preview?.stale);
   }
 
   function sendInputState(buttons: PadButton[]) {
@@ -2248,7 +2362,21 @@ function renderDedupGroupSummary(group: LabelsSnapshotResponse["dedup_groups"][n
 }
 
 function renderPreviewImage(model: OperatorViewModel): string {
-  if (!model.auth.session.active || !model.preview) {
+  if (!model.auth.session.active) {
+    return "";
+  }
+  // During continuous Play the newest frame streams over the frames socket and
+  // is painted onto this canvas (no <img>/object URL — see paintLiveFrame). The
+  // canvas persists across re-renders so live frames have a stable draw target.
+  if (model.sessionState === "playing") {
+    return `<canvas
+    data-preview-image
+    data-preview-canvas
+    role="img"
+    aria-label="Live framebuffer preview"
+  ></canvas>`;
+  }
+  if (!model.preview) {
     return "";
   }
   return `<img
@@ -2725,8 +2853,16 @@ function renderSessionPanel(model: OperatorViewModel): string {
     auth.status === "stopping" ||
     model.sessionAction === "pausing" ||
     model.sessionAction === "resuming";
-  const canPause = auth.status === "active" && auth.session.state === "running" && model.sessionAction === "idle";
-  const canResume = auth.status === "active" && auth.session.state === "paused" && model.sessionAction === "idle";
+  const idle = model.sessionAction === "idle";
+  const state = auth.status === "active" ? auth.session.state : null;
+  // Play/Resume from the post-start ready (running) or single-step (paused)
+  // states; Pause freezes from either actively-emitting state (running/playing).
+  const canPlay =
+    auth.status === "active" && (state === "running" || state === "paused") && idle;
+  const canPause =
+    auth.status === "active" && (state === "running" || state === "playing") && idle;
+  const canResume =
+    auth.status === "active" && (state === "running" || state === "paused") && idle;
   return `
     <article class="panel session-panel" aria-busy="${busy}">
       <div class="panel-header">
@@ -2761,6 +2897,7 @@ function renderSessionPanel(model: OperatorViewModel): string {
       ${
         showSession
           ? `<div class="button-row single-action">
+              <button type="button" data-run-action="play" ${canPlay ? "" : "disabled"}>Play</button>
               <button type="button" data-run-action="pause" ${canPause ? "" : "disabled"}>Pause</button>
               <button type="button" data-run-action="resume" ${canResume ? "" : "disabled"}>Resume</button>
               <button type="button" class="danger" data-session-action="logout" ${

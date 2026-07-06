@@ -2,7 +2,8 @@ use rom_operator_bridge_service::{
     backend::{
         BackendCapabilities, BackendError, BackendMode, BackendResult, BackendSession,
         BridgeBackend, CaptureJob, CaptureRequest, FrameCounter, FramePreview,
-        InputScheduleReceipt, InputScheduleRequest, RunBoundary, RunStatus, SessionId,
+        InputScheduleReceipt, InputScheduleRequest, PlayStepOutcome, RunBoundary, RunStatus,
+        SessionId,
         SessionState, StartBackendSession, StopReason, StoppedSession,
     },
     input::{
@@ -839,6 +840,14 @@ impl BridgeBackend for FakeBackend {
     }
 
     fn resume(&self, _session_id: SessionId) -> BackendResult<RunBoundary> {
+        unimplemented!("not needed by input scheduler tests")
+    }
+
+    fn play_start(&self, _session_id: SessionId) -> BackendResult<RunBoundary> {
+        unimplemented!("not needed by input scheduler tests")
+    }
+
+    fn play_step(&self, _session_id: SessionId) -> BackendResult<PlayStepOutcome> {
         unimplemented!("not needed by input scheduler tests")
     }
 

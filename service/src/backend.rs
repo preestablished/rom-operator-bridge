@@ -145,6 +145,10 @@ pub enum SessionState {
     Starting,
     Running,
     Paused,
+    /// Continuous auto-advance: a bridge-side loop is running frames and
+    /// streaming them over `/ws/frames`. Input is buffered on arrival and
+    /// flushed by the loop between frames.
+    Playing,
     CapturePending,
     Stopping,
     Stopped,
@@ -236,6 +240,18 @@ pub struct FramePreview {
     pub png_bytes: Vec<u8>,
 }
 
+/// One continuous-play step: a single advanced frame plus its rendered image.
+/// The bridge Play loop pushes this to `/ws/frames`. `frame` is the deterministic
+/// pv-pad FRAME_COUNTER (monotonic within a run) used as the ordering key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlayStepOutcome {
+    pub session_id: SessionId,
+    pub frame: FrameCounter,
+    pub width: u32,
+    pub height: u32,
+    pub png_bytes: Vec<u8>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaptureRequest {
     pub session_id: SessionId,
@@ -291,6 +307,12 @@ pub trait BridgeBackend: Send + Sync {
     fn status(&self, session_id: SessionId) -> BackendResult<RunStatus>;
     fn pause(&self, session_id: SessionId) -> BackendResult<RunBoundary>;
     fn resume(&self, session_id: SessionId) -> BackendResult<RunBoundary>;
+    /// Enter continuous-play (`Playing`) from a resumable state. Does not itself
+    /// advance frames — the API layer starts the Play loop, which calls
+    /// [`play_step`](BridgeBackend::play_step) per frame.
+    fn play_start(&self, session_id: SessionId) -> BackendResult<RunBoundary>;
+    /// Advance exactly one frame while `Playing`, returning the rendered frame.
+    fn play_step(&self, session_id: SessionId) -> BackendResult<PlayStepOutcome>;
     fn inject_input(&self, request: InputScheduleRequest) -> BackendResult<InputScheduleReceipt>;
     fn framebuffer(&self, session_id: SessionId) -> BackendResult<FramePreview>;
     fn trigger_capture(&self, request: CaptureRequest) -> BackendResult<CaptureJob>;
@@ -487,22 +509,16 @@ impl BridgeBackend for SyntheticBackend {
             if session.state == SessionState::Faulted {
                 return Err(BackendError::BackendUnavailable);
             }
-            let next_frame = if session.state == SessionState::Paused {
-                session.current_frame.saturating_add(1)
-            } else {
-                session.current_frame
-            };
+            // Single-step: advance exactly one frame and land Paused, so the
+            // operator can keep stepping (Resume is enabled from Paused).
+            let next_frame = session.current_frame.saturating_add(1);
             let boundary = RunBoundary {
                 session_id: session.session_id.clone(),
-                state: SessionState::Running,
+                state: SessionState::Paused,
                 current_frame: next_frame,
                 preview_stale: session.last_preview_frame < next_frame,
             };
-            (
-                session.run_id.clone(),
-                boundary,
-                session.state != SessionState::Running,
-            )
+            (session.run_id.clone(), boundary, true)
         };
         if should_append_event {
             inner.append_event_for_run(
@@ -516,10 +532,56 @@ impl BridgeBackend for SyntheticBackend {
             .active
             .as_mut()
             .ok_or(BackendError::BackendUnavailable)?;
-        session.state = SessionState::Running;
+        session.state = SessionState::Paused;
         session.current_frame = boundary.current_frame;
 
         Ok(boundary)
+    }
+
+    fn play_start(&self, session_id: SessionId) -> BackendResult<RunBoundary> {
+        let mut inner = self.inner.lock().expect("synthetic backend mutex poisoned");
+        let session = inner
+            .active
+            .as_mut()
+            .filter(|session| session.session_id == session_id)
+            .ok_or(BackendError::BackendUnavailable)?;
+        if !matches!(
+            session.state,
+            SessionState::Running | SessionState::Paused | SessionState::Playing
+        ) {
+            return Err(BackendError::BackendUnavailable);
+        }
+        session.state = SessionState::Playing;
+        Ok(RunBoundary {
+            session_id,
+            state: SessionState::Playing,
+            current_frame: session.current_frame,
+            preview_stale: session.last_preview_frame < session.current_frame,
+        })
+    }
+
+    /// One continuous-play step: advance exactly one frame and remain in
+    /// `Playing`. Synthetic backend produces a deterministic frame.
+    fn play_step(&self, session_id: SessionId) -> BackendResult<PlayStepOutcome> {
+        let mut inner = self.inner.lock().expect("synthetic backend mutex poisoned");
+        let session = inner
+            .active
+            .as_mut()
+            .filter(|session| session.session_id == session_id)
+            .ok_or(BackendError::BackendUnavailable)?;
+        if session.state != SessionState::Playing {
+            return Err(BackendError::BackendUnavailable);
+        }
+        let frame = session.current_frame.saturating_add(1);
+        session.current_frame = frame;
+        session.last_preview_frame = frame;
+        Ok(PlayStepOutcome {
+            session_id,
+            frame,
+            width: SYNTHETIC_FRAME_WIDTH,
+            height: SYNTHETIC_FRAME_HEIGHT,
+            png_bytes: synthetic_frame_png(frame),
+        })
     }
 
     fn inject_input(&self, request: InputScheduleRequest) -> BackendResult<InputScheduleReceipt> {
@@ -530,7 +592,10 @@ impl BridgeBackend for SyntheticBackend {
                 .as_ref()
                 .filter(|session| session.session_id == request.session_id)
                 .ok_or(BackendError::BackendUnavailable)?;
-            if session.state != SessionState::Running {
+            if !matches!(
+                session.state,
+                SessionState::Running | SessionState::Paused | SessionState::Playing
+            ) {
                 return Err(BackendError::BackendUnavailable);
             }
             let frame_index = session.applied_inputs.len() as u64;
@@ -787,6 +852,27 @@ impl RealBackend {
             private_config,
             inner: Arc::new(Mutex::new(RealBackendInner::default())),
         }
+    }
+
+    /// Mark the active session faulted (used by the play loop and run paths on a
+    /// worker error). Clears any in-flight input.
+    fn mark_faulted(&self, session: &RealSession) {
+        {
+            let mut inner = self.inner.lock().expect("real backend mutex poisoned");
+            if let Some(active) = inner
+                .active
+                .as_mut()
+                .filter(|active| active.session_id == session.session_id)
+            {
+                active.state = SessionState::Faulted;
+                active.input_in_flight = false;
+            }
+        }
+        let _ = self.append_real_event(
+            &session.run_id,
+            "session_faulted",
+            "real backend session faulted",
+        );
     }
 
     fn capture_spec(&self) -> BackendResult<ResolvedCaptureSpec> {
@@ -1165,7 +1251,11 @@ impl BridgeBackend for RealBackend {
 
         let outcome = match self.worker.pause(session.lease.clone()) {
             Ok(outcome) => outcome,
-            Err(RealWorkerFailure::FailedPrecondition) if session.state == SessionState::Paused => {
+            // Coming from Playing the loop already left the slot PAUSED_S; a Pause
+            // RPC against an already-paused slot is a benign precondition failure.
+            Err(RealWorkerFailure::FailedPrecondition)
+                if matches!(session.state, SessionState::Paused | SessionState::Playing) =>
+            {
                 RealPauseOutcome {
                     current_icount: session.current_icount,
                 }
@@ -1293,6 +1383,86 @@ impl BridgeBackend for RealBackend {
         Ok(active.boundary())
     }
 
+    fn play_start(&self, session_id: SessionId) -> BackendResult<RunBoundary> {
+        let mut inner = self.inner.lock().expect("real backend mutex poisoned");
+        let active = inner
+            .active
+            .as_mut()
+            .filter(|active| active.session_id == session_id)
+            .ok_or(BackendError::BackendUnavailable)?;
+        if !matches!(
+            active.state,
+            SessionState::Running | SessionState::Paused | SessionState::Playing
+        ) || active.input_in_flight
+        {
+            return Err(BackendError::BackendUnavailable);
+        }
+        active.state = SessionState::Playing;
+        Ok(active.boundary())
+    }
+
+    fn play_step(&self, session_id: SessionId) -> BackendResult<PlayStepOutcome> {
+        // Precondition: Playing and no input in flight (the loop flushes input
+        // between frames, so input_in_flight is clear when it calls us).
+        let session = {
+            let mut inner = self.inner.lock().expect("real backend mutex poisoned");
+            let active = inner
+                .active
+                .as_mut()
+                .filter(|active| active.session_id == session_id)
+                .ok_or(BackendError::BackendUnavailable)?;
+            if active.state != SessionState::Playing || active.input_in_flight {
+                return Err(BackendError::BackendUnavailable);
+            }
+            active.clone()
+        };
+
+        // Advance exactly one frame.
+        let run_outcome = match self.worker.resume(session.lease.clone()) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.mark_faulted(&session);
+                return Err(error.into());
+            }
+        };
+        if run_outcome.faulted {
+            self.mark_faulted(&session);
+            return Err(BackendError::BackendUnavailable);
+        }
+
+        // Read the framebuffer at the (paused) frame boundary.
+        let fb = match self.worker.framebuffer(session.lease.clone()) {
+            Ok(fb) => fb,
+            Err(error) => {
+                self.mark_faulted(&session);
+                return Err(error.into());
+            }
+        };
+
+        {
+            let mut inner = self.inner.lock().expect("real backend mutex poisoned");
+            if let Some(active) = inner
+                .active
+                .as_mut()
+                .filter(|active| active.session_id == session.session_id)
+            {
+                active.current_icount = run_outcome.current_icount;
+                active.current_frame = fb.frame;
+                active.last_preview_frame = fb.frame;
+                active.frame_base_known = true;
+                active.preview_stale = false;
+            }
+        }
+
+        Ok(PlayStepOutcome {
+            session_id,
+            frame: fb.frame,
+            width: fb.width,
+            height: fb.height,
+            png_bytes: fb.png_bytes,
+        })
+    }
+
     fn inject_input(&self, request: InputScheduleRequest) -> BackendResult<InputScheduleReceipt> {
         if request.target_frame >= u64::from(u32::MAX) {
             return Err(BackendError::BackendUnavailable);
@@ -1308,7 +1478,7 @@ impl BridgeBackend for RealBackend {
                 .filter(|session| session.session_id == request.session_id)
                 .ok_or(BackendError::BackendUnavailable)?;
             if !active.capabilities.input
-                || active.state != SessionState::Paused
+                || !matches!(active.state, SessionState::Paused | SessionState::Playing)
                 || active.input_in_flight
             {
                 return Err(BackendError::BackendUnavailable);
@@ -2843,6 +3013,14 @@ impl BridgeBackend for RealBackendUnavailable {
     }
 
     fn resume(&self, _session_id: SessionId) -> BackendResult<RunBoundary> {
+        Err(BackendError::BackendUnavailable)
+    }
+
+    fn play_start(&self, _session_id: SessionId) -> BackendResult<RunBoundary> {
+        Err(BackendError::BackendUnavailable)
+    }
+
+    fn play_step(&self, _session_id: SessionId) -> BackendResult<PlayStepOutcome> {
         Err(BackendError::BackendUnavailable)
     }
 

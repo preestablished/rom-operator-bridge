@@ -403,6 +403,10 @@ export class RuntimeApiClient {
     return this.sessionTransition("/run/resume", sessionId);
   }
 
+  playRun(sessionId: string): Promise<RunStateResponse> {
+    return this.sessionTransition("/run/play", sessionId);
+  }
+
   currentFrame(): Promise<FrameCurrentResponse> {
     return this.request("/frame/current", parseFrameCurrentResponse);
   }
@@ -665,6 +669,10 @@ export class RuntimeSocket {
       onError?: (error: RuntimeApiError) => void;
       onClose?: () => void;
       onReconnect?: (attempt: number) => void;
+      // When set, the socket switches to binary mode: incoming ArrayBuffer
+      // messages are delivered here (used by the `/ws/frames` live stream) and
+      // the JSON message path is bypassed.
+      onBinary?: (data: ArrayBuffer) => void;
     } = {},
     private readonly reconnect: {
       maxAttempts: number;
@@ -712,6 +720,9 @@ export class RuntimeSocket {
   private open(wasReconnect = false): void {
     const socket = new this.socketConstructor(this.url);
     this.socket = socket;
+    if (this.handlers.onBinary) {
+      (socket as { binaryType?: string }).binaryType = "arraybuffer";
+    }
     socket.onopen = () => {
       this.reconnectAttempts = 0;
       if (wasReconnect) {
@@ -729,6 +740,10 @@ export class RuntimeSocket {
   }
 
   private handleMessage(event: MessageEvent): void {
+    if (this.handlers.onBinary && event.data instanceof ArrayBuffer) {
+      this.handlers.onBinary(event.data);
+      return;
+    }
     try {
       const message = parseWsMessage(JSON.parse(String(event.data)));
       if (message.server_seq !== null) {
@@ -869,6 +884,18 @@ export class RuntimeWebSocketClient {
   eventSocket(handlers: ConstructorParameters<typeof RuntimeSocket>[2] = {}): RuntimeSocket {
     return new RuntimeSocket(
       this.url("/events"),
+      this.socketConstructor(),
+      handlers,
+      this.reconnectOptions()
+    );
+  }
+
+  /// Live binary frame stream for continuous play (`/ws/frames`). Delivers raw
+  /// `[u64 frame_counter LE][PNG bytes]` messages to `handlers.onBinary`; reuses
+  /// the shared reconnect infra.
+  framesSocket(handlers: ConstructorParameters<typeof RuntimeSocket>[2] = {}): RuntimeSocket {
+    return new RuntimeSocket(
+      this.url("/frames"),
       this.socketConstructor(),
       handlers,
       this.reconnectOptions()

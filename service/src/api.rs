@@ -26,7 +26,10 @@ use crate::{
 use axum::{
     Json, Router,
     body::{Body, to_bytes},
-    extract::{Path, State, ws::WebSocketUpgrade},
+    extract::{
+        Path, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
+    },
     http::{
         HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri,
         header::{
@@ -65,6 +68,7 @@ pub struct AppState {
     frame_previews: FramePreviewState,
     ws_events: WsEventState,
     ws_input: WsInputState,
+    play: crate::play::PlayController,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +104,7 @@ impl AppState {
             frame_previews: FramePreviewState::new(),
             ws_events: WsEventState::new(),
             ws_input: WsInputState::new(),
+            play: crate::play::PlayController::new(),
         }
     }
 
@@ -120,6 +125,7 @@ impl AppState {
             frame_previews: FramePreviewState::new(),
             ws_events: WsEventState::new(),
             ws_input: WsInputState::new(),
+            play: crate::play::PlayController::new(),
         }
     }
 
@@ -139,6 +145,7 @@ impl AppState {
             frame_previews: FramePreviewState::new(),
             ws_events: WsEventState::new(),
             ws_input: WsInputState::new(),
+            play: crate::play::PlayController::new(),
         }
     }
 
@@ -968,6 +975,10 @@ pub fn router(state: AppState) -> Router {
             post(resume_run).fallback(method_not_allowed),
         )
         .route(
+            "/api/run/play",
+            post(play_run).fallback(method_not_allowed),
+        )
+        .route(
             "/api/frame/current",
             get(frame_current).fallback(method_not_allowed),
         )
@@ -1012,6 +1023,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/ws/events",
             get(events_ws_handshake).fallback(method_not_allowed),
+        )
+        .route(
+            "/ws/frames",
+            get(frames_ws_handshake).fallback(method_not_allowed),
         )
         .fallback(static_or_not_found)
         .with_state(state)
@@ -1918,6 +1933,71 @@ async fn events_ws_handshake(
     response
 }
 
+/// `GET /ws/frames` — live frame stream for continuous play. Binary messages
+/// `[u64 frame_counter LE][PNG bytes]`; the client renders only frames newer than
+/// the last displayed one. A `watch` receiver means each connection always sees
+/// the latest frame; a slow/late subscriber simply misses intermediate frames.
+async fn frames_ws_handshake(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    let auth_context = match authenticate_runtime_request(&state, &headers, &uri) {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
+    if let Err(response) = active_session_id(&state) {
+        return response;
+    }
+    let frames = state.play.subscribe();
+    let mut response = ws
+        .on_upgrade(move |socket| serve_frames_socket(socket, frames))
+        .into_response();
+    apply_runtime_headers(response.headers_mut(), &auth_context);
+    response
+}
+
+async fn serve_frames_socket(
+    mut socket: WebSocket,
+    mut frames: tokio::sync::watch::Receiver<crate::play::FrameSlot>,
+) {
+    // Send the latest frame immediately (if a run is already producing).
+    let current = frames.borrow_and_update().clone();
+    if let Some(frame) = current
+        && socket
+            .send(Message::Binary(frame.as_ref().clone().into()))
+            .await
+            .is_err()
+    {
+        return;
+    }
+    loop {
+        tokio::select! {
+            changed = frames.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                let current = frames.borrow_and_update().clone();
+                if let Some(frame) = current
+                    && socket
+                        .send(Message::Binary(frame.as_ref().clone().into()))
+                        .await
+                        .is_err()
+                {
+                    break;
+                }
+            }
+            incoming = socket.recv() => {
+                match incoming {
+                    None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
 fn run_state_transition(
     state: AppState,
     headers: HeaderMap,
@@ -1935,6 +2015,11 @@ fn run_state_transition(
     if let Err(response) = ensure_active_session(&state, &request.session_id) {
         return response;
     }
+
+    // Pause (and Resume, which single-steps) must first halt any continuous-play
+    // loop so it stops issuing Runs before we change the run state. `stop` blocks
+    // until the loop exits (~one frame).
+    state.play.stop(&request.session_id);
 
     if transition == RunTransition::Resume
         && flush_pending_input(&state, &request.session_id).is_err()
@@ -1966,6 +2051,102 @@ fn run_state_transition(
     .into_response();
     apply_runtime_headers(response.headers_mut(), &auth_context);
     response
+}
+
+/// `POST /api/run/play` — enter continuous play. Fire-and-forget: transition the
+/// session to `Playing`, spawn the dedicated Play loop thread, and return
+/// immediately (the loop streams frames over `/ws/frames`).
+async fn play_run(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(request): Json<SessionOnlyRequest>,
+) -> Response {
+    let auth_context = match authenticate_runtime_request(&state, &headers, &uri) {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
+    if request.schema_version != RUNTIME_API_SCHEMA_VERSION {
+        return bad_request("Unsupported schema version.").into_response();
+    }
+    if let Err(response) = ensure_active_session(&state, &request.session_id) {
+        return response;
+    }
+
+    let boundary = match state.backend.play_start(request.session_id.clone()) {
+        Ok(boundary) => boundary,
+        Err(error) => return backend_error(error).into_response(),
+    };
+    publish_run_boundary_event(&state, &boundary);
+
+    // Dedicated OS thread: not the axum runtime (would block a worker for
+    // minutes) and not the serialized worker thread (must service Stop/Status).
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let loop_state = state.clone();
+    let loop_session = request.session_id.clone();
+    let loop_stop = stop.clone();
+    let join = std::thread::Builder::new()
+        .name("play-loop".to_string())
+        .spawn(move || play_loop(loop_state, loop_session, loop_stop))
+        .expect("spawn play loop thread");
+    state.play.register(request.session_id.clone(), stop, join);
+
+    let mut response = Json(RunStateResponse {
+        schema_version: RUNTIME_API_SCHEMA_VERSION,
+        state: boundary.state,
+        current_frame: boundary.current_frame,
+    })
+    .into_response();
+    apply_runtime_headers(response.headers_mut(), &auth_context);
+    response
+}
+
+/// The continuous-play loop body (runs on a dedicated thread). Per frame: flush
+/// buffered input (scheduled for upcoming frames), advance exactly one frame, push
+/// it to `/ws/frames`, and publish `run_updated`. Exits when the stop flag is set
+/// (Pause/Stop) or on the first backend error (fault).
+fn play_loop(state: AppState, session_id: String, stop: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    use std::sync::atomic::Ordering;
+    let frames = state.play.frames_sender();
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        // Inject inputs the client buffered for upcoming frames (best-effort:
+        // a scheduling hiccup on one frame must not kill the loop).
+        let _ = flush_pending_input(&state, &session_id);
+
+        match state.backend.play_step(session_id.clone()) {
+            Ok(step) => {
+                let _ = frames.send(Some(crate::play::frame_message(step.frame, &step.png_bytes)));
+                publish_run_boundary_event(
+                    &state,
+                    &crate::backend::RunBoundary {
+                        session_id: session_id.clone(),
+                        state: crate::backend::SessionState::Playing,
+                        current_frame: step.frame,
+                        preview_stale: false,
+                    },
+                );
+            }
+            Err(_) => {
+                // Fault or the session went away. Surface the terminal state (if
+                // still resolvable) so the UI flips out of Playing, then stop.
+                if let Ok(status) = state.backend.status(session_id.clone()) {
+                    publish_run_boundary_event(
+                        &state,
+                        &crate::backend::RunBoundary {
+                            session_id: session_id.clone(),
+                            state: status.state,
+                            current_frame: status.current_frame,
+                            preview_stale: status.preview_stale,
+                        },
+                    );
+                }
+                break;
+            }
+        }
+    }
 }
 
 fn flush_pending_input(
@@ -2145,6 +2326,10 @@ fn is_contract_uuid(candidate: &str) -> bool {
 }
 
 fn cleanup_runtime_session(state: &AppState, reason: StopReason) -> Result<(), BackendError> {
+    // Stop any continuous-play loop before tearing down the slot, so it does not
+    // issue a Run against a destroyed lease (Stop / SessionReplaced / fault / TTL).
+    state.play.stop_any();
+
     let active_session = state
         .runtime_session
         .lock()

@@ -255,6 +255,7 @@ impl fmt::Display for SessionStateLabel {
             SessionState::Starting => "starting",
             SessionState::Running => "running",
             SessionState::Paused => "paused",
+            SessionState::Playing => "playing",
             SessionState::CapturePending => "capture_pending",
             SessionState::Stopping => "stopping",
             SessionState::Stopped => "stopped",
@@ -364,7 +365,7 @@ impl InputScheduler {
         let status = backend.status(input.session_id.clone())?;
         let key = InputRunKey::from_status(&input.session_id, &status)?;
 
-        match input_acceptance(&status) {
+        match input_acceptance(&status, InputContext::Submit) {
             InputAcceptance::Apply => {
                 self.apply_with_status(backend, input, status, key, rejection_sink)
             }
@@ -401,7 +402,7 @@ impl InputScheduler {
         }
         let status = backend.status(session_id.to_string())?;
         let key = InputRunKey::from_status(session_id, &status)?;
-        match input_acceptance(&status) {
+        match input_acceptance(&status, InputContext::Flush) {
             InputAcceptance::Queue => {
                 return Ok(self
                     .pending
@@ -470,7 +471,7 @@ impl InputScheduler {
         key: InputRunKey,
         rejection_sink: &mut dyn InputRejectionSink,
     ) -> Result<InputScheduleOutcome, InputSchedulerError> {
-        if input_acceptance(&status) != InputAcceptance::Apply {
+        if input_acceptance(&status, InputContext::Flush) != InputAcceptance::Apply {
             return Err(InputSchedulerError::SessionNotAcceptingInput {
                 session_id: status.session_id,
                 state: status.state.into(),
@@ -514,7 +515,7 @@ impl InputScheduler {
             return Ok(InputScheduleOutcome::dropped(&input, rejection.notice()));
         }
 
-        if input_acceptance(&refreshed) != InputAcceptance::Apply {
+        if input_acceptance(&refreshed, InputContext::Flush) != InputAcceptance::Apply {
             return Err(InputSchedulerError::SessionNotAcceptingInput {
                 session_id: refreshed.session_id,
                 state: refreshed.state.into(),
@@ -639,13 +640,28 @@ impl InputScheduler {
     }
 }
 
-fn input_acceptance(status: &RunStatus) -> InputAcceptance {
+/// Where `input_acceptance` is being consulted. During `Playing`, arrivals must
+/// **buffer** (`Submit` → Queue) and only the Play loop **applies** them between
+/// frames (`Flush` → Apply) — otherwise a `submit` would inject mid-loop and race
+/// the serialized worker channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputContext {
+    Submit,
+    Flush,
+}
+
+fn input_acceptance(status: &RunStatus, context: InputContext) -> InputAcceptance {
     match (status.backend_mode, status.state) {
         (BackendMode::Synthetic, SessionState::Running) => InputAcceptance::Apply,
         (BackendMode::Synthetic, SessionState::Paused) => InputAcceptance::Queue,
         (BackendMode::Real, SessionState::Paused) if status.capabilities.input => {
             InputAcceptance::Apply
         }
+        // Continuous play: buffer on arrival, apply on the loop's flush.
+        (_, SessionState::Playing) if status.capabilities.input => match context {
+            InputContext::Submit => InputAcceptance::Queue,
+            InputContext::Flush => InputAcceptance::Apply,
+        },
         _ => InputAcceptance::Reject,
     }
 }

@@ -68,7 +68,13 @@ async fn synthetic_session_lifecycle_reports_states_and_clears_auth_lock() {
         .with_header(COOKIE, &cookie),
     )
     .await;
-    assert_eq!(resumed["state"], "running");
+    // Resume single-steps exactly one frame and stays paused (Play resumes
+    // continuous emission); the frame counter advances by one.
+    assert_eq!(resumed["state"], "paused");
+    assert_eq!(
+        resumed["current_frame"].as_u64().unwrap(),
+        paused["current_frame"].as_u64().unwrap() + 1
+    );
     assert_matches_runtime_schema(&resumed);
 
     let stopped_response = app
@@ -327,10 +333,36 @@ fn synthetic_backend_trait_tracks_pause_resume_stop_state() {
         .expect("status reports paused");
     assert_eq!(status.state, SessionState::Paused);
 
+    // Resume single-steps one frame and stays paused; Play (not Resume) returns
+    // the session to continuous emission.
     let resumed = backend
         .resume(session.session_id.clone())
         .expect("session resumes");
-    assert_eq!(resumed.state, SessionState::Running);
+    assert_eq!(resumed.state, SessionState::Paused);
+    assert_eq!(resumed.current_frame, paused.current_frame + 1);
+
+    let playing = backend
+        .play_start(session.session_id.clone())
+        .expect("session plays");
+    assert_eq!(playing.state, SessionState::Playing);
+
+    // A play step advances exactly one frame, stays Playing, and returns a frame.
+    let step = backend
+        .play_step(session.session_id.clone())
+        .expect("play step advances");
+    assert_eq!(step.frame, playing.current_frame + 1);
+    assert!(!step.png_bytes.is_empty());
+    let playing_status = backend
+        .status(session.session_id.clone())
+        .expect("status reports playing");
+    assert_eq!(playing_status.state, SessionState::Playing);
+    assert_eq!(playing_status.current_frame, step.frame);
+
+    // Pause from Playing halts emission and lands in Paused.
+    let repaused = backend
+        .pause(session.session_id.clone())
+        .expect("play pauses");
+    assert_eq!(repaused.state, SessionState::Paused);
 
     let stopped = backend
         .stop_session(

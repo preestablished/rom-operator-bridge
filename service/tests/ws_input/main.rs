@@ -12,7 +12,8 @@ use rom_operator_bridge_service::{
     backend::{
         BackendCapabilities, BackendError, BackendMode, BackendResult, BackendSession,
         BridgeBackend, CaptureJob, CaptureRequest, FramePreview, InputScheduleReceipt,
-        InputScheduleRequest, RunBoundary, RunStatus, SessionId, SessionState, StartBackendSession,
+        InputScheduleRequest, PlayStepOutcome, RunBoundary, RunStatus, SessionId, SessionState,
+        StartBackendSession,
         StopReason, StoppedSession,
     },
     config::ServiceConfig,
@@ -958,6 +959,14 @@ impl BridgeBackend for RecordingBackend {
             current_frame: 0,
             preview_stale: false,
         })
+    }
+
+    fn play_start(&self, _session_id: SessionId) -> BackendResult<RunBoundary> {
+        unimplemented!("play mode not exercised by ws_input tests")
+    }
+
+    fn play_step(&self, _session_id: SessionId) -> BackendResult<PlayStepOutcome> {
+        unimplemented!("play mode not exercised by ws_input tests")
     }
 
     fn inject_input(&self, request: InputScheduleRequest) -> BackendResult<InputScheduleReceipt> {
