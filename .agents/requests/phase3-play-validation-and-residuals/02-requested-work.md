@@ -3,19 +3,32 @@
 ## What We Need (Behavioral)
 
 1. **`eqb` — real-worker streaming validation.** Against the redeployed
-   worker (`4285b45` build): a sustained streaming Play session from the
-   browser through `/ws/frames`, with measured fps, frame latency, and
-   stream stability recorded (sanitized notes only, per the redaction
-   discipline / `scripts/quality-gate.sh`). The pass bar is honesty, not
-   speed: **sustained ≥8 fps for ≥60 seconds with zero stream drops and
-   scheduled input honored (frame-hold injection observed)** — i.e.
-   within measurement noise of the hypervisor's ~8.5 fps ceiling. Record
-   the delta from ceiling and where the time goes (worker vs bridge vs
-   wire); that number is the baseline `pea` decides against. Also
-   exercise the rollback toggle once
-   (`ROM_OPERATOR_BRIDGE_PLAY_STREAMING=false`) and record the per-frame
-   path still works — that comparison replaces the "B1 before/after" the
-   original draft asked for.
+   worker (`4285b45` build). Instrument: a **scripted, authenticated
+   `/ws/frames` client** (capability request per `authSession.ts`) doing
+   the measurement, with a browser session as the human-visible sanity
+   pass — the operator's part is the private window/scheduling, not the
+   driving. Record measured fps (delivered at the WS client), frame
+   latency, pacer-overrun count and WS send depth (the exact telemetry
+   `pea` needs — capture it here so `pea` doesn't need a second window);
+   sanitized notes only, per `scripts/quality-gate.sh`. The pass bar is
+   honesty, not speed: **sustained ≥8 fps for ≥60 seconds** (within
+   noise of the hypervisor's ~8.5 fps ceiling — state whether your
+   measurement point matches theirs), where "no drops" means (a) no
+   unintended WS disconnect/reconnect in the window and (b) no
+   `frame_counter` gaps at the client — client-side render-if-newer
+   discards are by design and excluded. **Scheduled input honored**:
+   post-cutover, count frames from injected pad press to visible effect
+   (plan 02's method); pre-cutover (all-black zeros ROM), a worker-side
+   input-event observation or state delta is acceptable evidence —
+   prefer running this after the refwork cutover in the shared window.
+   Include the bead's own **determinism spot-check** (plan
+   `02-tests-and-acceptance.md`: after the played session, run the
+   verifier flow to confirm chain/replay evidence is intact under
+   streaming delivery) — `eqb` cannot close without it. Also exercise
+   the rollback toggle once (`ROM_OPERATOR_BRIDGE_PLAY_STREAMING=false`)
+   and record the per-frame path still works. Note in the record which
+   worker build was live (the hypervisor's in-flight frame-cap retune
+   may land between runs and shift the baseline).
 2. **Test debt, all four (beads already exist — don't file duplicates).**
    - `4zn`: Play-lifecycle integration test (fault during Play → frames
      slot cleared and deregistered — the regression the `960e4cc` fix
@@ -48,6 +61,9 @@
    - `9mk`: disposition the parent feature bead (close against
      `fb2a7fc`/`960e4cc` or re-scope to the B3 tail);
    - `qh4`: keep or fold into `pea` — your call, say which;
+   - `aaw` (in progress, sudo-blocked): disposition it too — close out
+     with the operator or re-scope; don't leave it as a stale
+     in-progress bead;
    - commit this request directory (it is currently untracked; the
      repo's own session rules say commit).
 
@@ -60,9 +76,11 @@ window, both purposes) → 3 (consumes 1's numbers) → 4 as things close.
 ## Acceptance Criteria
 
 1. `eqb` closed with the sanitized measurement record: fps/latency
-   table, the ≥8 fps / ≥60 s / zero-drop bar met (or a recorded reason
-   with the bottleneck named), input-injection observed, rollback-toggle
-   check recorded.
+   table plus pacer-overrun/WS-depth telemetry, the ≥8 fps / ≥60 s /
+   no-drops bar (as defined in item 1) met — or a recorded reason with
+   the bottleneck named; input-injection evidence (visual post-cutover
+   or worker-side pre-cutover); the determinism spot-check (verifier
+   flow) green; rollback-toggle check recorded; live worker build noted.
 2. The three bridge-side tests (`4zn`, `y4g`, the `/ws/events`
    throttle-rate assertion) exist and are green in this repo's CI, with
    `y4g`'s canvas-unblocking decision recorded; the worker-side
