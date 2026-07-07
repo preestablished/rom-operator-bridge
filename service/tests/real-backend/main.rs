@@ -1687,6 +1687,14 @@ async fn real_streaming_play_keeps_commands_responsive_and_stops_without_pause_r
         Some((ENV_REAL_SNAPSHOT_REF, SNAPSHOT_REF.to_string())),
     );
     let backend = real_backend_from_config(&config);
+    // Model the cancel window: the first stop-poll GetFramebuffer calls land
+    // while the slot is still Running (FailedPrecondition) and must be
+    // retried, not treated as a fault.
+    worker
+        .state
+        .lock()
+        .expect("mock worker mutex poisoned")
+        .framebuffer_failed_precondition_remaining = 3;
 
     let session_id = tokio::task::spawn_blocking(move || {
         let session = backend
@@ -1764,6 +1772,95 @@ async fn real_streaming_play_keeps_commands_responsive_and_stops_without_pause_r
     assert!(
         !calls.iter().any(|call| *call == "pause"),
         "no worker Pause RPC may be dispatched on the streaming path: {calls:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_streaming_segment_budget_end_supports_seamless_reopen() {
+    let workspace = tempfile::tempdir().expect("tempdir creates");
+    let private_root = workspace.path().join("bridge-private");
+    let reference_checkout = workspace.path().join("reference-workload");
+    let worker = MockWorker::new();
+    let server = WorkerServer::start(worker.clone()).await;
+    let config = real_config_with_start(
+        &private_root,
+        &reference_checkout,
+        &format!("unix://{}", server.uds_path.display()),
+        Some((ENV_REAL_SNAPSHOT_REF, SNAPSHOT_REF.to_string())),
+    );
+    let backend = real_backend_from_config(&config);
+    // Two frames per stream segment, then a BUDGET_REACHED terminal event —
+    // the shape of the deliberately bounded segment budget.
+    worker
+        .state
+        .lock()
+        .expect("mock worker mutex poisoned")
+        .frame_stream_frame_limit = Some(2);
+
+    tokio::task::spawn_blocking(move || {
+        let session = backend
+            .start_session(StartBackendSession {
+                requested_capabilities: BackendCapabilities::real_input_preview_mvp(),
+            })
+            .expect("real session starts");
+        backend
+            .play_start(session.session_id.clone())
+            .expect("play starts");
+
+        let mut frames = Vec::new();
+        let mut stream = backend
+            .play_stream_start(session.session_id.clone())
+            .expect("first segment opens");
+        loop {
+            match stream
+                .next_frame(std::time::Duration::from_secs(5))
+                .expect("segment event")
+            {
+                PlayStreamEvent::Frame(step) => frames.push(step.frame),
+                PlayStreamEvent::TimedOut => continue,
+                PlayStreamEvent::Ended { faulted } => {
+                    assert!(!faulted, "budget end is a clean segment end");
+                    break;
+                }
+            }
+        }
+        assert_eq!(frames, vec![13, 14]);
+
+        // The session is still Playing after a clean segment end, so the Play
+        // loop can reopen the next segment where the last one left off.
+        let status = backend
+            .status(session.session_id.clone())
+            .expect("status between segments");
+        assert_eq!(status.state, SessionState::Playing);
+
+        let mut next_segment = backend
+            .play_stream_start(session.session_id.clone())
+            .expect("next segment opens after budget end");
+        loop {
+            match next_segment
+                .next_frame(std::time::Duration::from_secs(5))
+                .expect("second segment event")
+            {
+                PlayStreamEvent::Frame(step) => {
+                    assert_eq!(step.frame, 15, "frames continue across segments");
+                    break;
+                }
+                PlayStreamEvent::TimedOut => continue,
+                PlayStreamEvent::Ended { faulted } => panic!("ended early (faulted: {faulted})"),
+            }
+        }
+    })
+    .await
+    .expect("segmented streaming session runs");
+
+    let calls = worker.calls();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| **call == "run_with_frame_capture")
+            .count(),
+        2,
+        "one stream per segment: {calls:?}"
     );
 }
 
@@ -2190,6 +2287,13 @@ struct MockWorkerState {
     take_snapshot_response: dh::TakeSnapshotResponse,
     framebuffer_status: Option<tonic::Code>,
     framebuffer_response: dh::GetFramebufferResponse,
+    /// Fail this many GetFramebuffer calls with FailedPrecondition first
+    /// (models the window where a cancelled stream has not yet parked the
+    /// slot Paused).
+    framebuffer_failed_precondition_remaining: u32,
+    /// Frames per RunWithFrameCapture stream before a BUDGET_REACHED terminal
+    /// event; None streams until the client disconnects.
+    frame_stream_frame_limit: Option<u32>,
     icount: u64,
     frame_counter: u32,
 }
@@ -2212,6 +2316,8 @@ impl Default for MockWorkerState {
             take_snapshot_response: MockWorker::take_snapshot_response(),
             framebuffer_status: None,
             framebuffer_response: MockWorker::framebuffer_response(12, 0),
+            framebuffer_failed_precondition_remaining: 0,
+            frame_stream_frame_limit: None,
             icount: 0,
             frame_counter: 12,
         }
@@ -2496,6 +2602,12 @@ impl HypervisorWorker for MockWorker {
     ) -> Result<TonicResponse<dh::GetFramebufferResponse>, Status> {
         let mut state = self.state.lock().expect("mock worker mutex poisoned");
         state.calls.push("get_framebuffer");
+        if state.framebuffer_failed_precondition_remaining > 0 {
+            state.framebuffer_failed_precondition_remaining -= 1;
+            return Err(Status::failed_precondition(
+                "GetFramebuffer requires Paused slot, got Running",
+            ));
+        }
         if let Some(code) = state.framebuffer_status {
             return Err(Status::new(
                 code,
@@ -2529,19 +2641,38 @@ impl HypervisorWorker for MockWorker {
         &self,
         _request: TonicRequest<dh::RunWithFrameCaptureRequest>,
     ) -> Result<TonicResponse<Self::RunWithFrameCaptureStream>, Status> {
-        let start_frame = {
+        let (start_frame, frame_limit) = {
             let mut state = self.state.lock().expect("mock worker mutex poisoned");
             state.calls.push("run_with_frame_capture");
-            state.frame_counter
+            (state.frame_counter, state.frame_stream_frame_limit)
         };
-        // Emit frames until the bridge drops the stream (send fails), like the
-        // real worker: the emit loop IS the backpressure, and cancellation
+        // Emit frames until the bridge drops the stream (send fails) or the
+        // configured segment budget elapses (BUDGET_REACHED terminal), like
+        // the real worker: the emit loop IS the backpressure, and either exit
         // parks the slot paused (the mock slot is always PausedS already).
         let worker_state = self.state.clone();
         let (tx, rx) = tokio::sync::mpsc::channel(2);
         tokio::spawn(async move {
             let mut frame_counter = start_frame;
+            let mut sent = 0_u32;
             loop {
+                if frame_limit.is_some_and(|limit| sent >= limit) {
+                    let done = dh::FrameCaptureEvent {
+                        msg: Some(dh::frame_capture_event::Msg::Done(dh::RunResponse {
+                            reason: dh::StopReason::BudgetReached as i32,
+                            icount: u64::from(frame_counter) * 100,
+                            vns: 0,
+                            state_hash: None,
+                            frames_elapsed: u64::from(sent),
+                            sdk_event: None,
+                            feature_bytes: Vec::new(),
+                            fb_lz4: Vec::new(),
+                            fb_info: None,
+                        })),
+                    };
+                    let _ = tx.send(Ok(done)).await;
+                    break;
+                }
                 frame_counter += 1;
                 let (fb_lz4, fb_info) = MockWorker::captured_framebuffer(frame_counter);
                 let event = dh::FrameCaptureEvent {
@@ -2555,6 +2686,7 @@ impl HypervisorWorker for MockWorker {
                 if tx.send(Ok(event)).await.is_err() {
                     break;
                 }
+                sent += 1;
                 let mut state = worker_state.lock().expect("mock worker mutex poisoned");
                 state.frame_counter = frame_counter;
                 state.framebuffer_response =

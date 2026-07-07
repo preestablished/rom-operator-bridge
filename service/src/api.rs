@@ -1237,6 +1237,11 @@ async fn stop_session(
         return response;
     }
 
+    // Halt any Play loop BEFORE destroying the slot: a streaming session's
+    // teardown (stream cancel → slot parks Paused) must complete first, or the
+    // worker rejects DestroyVm on a still-Running slot and the run leaks.
+    state.play.stop_any();
+
     let stopped = match state
         .backend
         .stop_session(request.session_id.clone(), request.reason)
@@ -2117,6 +2122,11 @@ const PLAY_EVENT_THROTTLE: std::time::Duration = std::time::Duration::from_milli
 /// If the pacer falls this far behind (stalled worker, debugger, laggy host),
 /// re-anchor the deadline instead of bursting frames to catch up.
 const PLAY_PACER_RESYNC: std::time::Duration = std::time::Duration::from_millis(250);
+/// Segment-reopen retries: a stream reopen can transiently collide with an
+/// in-flight input RPC (`input_in_flight`); ride it out briefly before
+/// treating the session as over.
+const PLAY_STREAM_REOPEN_ATTEMPTS: u32 = 5;
+const PLAY_STREAM_REOPEN_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// The continuous-play loop body (runs on a dedicated thread).
 ///
@@ -2223,9 +2233,34 @@ fn play_stream_loop(
             // No frame within the read window: re-check stop/TTL and keep
             // pacing (the missed ticks re-anchor via PLAY_PACER_RESYNC).
             Ok(PlayStreamEvent::TimedOut) => continue,
-            // Terminal: the run ended (budget/fault/stream loss). Publish the
-            // final state and tear down exactly like a per-frame fault.
-            Ok(PlayStreamEvent::Ended { .. }) | Err(_) => {
+            // A segment's icount budget elapsed (streams are deliberately
+            // bounded to cap worker memory growth per Run): reopen the stream
+            // and keep playing. A brief retry rides out an input RPC holding
+            // input_in_flight across the reopen.
+            Ok(PlayStreamEvent::Ended { faulted: false }) => {
+                let mut reopened = None;
+                for _ in 0..PLAY_STREAM_REOPEN_ATTEMPTS {
+                    match state.backend.play_stream_start(session_id.clone()) {
+                        Ok(next) => {
+                            reopened = Some(next);
+                            break;
+                        }
+                        Err(_) => std::thread::sleep(PLAY_STREAM_REOPEN_RETRY),
+                    }
+                }
+                match reopened {
+                    Some(next) => handle = next,
+                    None => {
+                        publish_play_terminal_state(&state, &session_id);
+                        let _ = frames.send(None);
+                        state.play.deregister(&session_id);
+                        break;
+                    }
+                }
+            }
+            // Terminal: fault or stream loss. Publish the final state and
+            // tear down exactly like a per-frame fault.
+            Ok(PlayStreamEvent::Ended { faulted: true }) | Err(_) => {
                 publish_play_terminal_state(&state, &session_id);
                 let _ = frames.send(None);
                 state.play.deregister(&session_id);
