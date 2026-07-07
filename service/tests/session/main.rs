@@ -8,7 +8,10 @@ use axum::{
 use rom_operator_bridge_service::{
     api::{AppState, router},
     auth::{ALLOWED_ORIGIN, AuthState, SESSION_TTL_SECONDS},
-    backend::{BridgeBackend, SessionState, SyntheticBackend},
+    backend::{
+        BackendCapabilities, BridgeBackend, PlayStreamEvent, SessionState, StartBackendSession,
+        SyntheticBackend,
+    },
     config::ServiceConfig,
     private_config::{ENV_PRIVATE_ROOT, ENV_SESSION_SECRET},
 };
@@ -518,4 +521,122 @@ impl RequestExt for Request<Body> {
         );
         self
     }
+}
+
+#[test]
+fn synthetic_streaming_play_delivers_frames_and_stops_paused() {
+    let backend = SyntheticBackend::new();
+    let session = backend
+        .start_session(StartBackendSession {
+            requested_capabilities: BackendCapabilities::synthetic_mvp(),
+        })
+        .expect("synthetic session starts");
+    backend
+        .play_start(session.session_id.clone())
+        .expect("session plays");
+
+    // Streaming requires Playing: a paused session must be rejected.
+    backend
+        .pause(session.session_id.clone())
+        .expect("session pauses");
+    assert!(
+        backend
+            .play_stream_start(session.session_id.clone())
+            .is_err(),
+        "streaming must not start while paused"
+    );
+    backend
+        .play_start(session.session_id.clone())
+        .expect("session plays again");
+
+    let mut stream = backend
+        .play_stream_start(session.session_id.clone())
+        .expect("synthetic stream opens");
+    let mut last_frame = 0;
+    for _ in 0..3 {
+        match stream
+            .next_frame(std::time::Duration::from_millis(10))
+            .expect("synthetic frame")
+        {
+            PlayStreamEvent::Frame(step) => {
+                assert_eq!(step.frame, last_frame + 1, "frames advance one at a time");
+                assert!(!step.png_bytes.is_empty());
+                last_frame = step.frame;
+            }
+            other => panic!("expected a frame, got {other:?}"),
+        }
+    }
+
+    let boundary = stream.stop().expect("stream stops");
+    assert_eq!(boundary.state, SessionState::Paused);
+    assert_eq!(boundary.current_frame, last_frame);
+
+    // After stop the adapter reports the stream over instead of more frames.
+    match stream
+        .next_frame(std::time::Duration::from_millis(10))
+        .expect("post-stop read resolves")
+    {
+        PlayStreamEvent::Ended { faulted: false } => {}
+        other => panic!("expected a clean end, got {other:?}"),
+    }
+    let status = backend
+        .status(session.session_id)
+        .expect("status after streaming stop");
+    assert_eq!(status.state, SessionState::Paused);
+    assert_eq!(status.current_frame, last_frame);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn synthetic_streaming_play_via_api_paces_frames_and_pauses_at_a_boundary() {
+    let (_workspace, app, _private_root) = session_app();
+    let (start, cookie) = start_session(app.clone()).await;
+    let session_id = start["session_id"].as_str().expect("session id is string");
+
+    let play = request_json(
+        app.clone(),
+        runtime_request(
+            Method::POST,
+            "/api/run/play",
+            Body::from(session_only_body(session_id)),
+        )
+        .with_header(COOKIE, &cookie),
+    )
+    .await;
+    assert_eq!(play["state"], "playing");
+
+    // Let the streaming loop run ~18 paced ticks.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let paused = request_json(
+        app.clone(),
+        runtime_request(
+            Method::POST,
+            "/api/run/pause",
+            Body::from(session_only_body(session_id)),
+        )
+        .with_header(COOKIE, &cookie),
+    )
+    .await;
+    assert_eq!(paused["state"], "paused");
+    let frame_at_pause = paused["current_frame"].as_u64().expect("frame is u64");
+    assert!(
+        frame_at_pause >= 2,
+        "streaming loop must advance frames (got {frame_at_pause})"
+    );
+    // Paced at ~60.0988Hz, not free-running: a free-running synthetic loop
+    // would blow far past a frame per tick in 300ms.
+    assert!(
+        frame_at_pause <= 60,
+        "streaming loop must be paced (got {frame_at_pause})"
+    );
+
+    // The frame counter freezes at the pause boundary.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let status = request_json(
+        app.clone(),
+        runtime_request(Method::GET, "/api/run/status", Body::empty()).with_header(COOKIE, &cookie),
+    )
+    .await;
+    assert_eq!(status["state"], "paused");
+    assert_eq!(status["current_frame"].as_u64(), Some(frame_at_pause));
 }

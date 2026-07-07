@@ -2105,11 +2105,154 @@ async fn play_run(
     response
 }
 
-/// The continuous-play loop body (runs on a dedicated thread). Per frame: flush
-/// buffered input (scheduled for upcoming frames), advance exactly one frame, push
-/// it to `/ws/frames`, and publish `run_updated`. Exits when the stop flag is set
-/// (Pause/Stop) or on the first backend error (fault).
+/// SNES NTSC frame period (~60.0988 Hz). The base period matters, not just
+/// jitter: a plain 16.64ms tick drifts ~1 frame per ~12s of play.
+const PLAY_FRAME_PERIOD: std::time::Duration = std::time::Duration::from_nanos(16_639_263);
+/// How long one paced iteration waits for a frame before re-checking
+/// stop/TTL. Transient (the stream stays open across timeouts).
+const PLAY_STREAM_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+/// `run_updated` cadence while streaming: 60Hz boundary events would swamp
+/// `/ws/events` subscribers; the frame counter still rides `/ws/frames`.
+const PLAY_EVENT_THROTTLE: std::time::Duration = std::time::Duration::from_millis(250);
+/// If the pacer falls this far behind (stalled worker, debugger, laggy host),
+/// re-anchor the deadline instead of bursting frames to catch up.
+const PLAY_PACER_RESYNC: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The continuous-play loop body (runs on a dedicated thread).
+///
+/// Streaming path (default): one long worker run emits a frame per FRAME_MARK;
+/// this loop consumes it at a drift-free ~60.0988Hz pace, publishes each frame
+/// to `/ws/frames`, and throttles `run_updated` events. Stop/Pause cancel the
+/// stream, which parks the session Paused at a frame boundary.
+///
+/// Fallback path (`ROM_OPERATOR_BRIDGE_PLAY_STREAMING=false`, or a backend
+/// without a streaming surface): per frame, flush buffered input, advance
+/// exactly one captured frame, push it, publish `run_updated`.
 fn play_loop(
+    state: AppState,
+    session_id: String,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    if state.config.play_streaming() {
+        match state.backend.play_stream_start(session_id.clone()) {
+            Ok(handle) => return play_stream_loop(state, session_id, stop, handle),
+            // Backend has no streaming surface: fall through to the
+            // per-frame path.
+            Err(BackendError::NotImplemented { .. }) => {}
+            // Stream open failed (fault already recorded by the backend):
+            // surface the terminal state and tear down like a mid-loop fault.
+            Err(_) => {
+                publish_play_terminal_state(&state, &session_id);
+                let frames = state.play.frames_sender();
+                let _ = frames.send(None);
+                state.play.deregister(&session_id);
+                return;
+            }
+        }
+    }
+    play_step_loop(state, session_id, stop);
+}
+
+/// Streaming Play consumer: paced reads from a `PlayStreamSession`.
+fn play_stream_loop(
+    state: AppState,
+    session_id: String,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    mut handle: Box<dyn crate::backend::PlayStreamSession>,
+) {
+    use crate::backend::PlayStreamEvent;
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
+
+    let frames = state.play.frames_sender();
+    let mut next_tick = Instant::now();
+    let mut last_event: Option<Instant> = None;
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            // Pause/Stop path: cancel the stream (slot parks Paused at the
+            // current frame boundary, ≤1 frame latency). The transition
+            // handler publishes the resulting boundary; `backend.pause()` is
+            // an idempotent no-op once the session is already Paused, so no
+            // epoch-quantized worker Pause is ever dispatched here.
+            let _ = handle.stop();
+            break;
+        }
+        // TTL self-termination, same rationale as the per-frame loop.
+        if !state.auth.active_session_live() {
+            let _ = handle.stop();
+            let _ = frames.send(None);
+            state.play.deregister(&session_id);
+            break;
+        }
+        // Inputs buffered by `/ws/input` are injected while the run streams;
+        // the worker applies them at the next frame-hold (best-effort).
+        let _ = flush_pending_input(&state, &session_id);
+
+        // Drift-free pacing: absolute deadlines, advanced by the frame
+        // period. Not reading the stream faster than the tick is the primary
+        // pacing mechanism (the worker's bounded channel is the backstop).
+        let now = Instant::now();
+        if let Some(wait) = next_tick.checked_duration_since(now) {
+            std::thread::sleep(wait);
+        } else if now.duration_since(next_tick) > PLAY_PACER_RESYNC {
+            next_tick = now;
+        }
+        next_tick += PLAY_FRAME_PERIOD;
+
+        match handle.next_frame(PLAY_STREAM_READ_TIMEOUT) {
+            Ok(PlayStreamEvent::Frame(step)) => {
+                let _ = frames.send(Some(crate::play::frame_message(
+                    step.frame,
+                    &step.png_bytes,
+                )));
+                let throttled =
+                    last_event.is_some_and(|published| published.elapsed() < PLAY_EVENT_THROTTLE);
+                if !throttled {
+                    last_event = Some(Instant::now());
+                    publish_run_boundary_event(
+                        &state,
+                        &crate::backend::RunBoundary {
+                            session_id: session_id.clone(),
+                            state: crate::backend::SessionState::Playing,
+                            current_frame: step.frame,
+                            preview_stale: false,
+                        },
+                    );
+                }
+            }
+            // No frame within the read window: re-check stop/TTL and keep
+            // pacing (the missed ticks re-anchor via PLAY_PACER_RESYNC).
+            Ok(PlayStreamEvent::TimedOut) => continue,
+            // Terminal: the run ended (budget/fault/stream loss). Publish the
+            // final state and tear down exactly like a per-frame fault.
+            Ok(PlayStreamEvent::Ended { .. }) | Err(_) => {
+                publish_play_terminal_state(&state, &session_id);
+                let _ = frames.send(None);
+                state.play.deregister(&session_id);
+                break;
+            }
+        }
+    }
+}
+
+/// Surface the session's terminal state (if still resolvable) so the UI flips
+/// out of Playing; the final boundary event is always published on stop.
+fn publish_play_terminal_state(state: &AppState, session_id: &str) {
+    if let Ok(status) = state.backend.status(session_id.to_string()) {
+        publish_run_boundary_event(
+            state,
+            &crate::backend::RunBoundary {
+                session_id: session_id.to_string(),
+                state: status.state,
+                current_frame: status.current_frame,
+                preview_stale: status.preview_stale,
+            },
+        );
+    }
+}
+
+/// Per-frame Play fallback (B1 path): one captured Run per frame.
+fn play_step_loop(
     state: AppState,
     session_id: String,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,

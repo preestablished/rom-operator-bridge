@@ -34,6 +34,20 @@ use crate::{
 const REAL_WORKER_RPC_TIMEOUT: Duration = Duration::from_secs(15);
 const REAL_WORKER_REPLY_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Streaming-play tuning. The worker holds the vCPU at frame boundaries while
+/// the bridge is not reading, so a small channel is the pacing backstop; the
+/// bridge's 60Hz-paced reads are the primary mechanism.
+const PLAY_STREAM_CHANNEL_CAPACITY: usize = 2;
+/// Effectively "run until stopped": the play loop cancels the stream long
+/// before this budget elapses. Kept below u64::MAX so worker-side arithmetic
+/// on icount deltas can never overflow.
+const PLAY_STREAM_ICOUNT_BUDGET: u64 = 1 << 62;
+const PLAY_STREAM_SEND_RETRY: Duration = Duration::from_millis(2);
+/// After cancelling the stream, the worker parks the slot Paused at the next
+/// frame boundary; poll introspection until it lands.
+const PLAY_STREAM_STOP_POLL: Duration = Duration::from_millis(20);
+const PLAY_STREAM_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendMode {
@@ -317,6 +331,45 @@ pub trait BridgeBackend: Send + Sync {
     fn framebuffer(&self, session_id: SessionId) -> BackendResult<FramePreview>;
     fn trigger_capture(&self, request: CaptureRequest) -> BackendResult<CaptureJob>;
     fn capture_job(&self, job_id: CaptureJobId) -> BackendResult<CaptureJob>;
+    /// Open a streaming-play session: one long worker run that emits a frame
+    /// per FRAME_MARK, consumed by the Play loop at its own pace. Call after
+    /// [`play_start`](BridgeBackend::play_start). Backends without a streaming
+    /// path return `NotImplemented` and the Play loop falls back to per-frame
+    /// [`play_step`](BridgeBackend::play_step).
+    fn play_stream_start(
+        &self,
+        _session_id: SessionId,
+    ) -> BackendResult<Box<dyn PlayStreamSession>> {
+        Err(BackendError::NotImplemented {
+            operation: "play_stream_start",
+        })
+    }
+}
+
+/// One event delivered by a [`PlayStreamSession`].
+#[derive(Debug)]
+pub enum PlayStreamEvent {
+    /// A rendered frame, ready for `/ws/frames`.
+    Frame(PlayStepOutcome),
+    /// No frame arrived within the deadline. Transient: the caller re-checks
+    /// its stop conditions and keeps pacing.
+    TimedOut,
+    /// The worker run ended (terminal stop, stream close, or fault). The
+    /// session is no longer streaming; faults have already been recorded.
+    Ended { faulted: bool },
+}
+
+/// A live streaming-play session. `next_frame` blocks up to the given timeout
+/// for the next frame; `stop` cancels the stream and leaves the session Paused
+/// at a frame boundary (≤1 frame of latency), returning the resulting boundary.
+///
+/// `input_in_flight` semantics while a stream is open: frame delivery never
+/// sets it; `inject_input` still sets it for the duration of each InjectInputs
+/// RPC (the worker applies the input at the next frame-hold), and
+/// `play_stream_start` refuses to start while it is set.
+pub trait PlayStreamSession: Send {
+    fn next_frame(&mut self, timeout: Duration) -> BackendResult<PlayStreamEvent>;
+    fn stop(&mut self) -> BackendResult<RunBoundary>;
 }
 
 #[derive(Debug, Clone)]
@@ -682,6 +735,66 @@ impl BridgeBackend for SyntheticBackend {
             status: CaptureJobStatus::Pending,
             capture_id: None,
             public: None,
+        })
+    }
+
+    fn play_stream_start(
+        &self,
+        session_id: SessionId,
+    ) -> BackendResult<Box<dyn PlayStreamSession>> {
+        let inner = self.inner.lock().expect("synthetic backend mutex poisoned");
+        let session = inner
+            .active
+            .as_ref()
+            .filter(|session| session.session_id == session_id)
+            .ok_or(BackendError::BackendUnavailable)?;
+        if session.state != SessionState::Playing {
+            return Err(BackendError::BackendUnavailable);
+        }
+        Ok(Box::new(SyntheticPlayStreamSession {
+            backend: self.clone(),
+            session_id,
+        }))
+    }
+}
+
+/// Streaming adapter over the synthetic backend: one synthetic frame per
+/// `next_frame` call, so the streaming Play loop is testable without a worker.
+struct SyntheticPlayStreamSession {
+    backend: SyntheticBackend,
+    session_id: SessionId,
+}
+
+impl PlayStreamSession for SyntheticPlayStreamSession {
+    fn next_frame(&mut self, _timeout: Duration) -> BackendResult<PlayStreamEvent> {
+        match self.backend.play_step(self.session_id.clone()) {
+            Ok(step) => Ok(PlayStreamEvent::Frame(step)),
+            // The session left Playing (stop/fault raced the loop): the stream
+            // is over rather than broken.
+            Err(BackendError::BackendUnavailable) => Ok(PlayStreamEvent::Ended { faulted: false }),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn stop(&mut self) -> BackendResult<RunBoundary> {
+        let mut inner = self
+            .backend
+            .inner
+            .lock()
+            .expect("synthetic backend mutex poisoned");
+        let session = inner
+            .active
+            .as_mut()
+            .filter(|session| session.session_id == self.session_id)
+            .ok_or(BackendError::BackendUnavailable)?;
+        if session.state == SessionState::Playing {
+            session.state = SessionState::Paused;
+        }
+        Ok(RunBoundary {
+            session_id: self.session_id.clone(),
+            state: session.state,
+            current_frame: session.current_frame,
+            preview_stale: session.last_preview_frame < session.current_frame,
         })
     }
 }
@@ -1248,6 +1361,19 @@ impl BridgeBackend for RealBackend {
         if session.state == SessionState::Faulted || session.input_in_flight {
             return Err(BackendError::BackendUnavailable);
         }
+        // Already paused (e.g. a streaming Play teardown parked the slot at a
+        // frame boundary before this handler ran): pausing is idempotent, and
+        // dispatching a real worker Pause here could land on a Running slot
+        // mid-race and quantize to the next epoch (~1s of extra play).
+        if session.state == SessionState::Paused {
+            let inner = self.inner.lock().expect("real backend mutex poisoned");
+            let active = inner
+                .active
+                .as_ref()
+                .filter(|active| active.session_id == session.session_id)
+                .ok_or(BackendError::BackendUnavailable)?;
+            return Ok(active.boundary());
+        }
 
         let outcome = match self.worker.pause(session.lease.clone()) {
             Ok(outcome) => outcome,
@@ -1417,34 +1543,24 @@ impl BridgeBackend for RealBackend {
             active.clone()
         };
 
-        // Advance exactly one frame, then read the framebuffer. This is two
-        // worker RPCs (resume + framebuffer) rather than the plan's single
-        // `Run{frame_budget=1, capture=framebuffer}`; both go through the same
-        // serialized worker slot back-to-back with no other command interleaved
-        // (the loop is the sole caller during Playing), so the pair is
-        // equivalent to one captured Run and reuses the existing, tested
-        // resume/framebuffer paths. Folding into one captured Run is a possible
-        // later optimization to halve the per-frame round-trips.
-        let run_outcome = match self.worker.resume(session.lease.clone()) {
+        // Advance exactly one frame and capture its framebuffer in a single
+        // `Run{frame_budget=1, capture{framebuffer}}` RPC (one worker
+        // round-trip per frame). The `GetFramebuffer`-based `resume` path
+        // stays for non-Play uses (frame_counter, preview).
+        let outcome = match self.worker.run_one_frame_captured(session.lease.clone()) {
             Ok(outcome) => outcome,
             Err(error) => {
                 self.mark_faulted(&session);
                 return Err(error.into());
             }
         };
-        if run_outcome.faulted {
+        if outcome.faulted {
             self.mark_faulted(&session);
             return Err(BackendError::BackendUnavailable);
         }
 
-        // Read the framebuffer at the (paused) frame boundary.
-        let fb = match self.worker.framebuffer(session.lease.clone()) {
-            Ok(fb) => fb,
-            Err(error) => {
-                self.mark_faulted(&session);
-                return Err(error.into());
-            }
-        };
+        let decoded = decode_captured_framebuffer(&outcome.fb_lz4, &outcome.fb_info)
+            .inspect_err(|_| self.mark_faulted(&session))?;
 
         {
             let mut inner = self.inner.lock().expect("real backend mutex poisoned");
@@ -1453,9 +1569,9 @@ impl BridgeBackend for RealBackend {
                 .as_mut()
                 .filter(|active| active.session_id == session.session_id)
             {
-                active.current_icount = run_outcome.current_icount;
-                active.current_frame = fb.frame;
-                active.last_preview_frame = fb.frame;
+                active.current_icount = outcome.current_icount;
+                active.current_frame = decoded.frame;
+                active.last_preview_frame = decoded.frame;
                 active.frame_base_known = true;
                 active.preview_stale = false;
             }
@@ -1463,10 +1579,10 @@ impl BridgeBackend for RealBackend {
 
         Ok(PlayStepOutcome {
             session_id,
-            frame: fb.frame,
-            width: fb.width,
-            height: fb.height,
-            png_bytes: fb.png_bytes,
+            frame: decoded.frame,
+            width: decoded.width,
+            height: decoded.height,
+            png_bytes: decoded.png_bytes,
         })
     }
 
@@ -1835,6 +1951,171 @@ impl BridgeBackend for RealBackend {
             .map(RealCaptureJobState::capture_job)
             .ok_or(BackendError::BackendUnavailable)
     }
+
+    fn play_stream_start(
+        &self,
+        session_id: SessionId,
+    ) -> BackendResult<Box<dyn PlayStreamSession>> {
+        let session = {
+            let inner = self.inner.lock().expect("real backend mutex poisoned");
+            let active = inner
+                .active
+                .as_ref()
+                .filter(|active| active.session_id == session_id)
+                .ok_or(BackendError::BackendUnavailable)?;
+            // Precondition mirrors play_step: Playing, and no input RPC racing
+            // the stream open (a fallback stop/inject/restart cycle owns the
+            // slot while input_in_flight is set).
+            if active.state != SessionState::Playing || active.input_in_flight {
+                return Err(BackendError::BackendUnavailable);
+            }
+            active.clone()
+        };
+
+        let stream = match self.worker.play_stream_open(session.lease.clone()) {
+            Ok(stream) => stream,
+            Err(error) => {
+                self.mark_faulted(&session);
+                return Err(error.into());
+            }
+        };
+        Ok(Box::new(RealPlayStreamSession {
+            backend: self.clone(),
+            session,
+            stream,
+            ended: false,
+        }))
+    }
+}
+
+/// A live worker frame-capture stream feeding the Play loop. Frames arrive on
+/// a bounded channel from the worker thread's streaming task; the command lane
+/// stays free for Status/Stop/InjectInputs while this is open.
+struct RealPlayStreamSession {
+    backend: RealBackend,
+    session: RealSession,
+    stream: RealPlayStream,
+    ended: bool,
+}
+
+impl PlayStreamSession for RealPlayStreamSession {
+    fn next_frame(&mut self, timeout: Duration) -> BackendResult<PlayStreamEvent> {
+        if self.ended {
+            return Ok(PlayStreamEvent::Ended { faulted: false });
+        }
+        match self.stream.frames.recv_timeout(timeout) {
+            Ok(RealStreamEvent::Frame(frame)) => {
+                let fb_info = frame.fb_info.ok_or_else(|| {
+                    self.backend.mark_faulted(&self.session);
+                    BackendError::BackendUnavailable
+                })?;
+                let decoded = decode_captured_framebuffer(&frame.fb_lz4, &fb_info)
+                    .inspect_err(|_| self.backend.mark_faulted(&self.session))?;
+                {
+                    let mut inner = self
+                        .backend
+                        .inner
+                        .lock()
+                        .expect("real backend mutex poisoned");
+                    if let Some(active) = inner
+                        .active
+                        .as_mut()
+                        .filter(|active| active.session_id == self.session.session_id)
+                    {
+                        active.current_icount = frame.icount;
+                        active.current_frame = decoded.frame;
+                        active.last_preview_frame = decoded.frame;
+                        active.frame_base_known = true;
+                        active.preview_stale = false;
+                    }
+                }
+                Ok(PlayStreamEvent::Frame(PlayStepOutcome {
+                    session_id: self.session.session_id.clone(),
+                    frame: decoded.frame,
+                    width: decoded.width,
+                    height: decoded.height,
+                    png_bytes: decoded.png_bytes,
+                }))
+            }
+            Ok(RealStreamEvent::Ended { faulted }) => {
+                self.ended = true;
+                if faulted {
+                    self.backend.mark_faulted(&self.session);
+                }
+                Ok(PlayStreamEvent::Ended { faulted })
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(PlayStreamEvent::TimedOut),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // The streaming task died without a terminal event.
+                self.ended = true;
+                self.backend.mark_faulted(&self.session);
+                Ok(PlayStreamEvent::Ended { faulted: true })
+            }
+        }
+    }
+
+    fn stop(&mut self) -> BackendResult<RunBoundary> {
+        let _ = self.stream.cancel.send(true);
+        // Drain anything already delivered so a buffered terminal fault is not
+        // lost; the cancel above stops further production.
+        while let Ok(event) = self.stream.frames.try_recv() {
+            if let RealStreamEvent::Ended { faulted: true } = event {
+                self.backend.mark_faulted(&self.session);
+            }
+        }
+
+        // The worker parks the slot Paused at the next frame boundary once the
+        // cancel lands; introspection fails FailedPrecondition until then.
+        let deadline = std::time::Instant::now() + PLAY_STREAM_STOP_TIMEOUT;
+        let outcome = loop {
+            match self
+                .backend
+                .worker
+                .frame_counter(self.session.lease.clone())
+            {
+                Ok(outcome) => break outcome,
+                Err(RealWorkerFailure::FailedPrecondition)
+                    if std::time::Instant::now() < deadline =>
+                {
+                    thread::sleep(PLAY_STREAM_STOP_POLL);
+                }
+                Err(error) => {
+                    self.backend.mark_faulted(&self.session);
+                    return Err(error.into());
+                }
+            }
+        };
+
+        let (boundary, transitioned) = {
+            let mut inner = self
+                .backend
+                .inner
+                .lock()
+                .expect("real backend mutex poisoned");
+            let active = inner
+                .active
+                .as_mut()
+                .filter(|active| active.session_id == self.session.session_id)
+                .ok_or(BackendError::BackendUnavailable)?;
+            let transitioned = active.state == SessionState::Playing;
+            if transitioned {
+                active.state = SessionState::Paused;
+            }
+            active.current_frame = outcome.frame;
+            active.current_icount = outcome.icount;
+            active.frame_base_known = true;
+            active.preview_stale = active.last_preview_frame < active.current_frame;
+            (active.boundary(), transitioned)
+        };
+        if transitioned {
+            let _ = self.backend.append_real_event(
+                &self.session.run_id,
+                "session_paused",
+                "real backend session paused",
+            );
+        }
+        Ok(boundary)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -2027,6 +2308,22 @@ impl RealWorkerThread {
             .map_err(|_| RealWorkerFailure::BackendUnavailable)?;
         recv_worker_reply(rx)
     }
+
+    fn run_one_frame_captured(&self, lease: dh::Lease) -> RealWorkerResult<RealCapturedRunOutcome> {
+        let (reply, rx) = mpsc::channel();
+        self.tx
+            .send(RealWorkerCommand::RunFrameCaptured { lease, reply })
+            .map_err(|_| RealWorkerFailure::BackendUnavailable)?;
+        recv_worker_reply(rx)
+    }
+
+    fn play_stream_open(&self, lease: dh::Lease) -> RealWorkerResult<RealPlayStream> {
+        let (reply, rx) = mpsc::channel();
+        self.tx
+            .send(RealWorkerCommand::PlayStreamOpen { lease, reply })
+            .map_err(|_| RealWorkerFailure::BackendUnavailable)?;
+        recv_worker_reply(rx)
+    }
 }
 
 type RealWorkerResult<T> = Result<T, RealWorkerFailure>;
@@ -2076,6 +2373,19 @@ enum RealWorkerCommand {
         lease: dh::Lease,
         capture_spec: dh::CaptureSpec,
         reply: mpsc::Sender<RealWorkerResult<RealCaptureOutcome>>,
+    },
+    /// One frame advanced and captured in a single Run RPC (Play fast path).
+    RunFrameCaptured {
+        lease: dh::Lease,
+        reply: mpsc::Sender<RealWorkerResult<RealCapturedRunOutcome>>,
+    },
+    /// Open a `RunWithFrameCapture` stream. The stream gets its own lane — a
+    /// task on the worker runtime forwards frames into the returned channel —
+    /// so this command loop stays responsive for every other RPC while a
+    /// stream is open.
+    PlayStreamOpen {
+        lease: dh::Lease,
+        reply: mpsc::Sender<RealWorkerResult<RealPlayStream>>,
     },
 }
 
@@ -2142,6 +2452,28 @@ struct RealFrameCounterOutcome {
 
 struct RealInjectInputOutcome {
     scheduled: u32,
+}
+
+/// Outcome of a single `Run{frame_budget=1, capture{framebuffer}}`.
+struct RealCapturedRunOutcome {
+    faulted: bool,
+    current_icount: u64,
+    fb_lz4: Vec<u8>,
+    fb_info: dh::FbInfo,
+}
+
+/// One event forwarded from the worker's frame-capture stream.
+enum RealStreamEvent {
+    Frame(dh::CapturedFrame),
+    Ended { faulted: bool },
+}
+
+/// The bridge-side end of an open frame-capture stream: a bounded frame
+/// channel (the backstop pacing mechanism) plus an out-of-band cancel that
+/// bypasses the command lane entirely.
+struct RealPlayStream {
+    frames: mpsc::Receiver<RealStreamEvent>,
+    cancel: tokio::sync::watch::Sender<bool>,
 }
 
 struct RealCaptureOutcome {
@@ -2237,6 +2569,98 @@ fn run_real_worker_thread(
                     state.capture(lease, capture_spec),
                 ));
             }
+            RealWorkerCommand::RunFrameCaptured { lease, reply } => {
+                let _ = reply.send(run_worker_future(
+                    &runtime,
+                    state.run_one_frame_captured(lease),
+                ));
+            }
+            RealWorkerCommand::PlayStreamOpen { lease, reply } => {
+                // Only the stream *open* runs on the command lane (bounded by
+                // the RPC timeout); consumption moves to its own task so the
+                // loop keeps servicing commands for the whole play session.
+                let result = run_worker_future(&runtime, state.play_stream_open(lease));
+                let _ = reply.send(result.map(|stream| {
+                    let (frames_tx, frames_rx) = mpsc::sync_channel(PLAY_STREAM_CHANNEL_CAPACITY);
+                    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+                    runtime.spawn(consume_play_stream(stream, frames_tx, cancel_rx));
+                    RealPlayStream {
+                        frames: frames_rx,
+                        cancel: cancel_tx,
+                    }
+                }));
+            }
+        }
+    }
+}
+
+/// Forward worker frame-capture events into the bounded bridge channel until
+/// the stream ends or the bridge cancels. Dropping the stream on exit cancels
+/// the RPC, which makes the worker park the slot Paused at the next frame
+/// boundary.
+async fn consume_play_stream(
+    mut stream: tonic::Streaming<dh::FrameCaptureEvent>,
+    frames: mpsc::SyncSender<RealStreamEvent>,
+    mut cancel: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        let message = tokio::select! {
+            _ = cancel.changed() => return,
+            message = stream.message() => message,
+        };
+        let event = match message {
+            Ok(Some(event)) => event,
+            Ok(None) => {
+                forward_stream_event(&frames, RealStreamEvent::Ended { faulted: false }, &cancel)
+                    .await;
+                return;
+            }
+            Err(status) => {
+                log_worker_rpc_failure("RunWithFrameCapture", &status);
+                forward_stream_event(&frames, RealStreamEvent::Ended { faulted: true }, &cancel)
+                    .await;
+                return;
+            }
+        };
+        match event.msg {
+            Some(dh::frame_capture_event::Msg::Frame(frame)) => {
+                if !forward_stream_event(&frames, RealStreamEvent::Frame(frame), &cancel).await {
+                    return;
+                }
+            }
+            Some(dh::frame_capture_event::Msg::Done(done)) => {
+                let reason = dh::StopReason::try_from(done.reason)
+                    .unwrap_or(dh::StopReason::StopUnspecified);
+                let faulted = reason == dh::StopReason::Faulted;
+                forward_stream_event(&frames, RealStreamEvent::Ended { faulted }, &cancel).await;
+                return;
+            }
+            None => {}
+        }
+    }
+}
+
+/// Push one event into the bounded channel without blocking the (single)
+/// runtime worker thread: retry-with-sleep keeps the timer/IO driver live, and
+/// a full channel is exactly the backpressure that holds the worker's vCPU at
+/// a frame boundary. Returns false when delivery is impossible (cancelled or
+/// receiver dropped).
+async fn forward_stream_event(
+    frames: &mpsc::SyncSender<RealStreamEvent>,
+    mut event: RealStreamEvent,
+    cancel: &tokio::sync::watch::Receiver<bool>,
+) -> bool {
+    loop {
+        if *cancel.borrow() {
+            return false;
+        }
+        match frames.try_send(event) {
+            Ok(()) => return true,
+            Err(mpsc::TrySendError::Full(back)) => {
+                event = back;
+                tokio::time::sleep(PLAY_STREAM_SEND_RETRY).await;
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => return false,
         }
     }
 }
@@ -2279,6 +2703,12 @@ fn reply_unavailable(command: RealWorkerCommand) {
             let _ = reply.send(Err(RealWorkerFailure::BackendUnavailable));
         }
         RealWorkerCommand::Capture { reply, .. } => {
+            let _ = reply.send(Err(RealWorkerFailure::BackendUnavailable));
+        }
+        RealWorkerCommand::RunFrameCaptured { reply, .. } => {
+            let _ = reply.send(Err(RealWorkerFailure::BackendUnavailable));
+        }
+        RealWorkerCommand::PlayStreamOpen { reply, .. } => {
             let _ = reply.send(Err(RealWorkerFailure::BackendUnavailable));
         }
     }
@@ -2549,6 +2979,76 @@ impl RealWorkerState {
         })
     }
 
+    async fn run_one_frame_captured(
+        &mut self,
+        lease: dh::Lease,
+    ) -> RealWorkerResult<RealCapturedRunOutcome> {
+        let response = self
+            .client()
+            .await?
+            .run(dh::RunRequest {
+                lease: Some(lease),
+                hard_icount_cap: 0,
+                capture: Some(dh::CaptureSpec {
+                    ranges: Vec::new(),
+                    framebuffer: true,
+                }),
+                until: Some(dh::run_request::Until::FrameBudget(1)),
+            })
+            .await
+            .map_err(|status| {
+                log_worker_rpc_failure("Run", &status);
+                RealWorkerFailure::BackendUnavailable
+            })?
+            .into_inner();
+        let reason =
+            dh::StopReason::try_from(response.reason).unwrap_or(dh::StopReason::StopUnspecified);
+        if reason == dh::StopReason::Faulted {
+            return Ok(RealCapturedRunOutcome {
+                faulted: true,
+                current_icount: response.icount,
+                fb_lz4: Vec::new(),
+                fb_info: dh::FbInfo::default(),
+            });
+        }
+        let fb_info = response.fb_info.ok_or_else(|| {
+            tracing::warn!("captured run response missing fb_info");
+            RealWorkerFailure::BackendUnavailable
+        })?;
+        if response.fb_lz4.is_empty() {
+            tracing::warn!("captured run response missing framebuffer payload");
+            return Err(RealWorkerFailure::BackendUnavailable);
+        }
+        Ok(RealCapturedRunOutcome {
+            faulted: false,
+            current_icount: response.icount,
+            fb_lz4: response.fb_lz4,
+            fb_info,
+        })
+    }
+
+    async fn play_stream_open(
+        &mut self,
+        lease: dh::Lease,
+    ) -> RealWorkerResult<tonic::Streaming<dh::FrameCaptureEvent>> {
+        let response = self
+            .client()
+            .await?
+            .run_with_frame_capture(dh::RunWithFrameCaptureRequest {
+                lease: Some(lease),
+                until: Some(dh::run_with_frame_capture_request::Until::IcountBudget(
+                    PLAY_STREAM_ICOUNT_BUDGET,
+                )),
+                hard_icount_cap: 0,
+            })
+            .await
+            .map_err(|status| {
+                log_worker_rpc_failure("RunWithFrameCapture", &status);
+                worker_failure_from_status(status)
+            })?;
+        Ok(response.into_inner())
+    }
+
     async fn capture(
         &mut self,
         lease: dh::Lease,
@@ -2697,6 +3197,50 @@ fn framebuffer_pixel_format_name(format: i32) -> BackendResult<&'static str> {
             Err(BackendError::BackendUnavailable)
         }
     }
+}
+
+struct DecodedFramebuffer {
+    frame: FrameCounter,
+    width: u32,
+    height: u32,
+    png_bytes: Vec<u8>,
+}
+
+/// Decode a worker `fb_lz4` framebuffer (lz4 block with prepended size, the
+/// same format on Run captures and TakeSnapshot captures) into the `/ws/frames`
+/// PNG. Geometry is validated first so unexpected dimensions surface as a
+/// clean error rather than a panic.
+fn decode_captured_framebuffer(
+    fb_lz4: &[u8],
+    fb_info: &dh::FbInfo,
+) -> BackendResult<DecodedFramebuffer> {
+    let pixels = lz4_flex::decompress_size_prepended(fb_lz4).map_err(|_| {
+        tracing::warn!("captured framebuffer lz4 decompress failed");
+        BackendError::BackendUnavailable
+    })?;
+    validate_framebuffer_geometry(fb_info, pixels.len() as u64)?;
+    let png_bytes = framebuffer_png(RawFramebuffer {
+        width: fb_info.width,
+        height: fb_info.height,
+        stride: fb_info.stride,
+        format: RawFramebufferFormat::Xrgb8888,
+        pixels: &pixels,
+    })
+    .map_err(|_| {
+        tracing::warn!(
+            width = fb_info.width,
+            height = fb_info.height,
+            stride = fb_info.stride,
+            "captured framebuffer png encode failed"
+        );
+        BackendError::BackendUnavailable
+    })?;
+    Ok(DecodedFramebuffer {
+        frame: u64::from(fb_info.frame_counter),
+        width: fb_info.width,
+        height: fb_info.height,
+        png_bytes,
+    })
 }
 
 fn validate_framebuffer_geometry(fb_info: &dh::FbInfo, uncompressed_len: u64) -> BackendResult<()> {

@@ -12,6 +12,11 @@ pub const DEFAULT_BIND_ADDR: &str = "10.0.0.106:7410";
 pub const DEFAULT_PUBLIC_ORIGIN: &str = "https://rombridge.birb.homes";
 pub const DEFAULT_BACKEND_MODE: BackendMode = BackendMode::Synthetic;
 pub const ENV_BIND_ADDR: &str = "ROM_OPERATOR_BRIDGE_BIND_ADDR";
+/// Rollback toggle for the streaming Play path (B2): `false` selects the
+/// per-frame captured-Run path (B1) at `play_run` time. Committed default is
+/// streaming; keep the toggle for at least one release after soak.
+pub const ENV_PLAY_STREAMING: &str = "ROM_OPERATOR_BRIDGE_PLAY_STREAMING";
+pub const DEFAULT_PLAY_STREAMING: bool = true;
 pub const ENV_BACKEND_MODE: &str = "ROM_OPERATOR_BRIDGE_BACKEND";
 pub const ENV_PUBLIC_ORIGIN: &str = "ROM_OPERATOR_BRIDGE_PUBLIC_ORIGIN";
 pub const ENV_ALLOWED_ORIGINS: &str = "ROM_OPERATOR_BRIDGE_ALLOWED_ORIGINS";
@@ -26,6 +31,7 @@ pub struct ServiceConfig {
     service_version: String,
     private_config: private_config::BridgePrivateConfig,
     deployment_security: DeploymentSecurityConfig,
+    play_streaming: bool,
 }
 
 impl ServiceConfig {
@@ -63,6 +69,11 @@ impl ServiceConfig {
         let private_config =
             private_config::BridgePrivateConfig::from_values(&values, backend_mode)?;
         let deployment_security = DeploymentSecurityConfig::from_values(&values)?;
+        let play_streaming = values
+            .get(ENV_PLAY_STREAMING)
+            .map(|value| parse_bool(ENV_PLAY_STREAMING, value))
+            .transpose()?
+            .unwrap_or(DEFAULT_PLAY_STREAMING);
 
         Ok(Self {
             bind_addr,
@@ -70,6 +81,7 @@ impl ServiceConfig {
             service_version: env!("CARGO_PKG_VERSION").to_string(),
             private_config,
             deployment_security,
+            play_streaming,
         })
     }
 
@@ -80,6 +92,7 @@ impl ServiceConfig {
             service_version: env!("CARGO_PKG_VERSION").to_string(),
             private_config: private_config::BridgePrivateConfig::placeholder(),
             deployment_security: DeploymentSecurityConfig::default(),
+            play_streaming: DEFAULT_PLAY_STREAMING,
         }
     }
 
@@ -89,6 +102,10 @@ impl ServiceConfig {
 
     pub const fn backend_mode(&self) -> BackendMode {
         self.backend_mode
+    }
+
+    pub const fn play_streaming(&self) -> bool {
+        self.play_streaming
     }
 
     pub fn service_version(&self) -> &str {

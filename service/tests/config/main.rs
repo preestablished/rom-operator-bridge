@@ -2,7 +2,8 @@ use rom_operator_bridge_service::{
     backend::BackendMode,
     config::{
         ConfigError, ENV_ALLOWED_ORIGINS, ENV_BACKEND_MODE, ENV_BIND_ADDR, ENV_COOKIE_SECURE,
-        ENV_DEPLOYMENT_PROFILES, ENV_EXPOSURE_MODE, ENV_PUBLIC_ORIGIN, ServiceConfig,
+        ENV_DEPLOYMENT_PROFILES, ENV_EXPOSURE_MODE, ENV_PLAY_STREAMING, ENV_PUBLIC_ORIGIN,
+        ServiceConfig,
     },
     private_config::{
         ENV_CAPTURE_SPEC_REF, ENV_CONFIG_FILE, ENV_CREATE_VM_CONFIG_REF, ENV_HYPERVISOR_ENDPOINT,
@@ -910,4 +911,29 @@ fn mode(path: &PathBuf) -> u32 {
         .permissions()
         .mode()
         & 0o777
+}
+
+#[test]
+fn play_streaming_toggle_defaults_on_and_parses_booleans() {
+    let default_config =
+        ServiceConfig::from_pairs([(ENV_BIND_ADDR, "127.0.0.1:0")]).expect("config loads");
+    assert!(default_config.play_streaming());
+
+    let disabled = ServiceConfig::from_pairs([
+        (ENV_BIND_ADDR, "127.0.0.1:0"),
+        (ENV_PLAY_STREAMING, "false"),
+    ])
+    .expect("config with toggle loads");
+    assert!(!disabled.play_streaming());
+
+    let invalid = ServiceConfig::from_pairs([
+        (ENV_BIND_ADDR, "127.0.0.1:0"),
+        (ENV_PLAY_STREAMING, "sometimes"),
+    ]);
+    assert!(matches!(
+        invalid,
+        Err(ConfigError::InvalidBoolean {
+            env: ENV_PLAY_STREAMING
+        })
+    ));
 }

@@ -189,7 +189,10 @@ mod tests {
         controller.register("s1".into(), stop.clone(), stoppable_thread(stop.clone()));
 
         controller.stop("s2");
-        assert!(controller.is_playing("s1"), "wrong session must not be stopped");
+        assert!(
+            controller.is_playing("s1"),
+            "wrong session must not be stopped"
+        );
         assert!(!stop.load(Ordering::SeqCst));
 
         controller.stop_any();

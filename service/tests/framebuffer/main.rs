@@ -126,3 +126,42 @@ fn route_facing_framebuffer_png_requires_runtime_schema_dimensions() {
     .expect("runtime schema dimensions convert");
     assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
 }
+
+#[test]
+fn lz4_captured_framebuffer_round_trips_to_the_same_png() {
+    // Worker Run captures ship the framebuffer as an lz4 block with a
+    // prepended size (`compress_prepend_size`); the decoded pixels must feed
+    // the PNG encoder identically to the uncompressed path.
+    let width = SYNTHETIC_FRAME_WIDTH;
+    let height = SYNTHETIC_FRAME_HEIGHT;
+    let stride = width * 4;
+    let mut pixels = Vec::with_capacity((stride * height) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            pixels.push(y as u8);
+            pixels.push((x ^ y) as u8);
+            pixels.push(x as u8);
+            pixels.push(0xaa);
+        }
+    }
+
+    let compressed = lz4_flex::compress_prepend_size(&pixels);
+    let decompressed =
+        lz4_flex::decompress_size_prepended(&compressed).expect("lz4 block decompresses");
+    assert_eq!(decompressed, pixels);
+
+    let raw = |bytes: &[u8]| {
+        framebuffer_png(RawFramebuffer {
+            width,
+            height,
+            stride,
+            format: RawFramebufferFormat::Xrgb8888,
+            pixels: bytes,
+        })
+        .expect("framebuffer converts")
+    };
+    let direct = raw(&pixels);
+    let via_lz4 = raw(&decompressed);
+    assert_eq!(direct, via_lz4);
+    assert!(direct.starts_with(b"\x89PNG\r\n\x1a\n"));
+}

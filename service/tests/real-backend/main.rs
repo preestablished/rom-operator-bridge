@@ -15,7 +15,7 @@ use rom_operator_bridge_service::{
     auth::ALLOWED_ORIGIN,
     backend::{
         BackendCapabilities, BackendError, BridgeBackend, CaptureJobStatus, CaptureRequest,
-        InputScheduleRequest, RealBackend, SessionState, StartBackendSession,
+        InputScheduleRequest, PlayStreamEvent, RealBackend, SessionState, StartBackendSession,
     },
     config::{ENV_BACKEND_MODE, ServiceConfig},
     input::{PadButton, PadLog, PadWord},
@@ -202,7 +202,10 @@ async fn real_restore_snapshot_lifecycle_calls_worker_and_stays_sanitized() {
     assert_eq!(snapshot_hash, vec![0x11; 32]);
     let calls = worker.calls();
     assert!(calls.iter().any(|call| *call == "watch_slots"));
-    assert!(calls.iter().any(|call| *call == "pause"));
+    // The restored session is already Paused, so the API pause is idempotent
+    // bookkeeping: no worker Pause RPC is dispatched (it could otherwise race
+    // a streaming teardown and quantize to the next epoch).
+    assert!(!calls.iter().any(|call| *call == "pause"));
     assert!(calls.iter().any(|call| *call == "run"));
     assert!(calls.iter().any(|call| *call == "list_slots"));
     assert!(calls.iter().any(|call| *call == "destroy_vm"));
@@ -1612,6 +1615,158 @@ async fn real_stop_destroy_failure_clears_public_session_with_sanitized_error() 
     assert_eq!(status.status(), StatusCode::UNAUTHORIZED);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_play_step_advances_via_single_captured_run() {
+    let workspace = tempfile::tempdir().expect("tempdir creates");
+    let private_root = workspace.path().join("bridge-private");
+    let reference_checkout = workspace.path().join("reference-workload");
+    let worker = MockWorker::new();
+    let server = WorkerServer::start(worker.clone()).await;
+    let config = real_config_with_start(
+        &private_root,
+        &reference_checkout,
+        &format!("unix://{}", server.uds_path.display()),
+        Some((ENV_REAL_SNAPSHOT_REF, SNAPSHOT_REF.to_string())),
+    );
+    let backend = real_backend_from_config(&config);
+
+    let steps = tokio::task::spawn_blocking(move || {
+        let session = backend
+            .start_session(StartBackendSession {
+                requested_capabilities: BackendCapabilities::real_input_preview_mvp(),
+            })
+            .expect("real session starts");
+        backend
+            .play_start(session.session_id.clone())
+            .expect("play starts");
+        let first = backend
+            .play_step(session.session_id.clone())
+            .expect("first play step");
+        let second = backend
+            .play_step(session.session_id.clone())
+            .expect("second play step");
+        let status = backend
+            .status(session.session_id.clone())
+            .expect("status after play steps");
+        (first, second, status)
+    })
+    .await
+    .expect("play steps run");
+
+    // The restored session starts at frame 12; each captured Run advances one.
+    assert_eq!(steps.0.frame, 13);
+    assert_eq!(steps.1.frame, 14);
+    assert_eq!(steps.0.width, 256);
+    assert_eq!(steps.0.height, 224);
+    assert!(!steps.0.png_bytes.is_empty());
+    assert_ne!(steps.0.png_bytes, steps.1.png_bytes);
+    assert_eq!(steps.2.current_frame, 14);
+    assert_eq!(steps.2.state, SessionState::Playing);
+
+    // One worker round-trip per frame: the Run carries the framebuffer, so no
+    // GetFramebuffer is ever dispatched on the Play path.
+    let calls = worker.calls();
+    assert_eq!(calls.iter().filter(|call| **call == "run").count(), 2);
+    assert!(
+        !calls.iter().any(|call| *call == "get_framebuffer"),
+        "play_step must not issue a separate GetFramebuffer: {calls:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_streaming_play_keeps_commands_responsive_and_stops_without_pause_rpc() {
+    let workspace = tempfile::tempdir().expect("tempdir creates");
+    let private_root = workspace.path().join("bridge-private");
+    let reference_checkout = workspace.path().join("reference-workload");
+    let worker = MockWorker::new();
+    let server = WorkerServer::start(worker.clone()).await;
+    let config = real_config_with_start(
+        &private_root,
+        &reference_checkout,
+        &format!("unix://{}", server.uds_path.display()),
+        Some((ENV_REAL_SNAPSHOT_REF, SNAPSHOT_REF.to_string())),
+    );
+    let backend = real_backend_from_config(&config);
+
+    let session_id = tokio::task::spawn_blocking(move || {
+        let session = backend
+            .start_session(StartBackendSession {
+                requested_capabilities: BackendCapabilities::real_input_preview_mvp(),
+            })
+            .expect("real session starts");
+        backend
+            .play_start(session.session_id.clone())
+            .expect("play starts");
+        let mut stream = backend
+            .play_stream_start(session.session_id.clone())
+            .expect("frame stream opens");
+
+        let mut frames = Vec::new();
+        while frames.len() < 3 {
+            match stream
+                .next_frame(std::time::Duration::from_secs(5))
+                .expect("next streamed frame")
+            {
+                PlayStreamEvent::Frame(step) => {
+                    assert!(!step.png_bytes.is_empty());
+                    frames.push(step.frame);
+                }
+                PlayStreamEvent::TimedOut => continue,
+                PlayStreamEvent::Ended { faulted } => {
+                    panic!("stream ended early (faulted: {faulted})")
+                }
+            }
+        }
+        assert!(
+            frames.windows(2).all(|pair| pair[1] > pair[0]),
+            "frame counters must be monotonic: {frames:?}"
+        );
+
+        // B2.0: the command lane must stay responsive while the stream is
+        // open (a stream dispatched as an ordinary command would park every
+        // other RPC behind it for the whole session).
+        let started = std::time::Instant::now();
+        let status = backend
+            .status(session.session_id.clone())
+            .expect("status while streaming");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "status must not queue behind the open stream"
+        );
+        assert_eq!(status.state, SessionState::Playing);
+        assert!(status.current_frame >= frames[0]);
+
+        // Stop cancels the stream and parks the session Paused at a frame
+        // boundary.
+        let boundary = stream.stop().expect("stream stops");
+        assert_eq!(boundary.state, SessionState::Paused);
+        assert!(boundary.current_frame >= *frames.last().expect("frames observed"));
+
+        // Pause after a streaming teardown is idempotent bookkeeping only.
+        let paused = backend
+            .pause(session.session_id.clone())
+            .expect("pause after streaming stop");
+        assert_eq!(paused.state, SessionState::Paused);
+        session.session_id
+    })
+    .await
+    .expect("streaming session runs");
+    drop(session_id);
+
+    let calls = worker.calls();
+    assert!(
+        calls.iter().any(|call| *call == "run_with_frame_capture"),
+        "streaming play must open RunWithFrameCapture: {calls:?}"
+    );
+    // The plan's pause-vs-stream race: stopping a streamed session must never
+    // dispatch a worker Pause (which is epoch-quantized), in the teardown or
+    // in the API-level pause that follows it.
+    assert!(
+        !calls.iter().any(|call| *call == "pause"),
+        "no worker Pause RPC may be dispatched on the streaming path: {calls:?}"
+    );
+}
+
 fn real_config(private_root: &Path, reference_checkout: &PathBuf) -> ServiceConfig {
     real_config_with_start(
         private_root,
@@ -2036,6 +2191,7 @@ struct MockWorkerState {
     framebuffer_status: Option<tonic::Code>,
     framebuffer_response: dh::GetFramebufferResponse,
     icount: u64,
+    frame_counter: u32,
 }
 
 impl Default for MockWorkerState {
@@ -2057,6 +2213,7 @@ impl Default for MockWorkerState {
             framebuffer_status: None,
             framebuffer_response: MockWorker::framebuffer_response(12, 0),
             icount: 0,
+            frame_counter: 12,
         }
     }
 }
@@ -2113,6 +2270,33 @@ impl MockWorker {
             icount,
             pixels,
         }
+    }
+
+    /// A 256x224 XRGB8888 framebuffer in the worker's `fb_lz4` wire format
+    /// (lz4 block with prepended size), varying with the frame counter.
+    fn captured_framebuffer(frame_counter: u32) -> (Vec<u8>, dh::FbInfo) {
+        let width = 256_u32;
+        let height = 224_u32;
+        let stride = width * 4;
+        let mut pixels = Vec::with_capacity((stride * height) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                pixels.push((y as u8).wrapping_add(frame_counter as u8));
+                pixels.push((x ^ y) as u8);
+                pixels.push(x as u8);
+                pixels.push(0xaa);
+            }
+        }
+        (
+            lz4_flex::compress_prepend_size(&pixels),
+            dh::FbInfo {
+                width,
+                height,
+                stride,
+                format: dh::PixelFormat::Xrgb8888 as i32,
+                frame_counter,
+            },
+        )
     }
 
     fn take_snapshot_response() -> dh::TakeSnapshotResponse {
@@ -2225,8 +2409,9 @@ impl HypervisorWorker for MockWorker {
 
     async fn run(
         &self,
-        _request: TonicRequest<dh::RunRequest>,
+        request: TonicRequest<dh::RunRequest>,
     ) -> Result<TonicResponse<dh::RunResponse>, Status> {
+        let request = request.into_inner();
         let mut state = self.state.lock().expect("mock worker mutex poisoned");
         state.calls.push("run");
         if let Some(code) = state.run_status {
@@ -2238,6 +2423,15 @@ impl HypervisorWorker for MockWorker {
         state.icount = state.icount.saturating_add(11);
         let icount = state.icount;
         state.active_slot = Some(Self::active_slot(icount));
+        // A captured frame-budget Run (the Play fast path) returns the
+        // framebuffer inline; a plain Run does not.
+        let (fb_lz4, fb_info) = if request.capture.is_some_and(|capture| capture.framebuffer) {
+            state.frame_counter += 1;
+            let (fb_lz4, fb_info) = Self::captured_framebuffer(state.frame_counter);
+            (fb_lz4, Some(fb_info))
+        } else {
+            (Vec::new(), None)
+        };
         Ok(TonicResponse::new(dh::RunResponse {
             reason: dh::StopReason::BudgetReached as i32,
             icount,
@@ -2246,8 +2440,8 @@ impl HypervisorWorker for MockWorker {
             frames_elapsed: 1,
             sdk_event: None,
             feature_bytes: Vec::new(),
-            fb_lz4: Vec::new(),
-            fb_info: None,
+            fb_lz4,
+            fb_info,
         }))
     }
 
@@ -2335,7 +2529,39 @@ impl HypervisorWorker for MockWorker {
         &self,
         _request: TonicRequest<dh::RunWithFrameCaptureRequest>,
     ) -> Result<TonicResponse<Self::RunWithFrameCaptureStream>, Status> {
-        Err(Status::unimplemented("not used by bridge bp8"))
+        let start_frame = {
+            let mut state = self.state.lock().expect("mock worker mutex poisoned");
+            state.calls.push("run_with_frame_capture");
+            state.frame_counter
+        };
+        // Emit frames until the bridge drops the stream (send fails), like the
+        // real worker: the emit loop IS the backpressure, and cancellation
+        // parks the slot paused (the mock slot is always PausedS already).
+        let worker_state = self.state.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        tokio::spawn(async move {
+            let mut frame_counter = start_frame;
+            loop {
+                frame_counter += 1;
+                let (fb_lz4, fb_info) = MockWorker::captured_framebuffer(frame_counter);
+                let event = dh::FrameCaptureEvent {
+                    msg: Some(dh::frame_capture_event::Msg::Frame(dh::CapturedFrame {
+                        frame_index: frame_counter,
+                        icount: u64::from(frame_counter) * 100,
+                        fb_lz4,
+                        fb_info: Some(fb_info),
+                    })),
+                };
+                if tx.send(Ok(event)).await.is_err() {
+                    break;
+                }
+                let mut state = worker_state.lock().expect("mock worker mutex poisoned");
+                state.frame_counter = frame_counter;
+                state.framebuffer_response =
+                    MockWorker::framebuffer_response(frame_counter, u64::from(frame_counter) * 100);
+            }
+        });
+        Ok(TonicResponse::new(ReceiverStream::new(rx)))
     }
 
     async fn get_worker_info(
