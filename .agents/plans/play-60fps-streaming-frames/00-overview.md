@@ -20,7 +20,13 @@ Per rendered frame the Play loop (`service/src/api.rs::play_loop`) does:
    worker additionally runs a debug build today) — root causes and fixes
    are planned in
    `determinism-hypervisor/.agents/plans/play-60fps-decouple-hash-from-frames/`;
-4. PNG encode (`framebuffer_png`) + `/ws/frames` publish (cheap).
+4. PNG encode (`framebuffer_png`) + `/ws/frames` publish — cheap in CPU,
+   NOT in bandwidth: `rgb8_png` emits *stored* (uncompressed) zlib blocks,
+   so a 256x224 frame is ~172 KB on the wire. At 60fps that is ~10 MB/s
+   (~81 Mbps) sustained bridge→browser, which may exceed the operator's
+   link and simply move the stutter downstream. B3 must size this and
+   pick a mitigation (real DEFLATE in `rgb8_png`, or an explicit
+   frame-skip/adapt policy).
 
 Bridge-side levers cannot reach 60fps alone (cause 3 dominates), but they
 halve RPC traffic now and are the consumer half of the 60fps design.
@@ -41,7 +47,10 @@ vCPU at frame boundaries, which the bridge uses for exact 60Hz pacing.
   `RunResponse` returns `fb_lz4 + fb_info` (worker
   `capture_at_boundary` is implemented). Replaces the resume +
   GetFramebuffer pair in `play_step` with one RPC. Land now; keeps all
-  current semantics.
+  current semantics. B1 is partially superseded when B2 lands — that is
+  deliberate: M2's landing date is uncertain, B1 gives an immediate
+  measurable win, and B2's rollback story is "flip back to the B1 path",
+  so B1 code is the fallback target, not throwaway.
 - **B2 — Streaming Play** (01). Replace the per-frame RPC loop with a
   `RunWithFrameCapture` consumer: 60Hz-paced reads, PNG encode, publish
   to the existing `watch` channel; input via `InjectInputs` at
