@@ -1,5 +1,8 @@
 # Request: Amend eqb For The Segmented World, Then The First Real Capture Smoke (Thin, Mostly Gated)
 
+> **CURRENT STATUS (2026-07-10):** Still open. Read
+> `04-current-status-2026-07-10.md` before executing this request.
+
 ## Who Is Asking
 
 The phases track, round 2 (2026-07-07). Deliberately thin: round-1

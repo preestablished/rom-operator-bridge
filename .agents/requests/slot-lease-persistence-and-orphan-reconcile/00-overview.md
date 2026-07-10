@@ -1,5 +1,8 @@
 # Request: Stop Leaking Worker Slots On Bridge Restart — Persist Leases, Reconcile Orphans (Bead 72o)
 
+> **CURRENT STATUS (2026-07-10):** Still open and still production-relevant.
+> Read `04-current-status-2026-07-10.md` before implementation.
+
 ## Who Is Asking
 
 The phases track, round 3 (2026-07-07). The round-3 skip-sweep caught

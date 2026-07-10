@@ -1,5 +1,9 @@
 # Request: Validate The Landed Play Stack And Clear Its Residuals
 
+> **CURRENT STATUS (2026-07-10):** Still open. Read
+> `04-current-status-2026-07-10.md`; the refwork cutover is complete, but the
+> validation and ledger work below has not landed.
+
 ## Who Is Asking
 
 The phases track. Filed 2026-07-07 (revised the same day: the original
