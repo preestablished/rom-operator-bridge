@@ -3,6 +3,8 @@
 ## What We Need (Behavioral)
 
 1. **`eqb` — real-worker streaming validation.** Against the redeployed
+   > [Amended — read `02a-eqb-rider-2026-07-07.md` first.]
+
    worker (`4285b45` build). Instrument: a **scripted, authenticated
    `/ws/frames` client** (capability request per `authSession.ts`) doing
    the measurement, with a browser session as the human-visible sanity

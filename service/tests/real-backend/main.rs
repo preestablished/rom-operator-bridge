@@ -1720,9 +1720,7 @@ async fn real_streaming_play_keeps_commands_responsive_and_stops_without_pause_r
                     frames.push(step.frame);
                 }
                 PlayStreamEvent::TimedOut => continue,
-                PlayStreamEvent::Ended { faulted } => {
-                    panic!("stream ended early (faulted: {faulted})")
-                }
+                PlayStreamEvent::Ended(end) => panic!("stream ended early: {end:?}"),
             }
         }
         assert!(
@@ -1818,8 +1816,15 @@ async fn real_streaming_segment_budget_end_supports_seamless_reopen() {
             {
                 PlayStreamEvent::Frame(step) => frames.push(step.frame),
                 PlayStreamEvent::TimedOut => continue,
-                PlayStreamEvent::Ended { faulted } => {
-                    assert!(!faulted, "budget end is a clean segment end");
+                PlayStreamEvent::Ended(end) => {
+                    assert_eq!(
+                        end.reason,
+                        rom_operator_bridge_service::backend::PlayStreamEndReason::BudgetReached,
+                        "segment ends only on its configured budget"
+                    );
+                    assert_eq!(end.first_frame_icount, Some(1_300));
+                    assert_eq!(end.last_frame_icount, Some(1_400));
+                    assert_eq!(end.done_icount, Some(1_400));
                     break;
                 }
             }
@@ -1846,7 +1851,7 @@ async fn real_streaming_segment_budget_end_supports_seamless_reopen() {
                     break;
                 }
                 PlayStreamEvent::TimedOut => continue,
-                PlayStreamEvent::Ended { faulted } => panic!("ended early (faulted: {faulted})"),
+                PlayStreamEvent::Ended(end) => panic!("ended early: {end:?}"),
             }
         }
     })
@@ -1862,6 +1867,83 @@ async fn real_streaming_segment_budget_end_supports_seamless_reopen() {
         2,
         "one stream per segment: {calls:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_play_loop_reopens_only_budget_ended_segments() {
+    let workspace = tempfile::tempdir().expect("tempdir creates");
+    let private_root = workspace.path().join("bridge-private");
+    let reference_checkout = workspace.path().join("reference-workload");
+    let worker = MockWorker::new();
+    let server = WorkerServer::start(worker.clone()).await;
+    let config = real_config_with_start(
+        &private_root,
+        &reference_checkout,
+        &format!("unix://{}", server.uds_path.display()),
+        Some((ENV_REAL_SNAPSHOT_REF, SNAPSHOT_REF.to_string())),
+    );
+    let mut app = router(AppState::from_config(config));
+    worker
+        .state
+        .lock()
+        .expect("mock worker mutex poisoned")
+        .frame_stream_frame_limit = Some(2);
+
+    let start = send_request(
+        &mut app,
+        runtime_request(
+            Method::POST,
+            "/api/session/start",
+            Body::from(start_body("real")),
+        ),
+    )
+    .await;
+    assert_eq!(start.status(), StatusCode::OK);
+    let cookie = response_cookie(&start);
+    let start_json = body_json(start).await;
+    let session_id = start_json["session_id"]
+        .as_str()
+        .expect("session id is string");
+
+    let play = send_request(
+        &mut app,
+        runtime_request_with_cookie(
+            Method::POST,
+            "/api/run/play",
+            &cookie,
+            Body::from(session_body(session_id)),
+        ),
+    )
+    .await;
+    assert_eq!(play.status(), StatusCode::OK);
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let opens = worker
+                .calls()
+                .iter()
+                .filter(|call| **call == "run_with_frame_capture")
+                .count();
+            if opens >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("API Play loop reopens a budget-ended segment");
+
+    let pause = send_request(
+        &mut app,
+        runtime_request_with_cookie(
+            Method::POST,
+            "/api/run/pause",
+            &cookie,
+            Body::from(session_body(session_id)),
+        ),
+    )
+    .await;
+    assert_eq!(pause.status(), StatusCode::OK);
 }
 
 fn real_config(private_root: &Path, reference_checkout: &PathBuf) -> ServiceConfig {

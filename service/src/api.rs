@@ -2128,6 +2128,28 @@ const PLAY_PACER_RESYNC: std::time::Duration = std::time::Duration::from_millis(
 const PLAY_STREAM_REOPEN_ATTEMPTS: u32 = 5;
 const PLAY_STREAM_REOPEN_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PlayReopenTelemetry {
+    clean_budget_ends: u64,
+    successful_reopens: u64,
+    failed_reopen_attempts: u64,
+}
+
+impl PlayReopenTelemetry {
+    fn budget_end(&mut self) -> u64 {
+        self.clean_budget_ends += 1;
+        self.clean_budget_ends
+    }
+
+    fn reopen_succeeded(&mut self) {
+        self.successful_reopens += 1;
+    }
+
+    fn reopen_failed(&mut self) {
+        self.failed_reopen_attempts += 1;
+    }
+}
+
 /// The continuous-play loop body (runs on a dedicated thread).
 ///
 /// Streaming path (default): one long worker run emits a frame per FRAME_MARK;
@@ -2177,6 +2199,7 @@ fn play_stream_loop(
     let frames = state.play.frames_sender();
     let mut next_tick = Instant::now();
     let mut last_event: Option<Instant> = None;
+    let mut reopen_telemetry = PlayReopenTelemetry::default();
     loop {
         if stop.load(Ordering::SeqCst) {
             // Pause/Stop path: cancel the stream (slot parks Paused at the
@@ -2237,7 +2260,11 @@ fn play_stream_loop(
             // bounded to cap worker memory growth per Run): reopen the stream
             // and keep playing. A brief retry rides out an input RPC holding
             // input_in_flight across the reopen.
-            Ok(PlayStreamEvent::Ended { faulted: false }) => {
+            Ok(PlayStreamEvent::Ended(end))
+                if end.reason == crate::backend::PlayStreamEndReason::BudgetReached =>
+            {
+                let segment_ordinal = reopen_telemetry.budget_end();
+                let reopen_started = Instant::now();
                 let mut reopened = None;
                 for _ in 0..PLAY_STREAM_REOPEN_ATTEMPTS {
                     match state.backend.play_stream_start(session_id.clone()) {
@@ -2245,12 +2272,42 @@ fn play_stream_loop(
                             reopened = Some(next);
                             break;
                         }
-                        Err(_) => std::thread::sleep(PLAY_STREAM_REOPEN_RETRY),
+                        Err(_) => {
+                            reopen_telemetry.reopen_failed();
+                            std::thread::sleep(PLAY_STREAM_REOPEN_RETRY);
+                        }
                     }
                 }
                 match reopened {
-                    Some(next) => handle = next,
+                    Some(next) => {
+                        reopen_telemetry.reopen_succeeded();
+                        tracing::info!(
+                            segment_ordinal,
+                            reopen_duration_ms = reopen_started.elapsed().as_millis() as u64,
+                            reopen_class = "success",
+                            clean_budget_ends_total = reopen_telemetry.clean_budget_ends,
+                            successful_reopens_total = reopen_telemetry.successful_reopens,
+                            failed_reopen_attempts_total = reopen_telemetry.failed_reopen_attempts,
+                            first_frame_icount = end.first_frame_icount,
+                            last_frame_icount = end.last_frame_icount,
+                            done_icount = end.done_icount,
+                            "play stream budget segment reopened"
+                        );
+                        handle = next;
+                    }
                     None => {
+                        tracing::warn!(
+                            segment_ordinal,
+                            reopen_duration_ms = reopen_started.elapsed().as_millis() as u64,
+                            reopen_class = "failed",
+                            clean_budget_ends_total = reopen_telemetry.clean_budget_ends,
+                            successful_reopens_total = reopen_telemetry.successful_reopens,
+                            failed_reopen_attempts_total = reopen_telemetry.failed_reopen_attempts,
+                            first_frame_icount = end.first_frame_icount,
+                            last_frame_icount = end.last_frame_icount,
+                            done_icount = end.done_icount,
+                            "play stream budget segment reopen failed"
+                        );
                         publish_play_terminal_state(&state, &session_id);
                         let _ = frames.send(None);
                         state.play.deregister(&session_id);
@@ -2258,9 +2315,19 @@ fn play_stream_loop(
                     }
                 }
             }
+            // A clean EOF is not evidence that the instruction budget was
+            // exhausted. Do not reopen or increment boundary telemetry.
+            Ok(PlayStreamEvent::Ended(end))
+                if end.reason == crate::backend::PlayStreamEndReason::CleanEof =>
+            {
+                publish_play_terminal_state(&state, &session_id);
+                let _ = frames.send(None);
+                state.play.deregister(&session_id);
+                break;
+            }
             // Terminal: fault or stream loss. Publish the final state and
             // tear down exactly like a per-frame fault.
-            Ok(PlayStreamEvent::Ended { faulted: true }) | Err(_) => {
+            Ok(PlayStreamEvent::Ended(_)) | Err(_) => {
                 publish_play_terminal_state(&state, &session_id);
                 let _ = frames.send(None);
                 state.play.deregister(&session_id);
@@ -3508,6 +3575,22 @@ fn auth_error(error: AuthError) -> AppError {
 mod tests {
     use super::*;
     use crate::backend::CaptureJobStatus;
+
+    #[test]
+    fn reopen_telemetry_counts_each_outcome_once() {
+        let mut telemetry = PlayReopenTelemetry::default();
+        assert_eq!(telemetry.budget_end(), 1);
+        telemetry.reopen_failed();
+        telemetry.reopen_succeeded();
+        assert_eq!(
+            telemetry,
+            PlayReopenTelemetry {
+                clean_budget_ends: 1,
+                successful_reopens: 1,
+                failed_reopen_attempts: 1,
+            }
+        );
+    }
 
     #[test]
     fn real_completed_job_without_public_projection_fails_closed() {

@@ -360,7 +360,36 @@ pub enum PlayStreamEvent {
     TimedOut,
     /// The worker run ended (terminal stop, stream close, or fault). The
     /// session is no longer streaming; faults have already been recorded.
-    Ended { faulted: bool },
+    Ended(PlayStreamEnd),
+}
+
+/// Aggregate-only classification and counters for a completed worker stream.
+/// These values are safe to log: they contain no session, lease, endpoint,
+/// snapshot, input-log, or framebuffer data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayStreamEnd {
+    pub reason: PlayStreamEndReason,
+    pub first_frame_icount: Option<u64>,
+    pub last_frame_icount: Option<u64>,
+    pub done_icount: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlayStreamEndReason {
+    BudgetReached,
+    CleanEof,
+    Faulted,
+}
+
+impl PlayStreamEnd {
+    const fn clean_eof() -> Self {
+        Self {
+            reason: PlayStreamEndReason::CleanEof,
+            first_frame_icount: None,
+            last_frame_icount: None,
+            done_icount: None,
+        }
+    }
 }
 
 /// A live streaming-play session. `next_frame` blocks up to the given timeout
@@ -775,7 +804,9 @@ impl PlayStreamSession for SyntheticPlayStreamSession {
             Ok(step) => Ok(PlayStreamEvent::Frame(step)),
             // The session left Playing (stop/fault raced the loop): the stream
             // is over rather than broken.
-            Err(BackendError::BackendUnavailable) => Ok(PlayStreamEvent::Ended { faulted: false }),
+            Err(BackendError::BackendUnavailable) => {
+                Ok(PlayStreamEvent::Ended(PlayStreamEnd::clean_eof()))
+            }
             Err(error) => Err(error),
         }
     }
@@ -2005,7 +2036,7 @@ struct RealPlayStreamSession {
 impl PlayStreamSession for RealPlayStreamSession {
     fn next_frame(&mut self, timeout: Duration) -> BackendResult<PlayStreamEvent> {
         if self.ended {
-            return Ok(PlayStreamEvent::Ended { faulted: false });
+            return Ok(PlayStreamEvent::Ended(PlayStreamEnd::clean_eof()));
         }
         match self.stream.frames.recv_timeout(timeout) {
             Ok(RealStreamEvent::Frame(frame)) => {
@@ -2041,19 +2072,24 @@ impl PlayStreamSession for RealPlayStreamSession {
                     png_bytes: decoded.png_bytes,
                 }))
             }
-            Ok(RealStreamEvent::Ended { faulted }) => {
+            Ok(RealStreamEvent::Ended(end)) => {
                 self.ended = true;
-                if faulted {
+                if end.reason == PlayStreamEndReason::Faulted {
                     self.backend.mark_faulted(&self.session);
                 }
-                Ok(PlayStreamEvent::Ended { faulted })
+                Ok(PlayStreamEvent::Ended(end))
             }
             Err(mpsc::RecvTimeoutError::Timeout) => Ok(PlayStreamEvent::TimedOut),
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 // The streaming task died without a terminal event.
                 self.ended = true;
                 self.backend.mark_faulted(&self.session);
-                Ok(PlayStreamEvent::Ended { faulted: true })
+                Ok(PlayStreamEvent::Ended(PlayStreamEnd {
+                    reason: PlayStreamEndReason::Faulted,
+                    first_frame_icount: None,
+                    last_frame_icount: None,
+                    done_icount: None,
+                }))
             }
         }
     }
@@ -2063,7 +2099,11 @@ impl PlayStreamSession for RealPlayStreamSession {
         // Drain anything already delivered so a buffered terminal fault is not
         // lost; the cancel above stops further production.
         while let Ok(event) = self.stream.frames.try_recv() {
-            if let RealStreamEvent::Ended { faulted: true } = event {
+            if let RealStreamEvent::Ended(PlayStreamEnd {
+                reason: PlayStreamEndReason::Faulted,
+                ..
+            }) = event
+            {
                 self.backend.mark_faulted(&self.session);
             }
         }
@@ -2469,7 +2509,7 @@ struct RealCapturedRunOutcome {
 /// One event forwarded from the worker's frame-capture stream.
 enum RealStreamEvent {
     Frame(dh::CapturedFrame),
-    Ended { faulted: bool },
+    Ended(PlayStreamEnd),
 }
 
 /// The bridge-side end of an open frame-capture stream: a bounded frame
@@ -2607,6 +2647,8 @@ async fn consume_play_stream(
     frames: mpsc::SyncSender<RealStreamEvent>,
     mut cancel: tokio::sync::watch::Receiver<bool>,
 ) {
+    let mut first_frame_icount = None;
+    let mut last_frame_icount = None;
     loop {
         let message = tokio::select! {
             _ = cancel.changed() => return,
@@ -2615,19 +2657,39 @@ async fn consume_play_stream(
         let event = match message {
             Ok(Some(event)) => event,
             Ok(None) => {
-                forward_stream_event(&frames, RealStreamEvent::Ended { faulted: false }, &cancel)
-                    .await;
+                forward_stream_event(
+                    &frames,
+                    RealStreamEvent::Ended(PlayStreamEnd {
+                        reason: PlayStreamEndReason::CleanEof,
+                        first_frame_icount,
+                        last_frame_icount,
+                        done_icount: None,
+                    }),
+                    &cancel,
+                )
+                .await;
                 return;
             }
             Err(status) => {
                 log_worker_rpc_failure("RunWithFrameCapture", &status);
-                forward_stream_event(&frames, RealStreamEvent::Ended { faulted: true }, &cancel)
-                    .await;
+                forward_stream_event(
+                    &frames,
+                    RealStreamEvent::Ended(PlayStreamEnd {
+                        reason: PlayStreamEndReason::Faulted,
+                        first_frame_icount,
+                        last_frame_icount,
+                        done_icount: None,
+                    }),
+                    &cancel,
+                )
+                .await;
                 return;
             }
         };
         match event.msg {
             Some(dh::frame_capture_event::Msg::Frame(frame)) => {
+                first_frame_icount.get_or_insert(frame.icount);
+                last_frame_icount = Some(frame.icount);
                 if !forward_stream_event(&frames, RealStreamEvent::Frame(frame), &cancel).await {
                     return;
                 }
@@ -2635,8 +2697,22 @@ async fn consume_play_stream(
             Some(dh::frame_capture_event::Msg::Done(done)) => {
                 let reason = dh::StopReason::try_from(done.reason)
                     .unwrap_or(dh::StopReason::StopUnspecified);
-                let faulted = reason == dh::StopReason::Faulted;
-                forward_stream_event(&frames, RealStreamEvent::Ended { faulted }, &cancel).await;
+                let reason = match reason {
+                    dh::StopReason::BudgetReached => PlayStreamEndReason::BudgetReached,
+                    dh::StopReason::Faulted => PlayStreamEndReason::Faulted,
+                    _ => PlayStreamEndReason::CleanEof,
+                };
+                forward_stream_event(
+                    &frames,
+                    RealStreamEvent::Ended(PlayStreamEnd {
+                        reason,
+                        first_frame_icount,
+                        last_frame_icount,
+                        done_icount: Some(done.icount),
+                    }),
+                    &cancel,
+                )
+                .await;
                 return;
             }
             None => {}
@@ -2747,6 +2823,7 @@ impl RealWorkerState {
                             hash: snapshot_hash.to_vec(),
                         }),
                         entropy_seed: Vec::new(),
+                        baseline: None,
                     })
                     .await
                     .map_err(|status| {

@@ -576,7 +576,9 @@ fn synthetic_streaming_play_delivers_frames_and_stops_paused() {
         .next_frame(std::time::Duration::from_millis(10))
         .expect("post-stop read resolves")
     {
-        PlayStreamEvent::Ended { faulted: false } => {}
+        PlayStreamEvent::Ended(end)
+            if end.reason
+                == rom_operator_bridge_service::backend::PlayStreamEndReason::CleanEof => {}
         other => panic!("expected a clean end, got {other:?}"),
     }
     let status = backend
