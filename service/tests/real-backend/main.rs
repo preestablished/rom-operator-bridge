@@ -1957,6 +1957,66 @@ async fn api_play_loop_reopens_only_budget_ended_segments() {
     assert_eq!(pause.status(), StatusCode::OK);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_play_loop_does_not_reopen_clean_eof() {
+    let workspace = tempfile::tempdir().expect("tempdir creates");
+    let private_root = workspace.path().join("bridge-private");
+    let reference_checkout = workspace.path().join("reference-workload");
+    let worker = MockWorker::new();
+    let server = WorkerServer::start(worker.clone()).await;
+    let config = real_config_with_start(
+        &private_root,
+        &reference_checkout,
+        &format!("unix://{}", server.uds_path.display()),
+        Some((ENV_REAL_SNAPSHOT_REF, SNAPSHOT_REF.to_string())),
+    );
+    let mut app = router(AppState::from_config(config));
+    {
+        let mut state = worker.state.lock().expect("mock worker mutex poisoned");
+        state.frame_stream_frame_limit = Some(2);
+        state.frame_stream_stop_reason = dh::StopReason::StopUnspecified;
+    }
+
+    let start = send_request(
+        &mut app,
+        runtime_request(
+            Method::POST,
+            "/api/session/start",
+            Body::from(start_body("real")),
+        ),
+    )
+    .await;
+    assert_eq!(start.status(), StatusCode::OK);
+    let cookie = response_cookie(&start);
+    let start_json = body_json(start).await;
+    let session_id = start_json["session_id"]
+        .as_str()
+        .expect("session id is string");
+
+    let play = send_request(
+        &mut app,
+        runtime_request_with_cookie(
+            Method::POST,
+            "/api/run/play",
+            &cookie,
+            Body::from(session_body(session_id)),
+        ),
+    )
+    .await;
+    assert_eq!(play.status(), StatusCode::OK);
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+    assert_eq!(
+        worker
+            .calls()
+            .iter()
+            .filter(|call| **call == "run_with_frame_capture")
+            .count(),
+        1,
+        "clean EOF must not be classified as a budget boundary"
+    );
+}
+
 fn real_config(private_root: &Path, reference_checkout: &PathBuf) -> ServiceConfig {
     real_config_with_start(
         private_root,
@@ -2388,6 +2448,7 @@ struct MockWorkerState {
     /// Frames per RunWithFrameCapture stream before a BUDGET_REACHED terminal
     /// event; None streams until the client disconnects.
     frame_stream_frame_limit: Option<u32>,
+    frame_stream_stop_reason: dh::StopReason,
     icount: u64,
     frame_counter: u32,
 }
@@ -2413,6 +2474,7 @@ impl Default for MockWorkerState {
             framebuffer_response: MockWorker::framebuffer_response(12, 0),
             framebuffer_failed_precondition_remaining: 0,
             frame_stream_frame_limit: None,
+            frame_stream_stop_reason: dh::StopReason::BudgetReached,
             icount: 0,
             frame_counter: 12,
         }
@@ -2736,13 +2798,17 @@ impl HypervisorWorker for MockWorker {
         &self,
         request: TonicRequest<dh::RunWithFrameCaptureRequest>,
     ) -> Result<TonicResponse<Self::RunWithFrameCaptureStream>, Status> {
-        let (start_frame, frame_limit) = {
+        let (start_frame, frame_limit, stop_reason) = {
             let mut state = self.state.lock().expect("mock worker mutex poisoned");
             state.calls.push("run_with_frame_capture");
             state
                 .run_with_frame_capture_requests
                 .push(request.into_inner());
-            (state.frame_counter, state.frame_stream_frame_limit)
+            (
+                state.frame_counter,
+                state.frame_stream_frame_limit,
+                state.frame_stream_stop_reason,
+            )
         };
         // Emit frames until the bridge drops the stream (send fails) or the
         // configured segment budget elapses (BUDGET_REACHED terminal), like
@@ -2757,7 +2823,7 @@ impl HypervisorWorker for MockWorker {
                 if frame_limit.is_some_and(|limit| sent >= limit) {
                     let done = dh::FrameCaptureEvent {
                         msg: Some(dh::frame_capture_event::Msg::Done(dh::RunResponse {
-                            reason: dh::StopReason::BudgetReached as i32,
+                            reason: stop_reason as i32,
                             icount: u64::from(frame_counter) * 100,
                             vns: 0,
                             state_hash: None,
