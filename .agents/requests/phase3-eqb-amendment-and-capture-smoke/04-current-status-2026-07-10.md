@@ -26,5 +26,5 @@ operator-private window against a worker that includes `c0337ab` or later,
 record the deployed build, and use the rider's contained-stack/delta evidence
 rules. This request is not waiting on reference-workload anymore.
 
-The request commits `6d70ea2` and the round-3 bridge request commit `6eb7a1e`
-are currently local-only: bridge `main` is two commits ahead of `origin/main`.
+The request commits `6d70ea2` and `6eb7a1e` were previously local-only. They
+were published to `origin/main` with audit commit `5188426` on 2026-07-10.

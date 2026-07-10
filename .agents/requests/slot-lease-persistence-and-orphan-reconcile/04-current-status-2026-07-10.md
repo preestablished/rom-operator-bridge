@@ -20,5 +20,5 @@ boundaries:
   hypervisor chooses a narrowly gated destroy-by-slot-id mechanism;
 - live SIGKILL verification still requires an operator window.
 
-This request's filing commit `6eb7a1e` is currently local-only because bridge
-`main` is two commits ahead of `origin/main`.
+This request's filing commit `6eb7a1e` was previously local-only and was
+published to `origin/main` with audit commit `5188426` on 2026-07-10.
