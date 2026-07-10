@@ -1944,6 +1944,12 @@ async fn api_play_loop_reopens_only_budget_ended_segments() {
     .await
     .expect("API Play loop reopens a budget-ended segment");
 
+    let opens_before_cancel = worker
+        .calls()
+        .iter()
+        .filter(|call| **call == "run_with_frame_capture")
+        .count();
+
     let pause = send_request(
         &mut app,
         runtime_request_with_cookie(
@@ -1955,6 +1961,16 @@ async fn api_play_loop_reopens_only_budget_ended_segments() {
     )
     .await;
     assert_eq!(pause.status(), StatusCode::OK);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        worker
+            .calls()
+            .iter()
+            .filter(|call| **call == "run_with_frame_capture")
+            .count(),
+        opens_before_cancel,
+        "operator cancellation must stop reopening segments"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2014,6 +2030,66 @@ async fn api_play_loop_does_not_reopen_clean_eof() {
             .count(),
         1,
         "clean EOF must not be classified as a budget boundary"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_play_loop_does_not_reopen_faulted_stream() {
+    let workspace = tempfile::tempdir().expect("tempdir creates");
+    let private_root = workspace.path().join("bridge-private");
+    let reference_checkout = workspace.path().join("reference-workload");
+    let worker = MockWorker::new();
+    let server = WorkerServer::start(worker.clone()).await;
+    let config = real_config_with_start(
+        &private_root,
+        &reference_checkout,
+        &format!("unix://{}", server.uds_path.display()),
+        Some((ENV_REAL_SNAPSHOT_REF, SNAPSHOT_REF.to_string())),
+    );
+    let mut app = router(AppState::from_config(config));
+    {
+        let mut state = worker.state.lock().expect("mock worker mutex poisoned");
+        state.frame_stream_frame_limit = Some(2);
+        state.frame_stream_stop_reason = dh::StopReason::Faulted;
+    }
+
+    let start = send_request(
+        &mut app,
+        runtime_request(
+            Method::POST,
+            "/api/session/start",
+            Body::from(start_body("real")),
+        ),
+    )
+    .await;
+    assert_eq!(start.status(), StatusCode::OK);
+    let cookie = response_cookie(&start);
+    let start_json = body_json(start).await;
+    let session_id = start_json["session_id"]
+        .as_str()
+        .expect("session id is string");
+
+    let play = send_request(
+        &mut app,
+        runtime_request_with_cookie(
+            Method::POST,
+            "/api/run/play",
+            &cookie,
+            Body::from(session_body(session_id)),
+        ),
+    )
+    .await;
+    assert_eq!(play.status(), StatusCode::OK);
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+    assert_eq!(
+        worker
+            .calls()
+            .iter()
+            .filter(|call| **call == "run_with_frame_capture")
+            .count(),
+        1,
+        "faulted streams must terminate rather than reopen"
     );
 }
 
