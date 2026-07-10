@@ -1764,6 +1764,17 @@ async fn real_streaming_play_keeps_commands_responsive_and_stops_without_pause_r
         calls.iter().any(|call| *call == "run_with_frame_capture"),
         "streaming play must open RunWithFrameCapture: {calls:?}"
     );
+    let state = worker.state.lock().expect("mock worker mutex poisoned");
+    assert!(
+        state.run_with_frame_capture_requests.iter().all(|request| {
+            request.until
+                == Some(dh::run_with_frame_capture_request::Until::IcountBudget(
+                    u64::MAX / 4,
+                ))
+        }),
+        "normal streaming requests must retain the numeric effectively-unbounded budget"
+    );
+    drop(state);
     // The plan's pause-vs-stream race: stopping a streamed session must never
     // dispatch a worker Pause (which is epoch-quantized), in the teardown or
     // in the API-level pause that follows it.
@@ -2360,6 +2371,7 @@ struct MockWorkerState {
     create_vm: Option<dh::CreateVmRequest>,
     take_snapshot_requests: Vec<dh::TakeSnapshotRequest>,
     inject_inputs: Vec<dh::InjectInputsRequest>,
+    run_with_frame_capture_requests: Vec<dh::RunWithFrameCaptureRequest>,
     destroy_fails: bool,
     inject_status: Option<tonic::Code>,
     inject_scheduled: u32,
@@ -2389,6 +2401,7 @@ impl Default for MockWorkerState {
             create_vm: None,
             take_snapshot_requests: Vec::new(),
             inject_inputs: Vec::new(),
+            run_with_frame_capture_requests: Vec::new(),
             destroy_fails: false,
             inject_status: None,
             inject_scheduled: 1,
@@ -2721,11 +2734,14 @@ impl HypervisorWorker for MockWorker {
 
     async fn run_with_frame_capture(
         &self,
-        _request: TonicRequest<dh::RunWithFrameCaptureRequest>,
+        request: TonicRequest<dh::RunWithFrameCaptureRequest>,
     ) -> Result<TonicResponse<Self::RunWithFrameCaptureStream>, Status> {
         let (start_frame, frame_limit) = {
             let mut state = self.state.lock().expect("mock worker mutex poisoned");
             state.calls.push("run_with_frame_capture");
+            state
+                .run_with_frame_capture_requests
+                .push(request.into_inner());
             (state.frame_counter, state.frame_stream_frame_limit)
         };
         // Emit frames until the bridge drops the stream (send fails) or the

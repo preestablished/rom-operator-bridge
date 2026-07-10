@@ -38,14 +38,12 @@ const REAL_WORKER_REPLY_TIMEOUT: Duration = Duration::from_secs(20);
 /// the bridge is not reading, so a small channel is the pacing backstop; the
 /// bridge's 60Hz-paced reads are the primary mechanism.
 const PLAY_STREAM_CHANNEL_CAPACITY: usize = 2;
-/// Instructions per streaming segment. Deliberately bounded, not
-/// "run until stopped": the live worker accumulates memory for the duration
-/// of a single Run (observed 2026-07-07: ~26 GB RSS and an OOM kill during
-/// one long RunWithFrameCapture; per-Run buffers are freed at Run end).
-/// ~4 default epochs (~1-2s of play) caps that growth per segment; the Play
-/// loop reopens the stream seamlessly when a segment's budget is reached.
-/// Raise this once the worker-side leak is fixed (tracked in beads).
-const PLAY_STREAM_SEGMENT_ICOUNT_BUDGET: u64 = 200_000_000;
+/// Effectively-unbounded streaming run budget. The worker's agenda
+/// materialization/RSS fix (`c0337ab` or later) is a deployment prerequisite.
+/// Keep a numeric `until` arm because the worker rejects a missing bound.
+/// Segment reopening remains valid for early budget completion; DHILOG sealing
+/// granularity is a separate concern from the resolved agenda OOM.
+const PLAY_STREAM_ICOUNT_BUDGET: u64 = u64::MAX / 4;
 const PLAY_STREAM_SEND_RETRY: Duration = Duration::from_millis(2);
 /// After cancelling the stream, the worker parks the slot Paused at the next
 /// frame boundary; poll introspection until it lands.
@@ -3120,7 +3118,7 @@ impl RealWorkerState {
             .run_with_frame_capture(dh::RunWithFrameCaptureRequest {
                 lease: Some(lease),
                 until: Some(dh::run_with_frame_capture_request::Until::IcountBudget(
-                    PLAY_STREAM_SEGMENT_ICOUNT_BUDGET,
+                    PLAY_STREAM_ICOUNT_BUDGET,
                 )),
                 hard_icount_cap: 0,
             })
