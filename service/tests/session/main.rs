@@ -578,7 +578,7 @@ fn synthetic_streaming_play_delivers_frames_and_stops_paused() {
     {
         PlayStreamEvent::Ended(end)
             if end.reason
-                == rom_operator_bridge_service::backend::PlayStreamEndReason::CleanEof => {}
+                == rom_operator_bridge_service::backend::PlayStreamEndReason::UnexpectedEnd => {}
         other => panic!("expected a clean end, got {other:?}"),
     }
     let status = backend

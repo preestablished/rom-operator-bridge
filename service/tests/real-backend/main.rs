@@ -1961,6 +1961,8 @@ async fn api_play_loop_reopens_only_budget_ended_segments() {
     )
     .await;
     assert_eq!(pause.status(), StatusCode::OK);
+    let pause_body = body_json(pause).await;
+    assert_eq!(pause_body["state"], "paused");
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert_eq!(
         worker
@@ -1974,7 +1976,7 @@ async fn api_play_loop_reopens_only_budget_ended_segments() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn api_play_loop_does_not_reopen_clean_eof() {
+async fn api_play_loop_faults_transport_eof_without_done() {
     let workspace = tempfile::tempdir().expect("tempdir creates");
     let private_root = workspace.path().join("bridge-private");
     let reference_checkout = workspace.path().join("reference-workload");
@@ -1990,7 +1992,7 @@ async fn api_play_loop_does_not_reopen_clean_eof() {
     {
         let mut state = worker.state.lock().expect("mock worker mutex poisoned");
         state.frame_stream_frame_limit = Some(2);
-        state.frame_stream_stop_reason = dh::StopReason::StopUnspecified;
+        state.frame_stream_omit_done = true;
     }
 
     let start = send_request(
@@ -2020,7 +2022,26 @@ async fn api_play_loop_does_not_reopen_clean_eof() {
     )
     .await;
     assert_eq!(play.status(), StatusCode::OK);
-    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+    let status_body = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let status = send_request(
+                &mut app,
+                runtime_request_with_cookie(Method::GET, "/api/run/status", &cookie, Body::empty()),
+            )
+            .await;
+            assert_eq!(status.status(), StatusCode::OK);
+            let body = body_json(status).await;
+            if body["state"] == "faulted" {
+                break body;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("unexpected stream EOF transitions the session to faulted");
+    assert_eq!(status_body["backend_mode"], "real");
+    assert_eq!(status_body["current_frame"], 14);
 
     assert_eq!(
         worker
@@ -2029,7 +2050,30 @@ async fn api_play_loop_does_not_reopen_clean_eof() {
             .filter(|call| **call == "run_with_frame_capture")
             .count(),
         1,
-        "clean EOF must not be classified as a budget boundary"
+        "unexpected EOF must not be classified as a budget boundary"
+    );
+
+    let replay = send_request(
+        &mut app,
+        runtime_request_with_cookie(
+            Method::POST,
+            "/api/run/play",
+            &cookie,
+            Body::from(session_body(session_id)),
+        ),
+    )
+    .await;
+    assert_eq!(replay.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let replay_body = body_json(replay).await;
+    assert_eq!(replay_body["error"]["code"], "backend_unavailable");
+    assert_eq!(
+        worker
+            .calls()
+            .iter()
+            .filter(|call| **call == "run_with_frame_capture")
+            .count(),
+        1,
+        "rejected replay must not open another worker stream"
     );
 }
 
@@ -2525,6 +2569,8 @@ struct MockWorkerState {
     /// event; None streams until the client disconnects.
     frame_stream_frame_limit: Option<u32>,
     frame_stream_stop_reason: dh::StopReason,
+    /// Close the mock transport at the frame limit without a terminal Done.
+    frame_stream_omit_done: bool,
     icount: u64,
     frame_counter: u32,
 }
@@ -2551,6 +2597,7 @@ impl Default for MockWorkerState {
             framebuffer_failed_precondition_remaining: 0,
             frame_stream_frame_limit: None,
             frame_stream_stop_reason: dh::StopReason::BudgetReached,
+            frame_stream_omit_done: false,
             icount: 0,
             frame_counter: 12,
         }
@@ -2874,7 +2921,7 @@ impl HypervisorWorker for MockWorker {
         &self,
         request: TonicRequest<dh::RunWithFrameCaptureRequest>,
     ) -> Result<TonicResponse<Self::RunWithFrameCaptureStream>, Status> {
-        let (start_frame, frame_limit, stop_reason) = {
+        let (start_frame, frame_limit, stop_reason, omit_done) = {
             let mut state = self.state.lock().expect("mock worker mutex poisoned");
             state.calls.push("run_with_frame_capture");
             state
@@ -2884,6 +2931,7 @@ impl HypervisorWorker for MockWorker {
                 state.frame_counter,
                 state.frame_stream_frame_limit,
                 state.frame_stream_stop_reason,
+                state.frame_stream_omit_done,
             )
         };
         // Emit frames until the bridge drops the stream (send fails) or the
@@ -2897,6 +2945,9 @@ impl HypervisorWorker for MockWorker {
             let mut sent = 0_u32;
             loop {
                 if frame_limit.is_some_and(|limit| sent >= limit) {
+                    if omit_done {
+                        break;
+                    }
                     let done = dh::FrameCaptureEvent {
                         msg: Some(dh::frame_capture_event::Msg::Done(dh::RunResponse {
                             reason: stop_reason as i32,

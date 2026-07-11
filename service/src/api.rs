@@ -2315,10 +2315,11 @@ fn play_stream_loop(
                     }
                 }
             }
-            // A clean EOF is not evidence that the instruction budget was
-            // exhausted. Do not reopen or increment boundary telemetry.
+            // Only a budget terminal is a valid segment boundary. The real
+            // adapter faults unexpected EOF/non-budget endings before this
+            // branch publishes the reconciled terminal state.
             Ok(PlayStreamEvent::Ended(end))
-                if end.reason == crate::backend::PlayStreamEndReason::CleanEof =>
+                if end.reason == crate::backend::PlayStreamEndReason::UnexpectedEnd =>
             {
                 publish_play_terminal_state(&state, &session_id);
                 let _ = frames.send(None);

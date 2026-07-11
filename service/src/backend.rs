@@ -375,14 +375,16 @@ pub struct PlayStreamEnd {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlayStreamEndReason {
     BudgetReached,
-    CleanEof,
+    /// The stream ended without the budget terminal required by continuous
+    /// Play. This includes transport EOF and non-budget `Done` reasons.
+    UnexpectedEnd,
     Faulted,
 }
 
 impl PlayStreamEnd {
-    const fn clean_eof() -> Self {
+    const fn unexpected() -> Self {
         Self {
-            reason: PlayStreamEndReason::CleanEof,
+            reason: PlayStreamEndReason::UnexpectedEnd,
             first_frame_icount: None,
             last_frame_icount: None,
             done_icount: None,
@@ -803,7 +805,7 @@ impl PlayStreamSession for SyntheticPlayStreamSession {
             // The session left Playing (stop/fault raced the loop): the stream
             // is over rather than broken.
             Err(BackendError::BackendUnavailable) => {
-                Ok(PlayStreamEvent::Ended(PlayStreamEnd::clean_eof()))
+                Ok(PlayStreamEvent::Ended(PlayStreamEnd::unexpected()))
             }
             Err(error) => Err(error),
         }
@@ -2016,7 +2018,7 @@ impl BridgeBackend for RealBackend {
             backend: self.clone(),
             session,
             stream,
-            ended: false,
+            terminal: None,
         }))
     }
 }
@@ -2028,13 +2030,13 @@ struct RealPlayStreamSession {
     backend: RealBackend,
     session: RealSession,
     stream: RealPlayStream,
-    ended: bool,
+    terminal: Option<PlayStreamEnd>,
 }
 
 impl PlayStreamSession for RealPlayStreamSession {
     fn next_frame(&mut self, timeout: Duration) -> BackendResult<PlayStreamEvent> {
-        if self.ended {
-            return Ok(PlayStreamEvent::Ended(PlayStreamEnd::clean_eof()));
+        if let Some(end) = self.terminal {
+            return Ok(PlayStreamEvent::Ended(end));
         }
         match self.stream.frames.recv_timeout(timeout) {
             Ok(RealStreamEvent::Frame(frame)) => {
@@ -2071,8 +2073,11 @@ impl PlayStreamSession for RealPlayStreamSession {
                 }))
             }
             Ok(RealStreamEvent::Ended(end)) => {
-                self.ended = true;
-                if end.reason == PlayStreamEndReason::Faulted {
+                self.terminal = Some(end);
+                if matches!(
+                    end.reason,
+                    PlayStreamEndReason::UnexpectedEnd | PlayStreamEndReason::Faulted
+                ) {
                     self.backend.mark_faulted(&self.session);
                 }
                 Ok(PlayStreamEvent::Ended(end))
@@ -2080,14 +2085,15 @@ impl PlayStreamSession for RealPlayStreamSession {
             Err(mpsc::RecvTimeoutError::Timeout) => Ok(PlayStreamEvent::TimedOut),
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 // The streaming task died without a terminal event.
-                self.ended = true;
-                self.backend.mark_faulted(&self.session);
-                Ok(PlayStreamEvent::Ended(PlayStreamEnd {
+                let end = PlayStreamEnd {
                     reason: PlayStreamEndReason::Faulted,
                     first_frame_icount: None,
                     last_frame_icount: None,
                     done_icount: None,
-                }))
+                };
+                self.terminal = Some(end);
+                self.backend.mark_faulted(&self.session);
+                Ok(PlayStreamEvent::Ended(end))
             }
         }
     }
@@ -2658,7 +2664,7 @@ async fn consume_play_stream(
                 forward_stream_event(
                     &frames,
                     RealStreamEvent::Ended(PlayStreamEnd {
-                        reason: PlayStreamEndReason::CleanEof,
+                        reason: PlayStreamEndReason::UnexpectedEnd,
                         first_frame_icount,
                         last_frame_icount,
                         done_icount: None,
@@ -2698,7 +2704,7 @@ async fn consume_play_stream(
                 let reason = match reason {
                     dh::StopReason::BudgetReached => PlayStreamEndReason::BudgetReached,
                     dh::StopReason::Faulted => PlayStreamEndReason::Faulted,
-                    _ => PlayStreamEndReason::CleanEof,
+                    _ => PlayStreamEndReason::UnexpectedEnd,
                 };
                 forward_stream_event(
                     &frames,
