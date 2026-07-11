@@ -6,6 +6,7 @@ pub mod config;
 pub mod framebuffer;
 pub mod input;
 pub mod labels;
+pub mod lease_store;
 pub mod play;
 pub mod private_config;
 mod real_capture;

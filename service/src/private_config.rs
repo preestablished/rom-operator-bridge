@@ -1,4 +1,5 @@
 use crate::{backend::BackendMode, sanitization::PublicSanitizer};
+use fs2::FileExt;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::{
@@ -31,7 +32,16 @@ pub const DEFAULT_HYPERVISOR_ENDPOINT: &str = "unix:///run/dh/grpc.sock";
 pub const PRIVATE_ROOT_MARKER: &str = ".rom-operator-bridge-private-root";
 pub const PRIVATE_DIR_MODE: u32 = 0o700;
 pub const PRIVATE_FILE_MODE: u32 = 0o600;
-pub const PRIVATE_RUN_DIRS: &[&str] = &["runs", "captures", "events", "validation", "tmp"];
+pub const PRIVATE_RUN_DIRS: &[&str] = &[
+    "runs",
+    "captures",
+    "events",
+    "validation",
+    "tmp",
+    "leases",
+    "leases/intents",
+    "leases/active",
+];
 const MIN_PRIVATE_ROOT_COMPONENTS: usize = 3;
 
 #[derive(Clone, PartialEq, Eq)]
@@ -283,6 +293,89 @@ impl BridgePrivateConfig {
         validate_private_file(&path)?;
 
         Ok(path)
+    }
+
+    pub fn list_private_files(
+        &self,
+        relative_dir: impl AsRef<Path>,
+    ) -> Result<Vec<PathBuf>, PrivateConfigError> {
+        let root = self
+            .root
+            .as_ref()
+            .ok_or(PrivateConfigError::MissingEnv {
+                env: ENV_PRIVATE_ROOT,
+            })?
+            .path();
+        ensure_private_root_dir(root)?;
+        let relative_dir = validate_relative_path(relative_dir.as_ref())?;
+        ensure_private_descendant_dir(root, &relative_dir)?;
+        let dir = root.join(&relative_dir);
+        let mut files = Vec::new();
+        for entry in
+            fs::read_dir(&dir).map_err(|error| io_error("list private directory", &dir, error))?
+        {
+            let entry =
+                entry.map_err(|error| io_error("read private directory entry", &dir, error))?;
+            let name = entry.file_name();
+            let relative_path = relative_dir.join(name);
+            validate_relative_path(&relative_path)?;
+            validate_private_file(&root.join(&relative_path))?;
+            files.push(relative_path);
+        }
+        files.sort();
+        Ok(files)
+    }
+
+    pub fn remove_private_file_durable(
+        &self,
+        relative_path: impl AsRef<Path>,
+    ) -> Result<(), PrivateConfigError> {
+        let root = self
+            .root
+            .as_ref()
+            .ok_or(PrivateConfigError::MissingEnv {
+                env: ENV_PRIVATE_ROOT,
+            })?
+            .path();
+        ensure_private_root_dir(root)?;
+        let relative_path = validate_relative_path(relative_path.as_ref())?;
+        let path = root.join(relative_path);
+        match path_metadata(&path)? {
+            Some(_) => validate_private_file(&path)?,
+            None => return Ok(()),
+        }
+        fs::remove_file(&path).map_err(|error| io_error("remove private file", &path, error))?;
+        sync_parent_dir(&path)
+    }
+
+    pub fn acquire_bridge_runtime_lock(&self) -> Result<fs::File, PrivateConfigError> {
+        let root = self
+            .root
+            .as_ref()
+            .ok_or(PrivateConfigError::MissingEnv {
+                env: ENV_PRIVATE_ROOT,
+            })?
+            .path();
+        ensure_private_root_dir(root)?;
+        let path = root.join(".bridge-runtime.lock");
+        let existed = path_metadata(&path)?.is_some();
+        if existed {
+            validate_private_file(&path)?;
+        }
+        let mut options = OpenOptions::new();
+        options.create(true).read(true).write(true);
+        #[cfg(unix)]
+        options.mode(PRIVATE_FILE_MODE);
+        let file = options
+            .open(&path)
+            .map_err(|error| io_error("open bridge runtime lock", &path, error))?;
+        set_private_file_mode(&path)?;
+        if !existed {
+            sync_parent_dir(&path)?;
+        }
+        file.try_lock_exclusive()
+            .map_err(|error| io_error("acquire bridge runtime lock", &path, error))?;
+        Ok(file)
     }
 
     fn write_private_file_with_mode(

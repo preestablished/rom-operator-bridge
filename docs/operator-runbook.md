@@ -299,3 +299,12 @@ bridge-produced private bundle has passed Phase 4 acceptance.
 - `docs/publish-readiness.md`
 - `docs/redaction.md`
 - `docs/handoff.md`
+# Real-worker lease recovery
+
+The real backend writes allocation intents under `leases/intents` and token-bearing active records under `leases/active` within the validated private root. These files are mode `0600`, are operational secrets, and must not be copied into logs, tickets, backups, or published artifacts.
+
+At startup, and before every later real-session start while blocked, the bridge reconciles active records by listing slots and destroying matching leases. It never re-adopts a lease: clients cannot reattach, session/run identifiers restart from process-local state, and the in-memory session contains derived state that cannot be safely reconstructed. The numeric summary reports `found_leases`, `found_intents`, `destroyed`, `stale_cleaned`, `missing_cleaned`, `dangling`, `invalid`, `retained`, and `ready_for_real_sessions`. Invalid records, worker failures, retained leases, and unmatched intents fail closed for real starts while health and diagnostics remain available.
+
+An unmatched intent has no token and cannot be destroyed through the accepted worker API. Recovery is deliberately manual: stop the bridge, restart the worker, verify `ListSlots` is empty/full-capacity, then run the bridge binary with `clear-dangling-intents --bridge-stopped --worker-restarted --full-capacity <operation-id>...`. The command refuses malformed stores, any active lease record, missing confirmations, and empty or unselected acknowledgements. Restart the bridge afterward. A worker restart alone does not clear durable intents.
+
+For a controlled crash test, use only an operator-owned synthetic workload: record sanitized capacity, start the session, confirm an active record exists without reading it, SIGKILL only the bridge, restart it, and capture the numeric reconcile summary plus restored capacity. Never run this against a user session or without an owned restart window.

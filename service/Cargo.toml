@@ -12,9 +12,11 @@ path = "src/lib.rs"
 axum = { version = "0.8", features = ["ws"] }
 blake3 = "1"
 dh-proto = { path = "../../determinism-hypervisor/crates/dh-proto" }
+fs2 = "0.4"
 hmac = "0.12"
 hyper-util = "0.1"
 lz4_flex = "0.11"
+prost = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
@@ -25,6 +27,7 @@ tonic = "0.12"
 tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }

@@ -11,6 +11,7 @@ use thiserror::Error;
 
 use dh_proto::v1 as dh;
 use hyper_util::rt::TokioIo;
+use prost::Message;
 use tokio::net::UnixStream;
 use tonic::{Code, transport::Endpoint};
 use tower::service_fn;
@@ -27,6 +28,7 @@ use crate::{
         framebuffer_png, synthetic_frame_png,
     },
     input::{AppliedInputFrame, PadLog, PadWord},
+    lease_store::{AllocationKind, LeaseIntent, LeaseRecord, LeaseStore},
     private_config::{BridgePrivateConfig, RealRuntimeConfig},
     real_capture::{ResolvedCaptureSpec, resolve_capture_spec},
 };
@@ -990,15 +992,179 @@ pub struct RealBackend {
     private_config: BridgePrivateConfig,
     worker: RealWorkerThread,
     inner: Arc<Mutex<RealBackendInner>>,
+    lifecycle: Arc<Mutex<()>>,
+    reconcile_ready: Arc<Mutex<bool>>,
 }
 
 impl RealBackend {
     pub fn new(private_config: BridgePrivateConfig, runtime_config: RealRuntimeConfig) -> Self {
-        Self {
+        let backend = Self {
             worker: RealWorkerThread::new(runtime_config.hypervisor_endpoint().clone()),
             runtime_config,
             private_config,
             inner: Arc::new(Mutex::new(RealBackendInner::default())),
+            lifecycle: Arc::new(Mutex::new(())),
+            reconcile_ready: Arc::new(Mutex::new(false)),
+        };
+        let _guard = backend
+            .lifecycle
+            .lock()
+            .expect("real lifecycle mutex poisoned");
+        backend.reconcile_leases();
+        drop(_guard);
+        backend
+    }
+
+    fn lease_store(&self) -> LeaseStore {
+        LeaseStore::new(self.private_config.clone())
+    }
+
+    fn reconcile_leases(&self) {
+        let store = self.lease_store();
+        let pending = {
+            let mut inner = self.inner.lock().expect("real backend mutex poisoned");
+            std::mem::take(&mut inner.pending_cleanup)
+        };
+        let mut pending_retained = Vec::new();
+        for record in pending {
+            if store.write_lease(&record).is_err() {
+                match self.worker.stop(record.lease().unwrap_or(dh::Lease {
+                    slot_id: 0,
+                    token: Vec::new(),
+                })) {
+                    Ok(()) | Err(RealWorkerFailure::StaleLease) => {
+                        let _ = store.remove_intent(&record.operation_id);
+                    }
+                    Err(_) => pending_retained.push(record),
+                }
+            }
+        }
+        if !pending_retained.is_empty() {
+            self.inner
+                .lock()
+                .expect("real backend mutex poisoned")
+                .pending_cleanup = pending_retained;
+            *self
+                .reconcile_ready
+                .lock()
+                .expect("reconcile mutex poisoned") = false;
+            return;
+        }
+        let loaded = match store.load() {
+            Ok(loaded) => loaded,
+            Err(_) => {
+                *self
+                    .reconcile_ready
+                    .lock()
+                    .expect("reconcile mutex poisoned") = false;
+                return;
+            }
+        };
+        let found_intents = loaded.intents.len();
+        let found_leases = loaded.leases.len();
+        let mut destroyed = 0usize;
+        let mut stale_cleaned = 0usize;
+        let mut missing_cleaned = 0usize;
+        let mut retained = loaded.invalid;
+        let mut clean_operations = Vec::new();
+        if !loaded.leases.is_empty() {
+            match self.worker.list_slots() {
+                Ok(slots) => {
+                    for record in &loaded.leases {
+                        if !slots.contains(&record.slot_id) {
+                            if store.remove_lease(&record.operation_id).is_ok() {
+                                missing_cleaned += 1;
+                                clean_operations.push(record.operation_id.clone());
+                            } else {
+                                retained += 1;
+                            }
+                            continue;
+                        }
+                        let Ok(lease) = record.lease() else {
+                            retained += 1;
+                            continue;
+                        };
+                        match self.worker.stop(lease) {
+                            Ok(()) => {
+                                if store.remove_lease(&record.operation_id).is_ok() {
+                                    destroyed += 1;
+                                    clean_operations.push(record.operation_id.clone());
+                                } else {
+                                    retained += 1;
+                                }
+                            }
+                            Err(RealWorkerFailure::StaleLease) => {
+                                if store.remove_lease(&record.operation_id).is_ok() {
+                                    stale_cleaned += 1;
+                                    clean_operations.push(record.operation_id.clone());
+                                } else {
+                                    retained += 1;
+                                }
+                            }
+                            Err(_) => retained += 1,
+                        }
+                    }
+                }
+                Err(_) => retained += loaded.leases.len(),
+            }
+        }
+        for operation_id in &clean_operations {
+            if store.remove_intent(operation_id).is_err() {
+                retained += 1;
+            }
+        }
+        let dangling = loaded
+            .intents
+            .iter()
+            .filter(|intent| {
+                !clean_operations.contains(&intent.operation_id)
+                    && !loaded
+                        .leases
+                        .iter()
+                        .any(|lease| lease.operation_id == intent.operation_id)
+            })
+            .count();
+        retained += dangling;
+        let ready = loaded.invalid == 0 && retained == 0;
+        *self
+            .reconcile_ready
+            .lock()
+            .expect("reconcile mutex poisoned") = ready;
+        tracing::info!(
+            found_leases,
+            found_intents,
+            destroyed,
+            stale_cleaned,
+            missing_cleaned,
+            dangling,
+            invalid = loaded.invalid,
+            retained,
+            ready_for_real_sessions = ready,
+            "real lease reconciliation completed"
+        );
+        if dangling > 0 {
+            tracing::warn!(
+                dangling,
+                "unaccounted slot may exist; stop bridge, restart worker, verify full capacity, then use audited intent-clear tool before resuming"
+            );
+        }
+    }
+
+    fn destroy_recorded(&self, record: &LeaseRecord) -> BackendResult<()> {
+        let lease = record
+            .lease()
+            .map_err(|_| BackendError::BackendUnavailable)?;
+        match self.worker.stop(lease) {
+            Ok(()) | Err(RealWorkerFailure::StaleLease) => {
+                let store = self.lease_store();
+                store
+                    .remove_lease(&record.operation_id)
+                    .map_err(|_| BackendError::BackendUnavailable)?;
+                store
+                    .remove_intent(&record.operation_id)
+                    .map_err(|_| BackendError::BackendUnavailable)
+            }
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -1104,6 +1270,10 @@ impl RealBackend {
     }
 
     fn quarantine_after_input_artifact_failure(&self, session: &RealSession) {
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .expect("real lifecycle mutex poisoned");
         {
             let mut inner = self.inner.lock().expect("real backend mutex poisoned");
             if inner
@@ -1119,7 +1289,13 @@ impl RealBackend {
             "input_artifact_failed",
             "real backend input artifact persistence failed",
         );
-        if self.worker.stop(session.lease.clone()).is_err() {
+        let record = LeaseRecord::from_live_session(
+            &session.operation_id,
+            &session.session_id,
+            &session.run_id,
+            &session.lease,
+        );
+        if self.destroy_recorded(&record).is_err() {
             self.append_cleanup_failed(&session.run_id);
         }
     }
@@ -1243,6 +1419,26 @@ impl BridgeBackend for RealBackend {
     }
 
     fn start_session(&self, request: StartBackendSession) -> BackendResult<BackendSession> {
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .expect("real lifecycle mutex poisoned");
+        if self
+            .inner
+            .lock()
+            .expect("real backend mutex poisoned")
+            .active
+            .is_none()
+        {
+            self.reconcile_leases();
+        }
+        if !*self
+            .reconcile_ready
+            .lock()
+            .expect("reconcile mutex poisoned")
+        {
+            return Err(BackendError::BackendUnavailable);
+        }
         let (sequence, session_id, run_id) = {
             let mut inner = self.inner.lock().expect("real backend mutex poisoned");
             if inner.active.is_some() || inner.starting {
@@ -1260,24 +1456,79 @@ impl BridgeBackend for RealBackend {
                 return Err(error);
             }
         };
+        let (allocation_kind, source) = match &start_command {
+            RealStartCommand::RestoreSnapshot { snapshot_hash } => (
+                AllocationKind::RestoreSnapshot,
+                snapshot_hash
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect(),
+            ),
+            RealStartCommand::CreateVm { .. } => {
+                (AllocationKind::CreateVm, "create_vm_config".to_string())
+            }
+        };
+        let intent = LeaseIntent::new(session_id.clone(), run_id.clone(), source, allocation_kind);
+        let store = self.lease_store();
+        if store.write_intent(&intent).is_err() {
+            self.clear_starting();
+            return Err(BackendError::BackendUnavailable);
+        }
         let outcome = match self.worker.start(start_command) {
             Ok(outcome) => outcome,
             Err(error) => {
+                if matches!(error, RealWorkerFailure::AllocationRejected)
+                    && store.remove_intent(&intent.operation_id).is_err()
+                {
+                    *self
+                        .reconcile_ready
+                        .lock()
+                        .expect("reconcile mutex poisoned") = false;
+                }
                 self.clear_starting();
                 return Err(error.into());
             }
         };
+        let lease_record = intent.promote(&outcome.lease);
+        if store.write_lease(&lease_record).is_err() && store.write_lease(&lease_record).is_err() {
+            match self.worker.stop(outcome.lease.clone()) {
+                Ok(()) | Err(RealWorkerFailure::StaleLease) => {
+                    let _ = store.remove_intent(&intent.operation_id);
+                }
+                Err(_) => {
+                    self.inner
+                        .lock()
+                        .expect("real backend mutex poisoned")
+                        .pending_cleanup
+                        .push(lease_record);
+                    *self
+                        .reconcile_ready
+                        .lock()
+                        .expect("reconcile mutex poisoned") = false;
+                }
+            }
+            self.clear_starting();
+            return Err(BackendError::BackendUnavailable);
+        }
+        if store.remove_intent(&intent.operation_id).is_err() {
+            // A duplicate intent is harmless because the token-bearing record is authoritative.
+            *self
+                .reconcile_ready
+                .lock()
+                .expect("reconcile mutex poisoned") = false;
+        }
 
         if let Err(error) = self.write_real_manifest(&run_id).and_then(|_| {
             self.append_real_event(&run_id, "session_started", "real backend session started")
         }) {
-            let _ = self.worker.stop(outcome.lease.clone());
+            let _ = self.destroy_recorded(&lease_record);
             self.append_cleanup_failed(&run_id);
             self.clear_starting();
             return Err(error);
         }
 
         let session = RealSession {
+            operation_id: intent.operation_id,
             session_id,
             run_id,
             lease: outcome.lease,
@@ -1306,6 +1557,10 @@ impl BridgeBackend for RealBackend {
         session_id: SessionId,
         _reason: StopReason,
     ) -> BackendResult<StoppedSession> {
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .expect("real lifecycle mutex poisoned");
         let session = {
             let mut inner = self.inner.lock().expect("real backend mutex poisoned");
             let Some(session) = inner
@@ -1323,7 +1578,13 @@ impl BridgeBackend for RealBackend {
             state: SessionState::Stopped,
             final_frame: session.current_frame,
         };
-        match self.worker.stop(session.lease) {
+        let record = LeaseRecord::from_live_session(
+            &session.operation_id,
+            &session.session_id,
+            &session.run_id,
+            &session.lease,
+        );
+        match self.destroy_recorded(&record) {
             Ok(()) => {
                 self.append_real_event(
                     &session.run_id,
@@ -2187,6 +2448,7 @@ struct RealBackendInner {
     capture_jobs: BTreeMap<CaptureJobId, RealCaptureJobState>,
     capture_idempotency: BTreeMap<(SessionId, String), CaptureJobId>,
     starting: bool,
+    pending_cleanup: Vec<LeaseRecord>,
 }
 
 #[derive(Debug, Clone)]
@@ -2213,6 +2475,7 @@ impl RealCaptureJobState {
 
 #[derive(Debug, Clone)]
 struct RealSession {
+    operation_id: String,
     session_id: SessionId,
     run_id: RunId,
     lease: dh::Lease,
@@ -2292,6 +2555,14 @@ impl RealWorkerThread {
         let (reply, rx) = mpsc::channel();
         self.tx
             .send(RealWorkerCommand::Stop { lease, reply })
+            .map_err(|_| RealWorkerFailure::BackendUnavailable)?;
+        recv_worker_reply(rx)
+    }
+
+    fn list_slots(&self) -> RealWorkerResult<Vec<u64>> {
+        let (reply, rx) = mpsc::channel();
+        self.tx
+            .send(RealWorkerCommand::ListSlots { reply })
             .map_err(|_| RealWorkerFailure::BackendUnavailable)?;
         recv_worker_reply(rx)
     }
@@ -2404,6 +2675,9 @@ enum RealWorkerCommand {
         lease: dh::Lease,
         reply: mpsc::Sender<RealWorkerResult<()>>,
     },
+    ListSlots {
+        reply: mpsc::Sender<RealWorkerResult<Vec<u64>>>,
+    },
     Pause {
         lease: dh::Lease,
         reply: mpsc::Sender<RealWorkerResult<RealPauseOutcome>>,
@@ -2455,6 +2729,8 @@ enum RealWorkerFailure {
     BackendUnavailable,
     FailedPrecondition,
     FrameStale,
+    StaleLease,
+    AllocationRejected,
 }
 
 impl From<RealWorkerFailure> for BackendError {
@@ -2462,7 +2738,9 @@ impl From<RealWorkerFailure> for BackendError {
         match failure {
             RealWorkerFailure::BackendUnavailable
             | RealWorkerFailure::FailedPrecondition
-            | RealWorkerFailure::FrameStale => BackendError::BackendUnavailable,
+            | RealWorkerFailure::FrameStale
+            | RealWorkerFailure::StaleLease
+            | RealWorkerFailure::AllocationRejected => BackendError::BackendUnavailable,
         }
     }
 }
@@ -2593,6 +2871,9 @@ fn run_real_worker_thread(
             }
             RealWorkerCommand::Stop { lease, reply } => {
                 let _ = reply.send(run_worker_future(&runtime, state.stop(lease)));
+            }
+            RealWorkerCommand::ListSlots { reply } => {
+                let _ = reply.send(run_worker_future(&runtime, state.list_slots()));
             }
             RealWorkerCommand::Pause { lease, reply } => {
                 let _ = reply.send(run_worker_future(&runtime, state.pause(lease)));
@@ -2781,6 +3062,9 @@ fn reply_unavailable(command: RealWorkerCommand) {
         RealWorkerCommand::Stop { reply, .. } => {
             let _ = reply.send(Err(RealWorkerFailure::BackendUnavailable));
         }
+        RealWorkerCommand::ListSlots { reply } => {
+            let _ = reply.send(Err(RealWorkerFailure::BackendUnavailable));
+        }
         RealWorkerCommand::Pause { reply, .. } => {
             let _ = reply.send(Err(RealWorkerFailure::BackendUnavailable));
         }
@@ -2845,7 +3129,7 @@ impl RealWorkerState {
                     .await
                     .map_err(|status| {
                         log_worker_rpc_failure("RestoreSnapshot", &status);
-                        RealWorkerFailure::BackendUnavailable
+                        allocation_worker_failure_from_status(status)
                     })?
                     .into_inner();
                 let lease = response
@@ -2872,7 +3156,7 @@ impl RealWorkerState {
                     .await
                     .map_err(|status| {
                         log_worker_rpc_failure("CreateVm", &status);
-                        RealWorkerFailure::BackendUnavailable
+                        allocation_worker_failure_from_status(status)
                     })?
                     .into_inner();
                 let lease = response
@@ -2895,9 +3179,27 @@ impl RealWorkerState {
             .await
             .map_err(|status| {
                 log_worker_rpc_failure("DestroyVm", &status);
-                RealWorkerFailure::BackendUnavailable
+                destroy_worker_failure_from_status(status)
             })?;
         Ok(())
+    }
+
+    async fn list_slots(&mut self) -> RealWorkerResult<Vec<u64>> {
+        Ok(self
+            .client()
+            .await?
+            .list_slots(dh::ListSlotsRequest {})
+            .await
+            .map_err(|status| {
+                log_worker_rpc_failure("ListSlots", &status);
+                RealWorkerFailure::BackendUnavailable
+            })?
+            .into_inner()
+            .slots
+            .into_iter()
+            .filter(|slot| slot.state != dh::SlotState::Empty as i32)
+            .map(|slot| slot.slot_id)
+            .collect())
     }
 
     async fn pause(&mut self, lease: dh::Lease) -> RealWorkerResult<RealPauseOutcome> {
@@ -3270,6 +3572,26 @@ fn worker_failure_from_status(status: tonic::Status) -> RealWorkerFailure {
     }
 }
 
+fn destroy_worker_failure_from_status(status: tonic::Status) -> RealWorkerFailure {
+    if status.code() == Code::FailedPrecondition {
+        if let Ok(detail) = dh::ErrorDetail::decode(status.details()) {
+            if detail.code == "stale_lease" || detail.code == "no_such_slot" {
+                return RealWorkerFailure::StaleLease;
+            }
+        }
+        RealWorkerFailure::FailedPrecondition
+    } else {
+        RealWorkerFailure::BackendUnavailable
+    }
+}
+
+fn allocation_worker_failure_from_status(status: tonic::Status) -> RealWorkerFailure {
+    match status.code() {
+        Code::InvalidArgument | Code::ResourceExhausted => RealWorkerFailure::AllocationRejected,
+        _ => RealWorkerFailure::BackendUnavailable,
+    }
+}
+
 fn input_worker_failure_from_status(status: tonic::Status) -> RealWorkerFailure {
     match status.code() {
         Code::InvalidArgument => RealWorkerFailure::FrameStale,
@@ -3278,14 +3600,10 @@ fn input_worker_failure_from_status(status: tonic::Status) -> RealWorkerFailure 
     }
 }
 
-// Status codes and messages originate from our own hypervisor worker and are
-// generic protocol strings, so they are safe to log; never log request
-// payloads, leases, or snapshot refs here.
 fn log_worker_rpc_failure(rpc: &'static str, status: &tonic::Status) {
     tracing::warn!(
         rpc,
         code = %status.code(),
-        message = %status.message(),
         "hypervisor rpc failed"
     );
 }

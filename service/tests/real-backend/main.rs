@@ -19,6 +19,7 @@ use rom_operator_bridge_service::{
     },
     config::{ENV_BACKEND_MODE, ServiceConfig},
     input::{PadButton, PadLog, PadWord},
+    lease_store::{AllocationKind, LeaseIntent, LeaseStore},
     private_config::{
         ENV_CAPTURE_SPEC_REF, ENV_CREATE_VM_CONFIG_REF, ENV_HYPERVISOR_ENDPOINT, ENV_PRIVATE_ROOT,
         ENV_REAL_SNAPSHOT_REF, ENV_REFERENCE_WORKLOAD_CHECKOUT, ENV_SESSION_SECRET,
@@ -28,6 +29,8 @@ use rom_operator_bridge_service::{
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -44,6 +47,386 @@ const WORKLOAD_IMAGE_REF: &str = "private-workload-image-ref-from-test";
 const CAPTURE_SPEC_REF: &str = "private-capture-spec-ref-from-test";
 const SNAPSHOT_REF: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 const LEASE_TOKEN: &[u8] = b"mock-private-lease-token";
+
+fn seed_record(store: &LeaseStore, token: &[u8]) -> LeaseIntent {
+    let intent = LeaseIntent::new(
+        "old-session".into(),
+        "old-run".into(),
+        SNAPSHOT_REF.into(),
+        AllocationKind::RestoreSnapshot,
+    );
+    store.write_intent(&intent).expect("seed intent");
+    store
+        .write_lease(&intent.promote(&dh::Lease {
+            slot_id: 7,
+            token: token.to_vec(),
+        }))
+        .expect("seed lease");
+    intent
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_without_records_skips_worker_reconciliation_rpc() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let root = workspace.path().join("private");
+    let checkout = workspace.path().join("checkout");
+    let worker = MockWorker::new();
+    let server = WorkerServer::start(worker.clone()).await;
+    let config = real_config_with_start(
+        &root,
+        &checkout,
+        &format!("unix://{}", server.uds_path.display()),
+        Some((ENV_REAL_SNAPSHOT_REF, SNAPSHOT_REF.into())),
+    );
+    let _backend = real_backend_from_config(&config);
+    assert!(!worker.calls().contains(&"list_slots"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dangling_intent_blocks_without_tokenless_worker_calls() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let root = workspace.path().join("private");
+    let checkout = workspace.path().join("checkout");
+    let worker = MockWorker::new();
+    let server = WorkerServer::start(worker.clone()).await;
+    let config = real_config_with_start(
+        &root,
+        &checkout,
+        &format!("unix://{}", server.uds_path.display()),
+        Some((ENV_REAL_SNAPSHOT_REF, SNAPSHOT_REF.into())),
+    );
+    let store = LeaseStore::new(config.private_config().clone());
+    let intent = LeaseIntent::new(
+        "old-session".into(),
+        "old-run".into(),
+        SNAPSHOT_REF.into(),
+        AllocationKind::RestoreSnapshot,
+    );
+    store.write_intent(&intent).expect("seed");
+    let backend = real_backend_from_config(&config);
+    assert!(
+        backend
+            .start_session(StartBackendSession {
+                requested_capabilities: BackendCapabilities::real_preview_mvp()
+            })
+            .is_err()
+    );
+    assert!(!worker.calls().contains(&"list_slots"));
+    assert!(!worker.calls().contains(&"destroy_vm"));
+    assert_eq!(store.load().expect("load").intents.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_token_and_missing_slot_records_are_benignly_cleaned() {
+    for present in [true, false] {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let root = workspace.path().join("private");
+        let checkout = workspace.path().join("checkout");
+        let worker = MockWorker::new();
+        if present {
+            let mut state = worker.state.lock().expect("worker");
+            state.active_slot = Some(MockWorker::active_slot(0));
+            state.active_token = Some(LEASE_TOKEN.to_vec());
+        }
+        let server = WorkerServer::start(worker.clone()).await;
+        let config = real_config_with_start(
+            &root,
+            &checkout,
+            &format!("unix://{}", server.uds_path.display()),
+            Some((ENV_REAL_SNAPSHOT_REF, SNAPSHOT_REF.into())),
+        );
+        let store = LeaseStore::new(config.private_config().clone());
+        seed_record(&store, b"recycled-old-token");
+        let _backend = real_backend_from_config(&config);
+        let loaded = store.load().expect("load");
+        assert!(loaded.leases.is_empty());
+        assert!(loaded.intents.is_empty());
+        assert_eq!(worker.calls().contains(&"destroy_vm"), present);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proven_rejection_clears_intent_but_lost_response_retains_it() {
+    for (status, lost, expected_intents) in [
+        (Some(tonic::Code::InvalidArgument), false, 0),
+        (None, true, 1),
+    ] {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let root = workspace.path().join("private");
+        let checkout = workspace.path().join("checkout");
+        let worker = MockWorker::new();
+        {
+            let mut state = worker.state.lock().expect("worker");
+            state.allocation_status = status;
+            state.allocate_then_drop_response = lost;
+        }
+        let server = WorkerServer::start(worker.clone()).await;
+        let config = real_config_with_start(
+            &root,
+            &checkout,
+            &format!("unix://{}", server.uds_path.display()),
+            Some((ENV_REAL_SNAPSHOT_REF, SNAPSHOT_REF.into())),
+        );
+        let backend = real_backend_from_config(&config);
+        assert!(
+            backend
+                .start_session(StartBackendSession {
+                    requested_capabilities: BackendCapabilities::real_preview_mvp()
+                })
+                .is_err()
+        );
+        assert_eq!(
+            LeaseStore::new(config.private_config().clone())
+                .load()
+                .expect("load")
+                .intents
+                .len(),
+            expected_intents
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_unavailable_reconcile_retains_then_later_unblocks() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let root = workspace.path().join("private");
+    let checkout = workspace.path().join("checkout");
+    let worker = MockWorker::new();
+    {
+        let mut state = worker.state.lock().expect("worker");
+        state.active_slot = Some(MockWorker::active_slot(0));
+        state.active_token = Some(LEASE_TOKEN.to_vec());
+        state.list_slots_status = Some(tonic::Code::Unavailable);
+    }
+    let server = WorkerServer::start(worker.clone()).await;
+    let config = real_config_with_start(
+        &root,
+        &checkout,
+        &format!("unix://{}", server.uds_path.display()),
+        Some((ENV_REAL_SNAPSHOT_REF, SNAPSHOT_REF.into())),
+    );
+    let store = LeaseStore::new(config.private_config().clone());
+    seed_record(&store, LEASE_TOKEN);
+    let started = std::time::Instant::now();
+    let backend = real_backend_from_config(&config);
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    assert_eq!(store.load().expect("retained").leases.len(), 1);
+    assert!(
+        backend
+            .start_session(StartBackendSession {
+                requested_capabilities: BackendCapabilities::real_preview_mvp()
+            })
+            .is_err()
+    );
+    worker.state.lock().expect("worker").list_slots_status = None;
+    backend
+        .start_session(StartBackendSession {
+            requested_capabilities: BackendCapabilities::real_preview_mvp(),
+        })
+        .expect("recovery unblocks");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_reconcile_converges_after_partial_cleanup_shape() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let root = workspace.path().join("private");
+    let checkout = workspace.path().join("checkout");
+    let worker = MockWorker::new();
+    {
+        let mut state = worker.state.lock().expect("worker");
+        state.active_slot = Some(MockWorker::active_slot(0));
+        state.active_token = Some(LEASE_TOKEN.to_vec());
+    }
+    let server = WorkerServer::start(worker.clone()).await;
+    let config = real_config_with_start(
+        &root,
+        &checkout,
+        &format!("unix://{}", server.uds_path.display()),
+        Some((ENV_REAL_SNAPSHOT_REF, SNAPSHOT_REF.into())),
+    );
+    let store = LeaseStore::new(config.private_config().clone());
+    seed_record(&store, LEASE_TOKEN);
+    seed_record(&store, LEASE_TOKEN);
+    let first = real_backend_from_config(&config);
+    drop(first);
+    assert!(store.load().expect("first pass").leases.is_empty());
+    let before = worker
+        .calls()
+        .iter()
+        .filter(|call| **call == "destroy_vm")
+        .count();
+    let _second = real_backend_from_config(&config);
+    assert_eq!(
+        worker
+            .calls()
+            .iter()
+            .filter(|call| **call == "destroy_vm")
+            .count(),
+        before
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_real_starts_are_serialized_across_persistence_and_rpc() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let root = workspace.path().join("private");
+    let checkout = workspace.path().join("checkout");
+    let worker = MockWorker::new();
+    let server = WorkerServer::start(worker.clone()).await;
+    let config = real_config_with_start(
+        &root,
+        &checkout,
+        &format!("unix://{}", server.uds_path.display()),
+        Some((ENV_REAL_SNAPSHOT_REF, SNAPSHOT_REF.into())),
+    );
+    let backend = real_backend_from_config(&config);
+    let a = backend.clone();
+    let b = backend.clone();
+    let first = tokio::task::spawn_blocking(move || {
+        a.start_session(StartBackendSession {
+            requested_capabilities: BackendCapabilities::real_preview_mvp(),
+        })
+    });
+    let second = tokio::task::spawn_blocking(move || {
+        b.start_session(StartBackendSession {
+            requested_capabilities: BackendCapabilities::real_preview_mvp(),
+        })
+    });
+    let results = [first.await.expect("join"), second.await.expect("join")];
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        worker
+            .calls()
+            .iter()
+            .filter(|call| **call == "restore_snapshot")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nondiscriminated_failed_preconditions_retain_lease_records() {
+    for malformed in [false, true] {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let root = workspace.path().join("private");
+        let checkout = workspace.path().join("checkout");
+        let worker = MockWorker::new();
+        {
+            let mut state = worker.state.lock().expect("worker");
+            state.active_slot = Some(MockWorker::active_slot(0));
+            state.active_token = Some(LEASE_TOKEN.to_vec());
+            state.destroy_detail_override = (!malformed).then(|| "wrong_state".to_string());
+            state.destroy_malformed_details = malformed;
+        }
+        let server = WorkerServer::start(worker.clone()).await;
+        let config = real_config_with_start(
+            &root,
+            &checkout,
+            &format!("unix://{}", server.uds_path.display()),
+            Some((ENV_REAL_SNAPSHOT_REF, SNAPSHOT_REF.into())),
+        );
+        let store = LeaseStore::new(config.private_config().clone());
+        seed_record(&store, LEASE_TOKEN);
+        let _backend = real_backend_from_config(&config);
+        assert_eq!(store.load().expect("retained").leases.len(), 1);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_with_active_session_reconciles_before_next_allocation() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let private_root = workspace.path().join("bridge-private");
+    let reference_checkout = workspace.path().join("reference-workload");
+    let worker = MockWorker::new();
+    let server = WorkerServer::start(worker.clone()).await;
+    let config = real_config_with_start(
+        &private_root,
+        &reference_checkout,
+        &format!("unix://{}", server.uds_path.display()),
+        Some((ENV_REAL_SNAPSHOT_REF, SNAPSHOT_REF.to_string())),
+    );
+    let backend = real_backend_from_config(&config);
+    backend
+        .start_session(StartBackendSession {
+            requested_capabilities: BackendCapabilities::real_preview_mvp(),
+        })
+        .expect("start");
+    assert_eq!(
+        LeaseStore::new(config.private_config().clone())
+            .load()
+            .expect("load")
+            .leases
+            .len(),
+        1
+    );
+    drop(backend);
+    let restarted = real_backend_from_config(&config);
+    let loaded = LeaseStore::new(config.private_config().clone())
+        .load()
+        .expect("load after reconcile");
+    assert!(loaded.leases.is_empty());
+    assert!(loaded.intents.is_empty());
+    restarted
+        .start_session(StartBackendSession {
+            requested_capabilities: BackendCapabilities::real_preview_mvp(),
+        })
+        .expect("new allocation after reconcile");
+    let calls = worker.calls();
+    let destroy = calls
+        .iter()
+        .position(|call| *call == "destroy_vm")
+        .expect("destroy");
+    assert!(
+        calls
+            .iter()
+            .skip(destroy + 1)
+            .any(|call| *call == "restore_snapshot")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_stop_record_is_reconciled_before_later_start() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let private_root = workspace.path().join("bridge-private");
+    let reference_checkout = workspace.path().join("reference-workload");
+    let worker = MockWorker::new();
+    let server = WorkerServer::start(worker.clone()).await;
+    let config = real_config_with_start(
+        &private_root,
+        &reference_checkout,
+        &format!("unix://{}", server.uds_path.display()),
+        Some((ENV_REAL_SNAPSHOT_REF, SNAPSHOT_REF.to_string())),
+    );
+    let backend = real_backend_from_config(&config);
+    let session = backend
+        .start_session(StartBackendSession {
+            requested_capabilities: BackendCapabilities::real_preview_mvp(),
+        })
+        .expect("start");
+    worker.state.lock().expect("worker").destroy_fails = true;
+    assert!(
+        backend
+            .stop_session(
+                session.session_id,
+                rom_operator_bridge_service::backend::StopReason::OperatorStop
+            )
+            .is_err()
+    );
+    assert_eq!(
+        LeaseStore::new(config.private_config().clone())
+            .load()
+            .expect("load")
+            .leases
+            .len(),
+        1
+    );
+    worker.state.lock().expect("worker").destroy_fails = false;
+    backend
+        .start_session(StartBackendSession {
+            requested_capabilities: BackendCapabilities::real_preview_mvp(),
+        })
+        .expect("retry reconciles and starts");
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_start_without_attached_worker_returns_sanitized_backend_unavailable() {
@@ -2465,6 +2848,10 @@ fn sha256_ref(bytes: &[u8]) -> String {
 }
 
 fn assert_private_artifacts_do_not_contain_lease(private_root: &Path) {
+    let token_hex: String = LEASE_TOKEN
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
     let run_dir = private_root.join("runs").join("real-run-0000");
     for file_name in [
         "run-manifest.json",
@@ -2479,10 +2866,25 @@ fn assert_private_artifacts_do_not_contain_lease(private_root: &Path) {
         let contents = fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
         assert!(
-            !contents.contains(&String::from_utf8(LEASE_TOKEN.to_vec()).expect("lease token utf8")),
+            !contents.contains(&String::from_utf8(LEASE_TOKEN.to_vec()).expect("lease token utf8"))
+                && !contents.contains(&token_hex),
             "private artifact persisted lease token: {}",
             path.display()
         );
+    }
+    // The decoded, validated active lease record is the sole durable token
+    // allowlist. It remains private mode 0600 and is removed only after cleanup.
+    let active = private_root.join("leases/active");
+    for entry in fs::read_dir(active).expect("active lease directory") {
+        let path = entry.expect("lease entry").path();
+        let metadata = fs::symlink_metadata(&path).expect("lease metadata");
+        assert!(metadata.file_type().is_file());
+        #[cfg(unix)]
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        let value: Value = serde_json::from_slice(&fs::read(&path).expect("lease record read"))
+            .expect("validated lease json");
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["token_hex"], token_hex);
     }
 }
 
@@ -2564,12 +2966,17 @@ struct MockWorker {
 struct MockWorkerState {
     calls: Vec<&'static str>,
     active_slot: Option<dh::SlotInfo>,
+    active_token: Option<Vec<u8>>,
     restore_hash: Option<Vec<u8>>,
     create_vm: Option<dh::CreateVmRequest>,
     take_snapshot_requests: Vec<dh::TakeSnapshotRequest>,
     inject_inputs: Vec<dh::InjectInputsRequest>,
     run_with_frame_capture_requests: Vec<dh::RunWithFrameCaptureRequest>,
     destroy_fails: bool,
+    destroy_detail_override: Option<String>,
+    destroy_malformed_details: bool,
+    allocation_status: Option<tonic::Code>,
+    allocate_then_drop_response: bool,
     inject_status: Option<tonic::Code>,
     inject_scheduled: u32,
     run_status: Option<tonic::Code>,
@@ -2597,12 +3004,17 @@ impl Default for MockWorkerState {
         Self {
             calls: Vec::new(),
             active_slot: None,
+            active_token: None,
             restore_hash: None,
             create_vm: None,
             take_snapshot_requests: Vec::new(),
             inject_inputs: Vec::new(),
             run_with_frame_capture_requests: Vec::new(),
             destroy_fails: false,
+            destroy_detail_override: None,
+            destroy_malformed_details: false,
+            allocation_status: None,
+            allocate_then_drop_response: false,
             inject_status: None,
             inject_scheduled: 1,
             run_status: None,
@@ -2745,10 +3157,17 @@ impl HypervisorWorker for MockWorker {
     ) -> Result<TonicResponse<dh::CreateVmResponse>, Status> {
         let mut state = self.state.lock().expect("mock worker mutex poisoned");
         state.calls.push("create_vm");
+        if let Some(code) = state.allocation_status {
+            return Err(Status::new(code, "allocation rejected"));
+        }
         let request = request.into_inner();
         state.create_vm = Some(request);
         state.icount = 0;
         state.active_slot = Some(Self::active_slot(0));
+        state.active_token = Some(LEASE_TOKEN.to_vec());
+        if state.allocate_then_drop_response {
+            return Err(Status::unavailable("response lost"));
+        }
         Ok(TonicResponse::new(dh::CreateVmResponse {
             lease: Some(Self::lease()),
             icount: 0,
@@ -2761,9 +3180,16 @@ impl HypervisorWorker for MockWorker {
     ) -> Result<TonicResponse<dh::RestoreSnapshotResponse>, Status> {
         let mut state = self.state.lock().expect("mock worker mutex poisoned");
         state.calls.push("restore_snapshot");
+        if let Some(code) = state.allocation_status {
+            return Err(Status::new(code, "allocation rejected"));
+        }
         state.restore_hash = request.into_inner().snapshot.map(|snapshot| snapshot.hash);
         state.icount = 0;
         state.active_slot = Some(Self::active_slot(0));
+        state.active_token = Some(LEASE_TOKEN.to_vec());
+        if state.allocate_then_drop_response {
+            return Err(Status::unavailable("response lost"));
+        }
         Ok(TonicResponse::new(dh::RestoreSnapshotResponse {
             lease: Some(Self::lease()),
             config: None,
@@ -2781,14 +3207,32 @@ impl HypervisorWorker for MockWorker {
 
     async fn destroy_vm(
         &self,
-        _request: TonicRequest<dh::DestroyVmRequest>,
+        request: TonicRequest<dh::DestroyVmRequest>,
     ) -> Result<TonicResponse<dh::DestroyVmResponse>, Status> {
         let mut state = self.state.lock().expect("mock worker mutex poisoned");
         state.calls.push("destroy_vm");
         if state.destroy_fails {
             return Err(Status::unavailable("private worker destroy failure"));
         }
+        if state.destroy_malformed_details {
+            return Err(Status::with_details(
+                tonic::Code::FailedPrecondition,
+                "worker precondition failed",
+                vec![0xff].into(),
+            ));
+        }
+        if let Some(code) = &state.destroy_detail_override {
+            return Err(worker_detail_status(code));
+        }
+        let lease = request.into_inner().lease;
+        if state.active_slot.is_none() {
+            return Err(worker_detail_status("no_such_slot"));
+        }
+        if lease.as_ref().map(|lease| lease.token.as_slice()) != state.active_token.as_deref() {
+            return Err(worker_detail_status("stale_lease"));
+        }
         state.active_slot = None;
+        state.active_token = None;
         Ok(TonicResponse::new(dh::DestroyVmResponse {}))
     }
 
@@ -3042,4 +3486,19 @@ impl HypervisorWorker for MockWorker {
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
         Ok(TonicResponse::new(ReceiverStream::new(rx)))
     }
+}
+
+fn worker_detail_status(code: &str) -> Status {
+    use prost::Message;
+    Status::with_details(
+        tonic::Code::FailedPrecondition,
+        "worker precondition failed",
+        dh::ErrorDetail {
+            code: code.to_string(),
+            slot_id: 7,
+            icount: 0,
+        }
+        .encode_to_vec()
+        .into(),
+    )
 }

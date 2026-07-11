@@ -303,3 +303,6 @@ Expected deployment check results:
   address;
 - the deployed static root is a clean, scanned release directory with no
   source maps, symlinks, private values, or mixed-content runtime endpoints.
+# Persistent real-worker leases
+
+Real-worker allocations use durable write-ahead intent and active-lease records in the bridge private root. Startup destroys recoverable orphan leases before permitting a real session; failures and dangling intents block real allocation but do not prevent health/diagnostic service startup. See `docs/operator-runbook.md` for the stopped-bridge, worker-restart, capacity-verification, and audited selected-intent acknowledgement procedure. Lease records are secret-bearing and must not enter ordinary artifact, backup, or log pipelines.
