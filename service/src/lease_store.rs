@@ -106,25 +106,6 @@ impl LeaseRecord {
             token: hex_decode(&self.token_hex)?,
         })
     }
-    pub fn from_live_session(
-        operation_id: &str,
-        session_id: &str,
-        run_id: &str,
-        lease: &dh_proto::v1::Lease,
-    ) -> Self {
-        Self {
-            schema_version: SCHEMA_VERSION,
-            operation_id: operation_id.to_string(),
-            session_id: session_id.to_string(),
-            run_id: run_id.to_string(),
-            source: "recorded_session".to_string(),
-            created_at: now(),
-            allocation_kind: AllocationKind::CreateVm,
-            slot_id: lease.slot_id,
-            token_hex: hex_encode(&lease.token),
-            lease_recorded_at: now(),
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -164,6 +145,10 @@ impl LeaseStore {
     }
     pub fn clear_dangling_intents(&self, selected: &[String]) -> Result<usize, LeaseStoreError> {
         if selected.is_empty() {
+            return Err(LeaseStoreError::InvalidSelection);
+        }
+        let unique: std::collections::BTreeSet<_> = selected.iter().collect();
+        if unique.len() != selected.len() {
             return Err(LeaseStoreError::InvalidSelection);
         }
         let loaded = self.load()?;
@@ -216,6 +201,9 @@ impl LeaseStore {
         let mut records = Vec::new();
         let mut invalid = 0;
         for path in self.config.list_private_files(dir)? {
+            if is_atomic_temp_path(&path) {
+                continue;
+            }
             let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
                 invalid += 1;
                 continue;
@@ -247,21 +235,94 @@ trait RecordValidation {
 }
 impl RecordValidation for LeaseIntent {
     fn valid_for(&self, id: &str) -> bool {
-        self.schema_version == SCHEMA_VERSION
-            && self.operation_id == id
-            && validate_operation_id(id).is_ok()
+        valid_common(
+            self.schema_version,
+            &self.operation_id,
+            id,
+            &self.session_id,
+            &self.run_id,
+            &self.source,
+            &self.created_at,
+            self.allocation_kind,
+        )
     }
 }
 impl RecordValidation for LeaseRecord {
     fn valid_for(&self, id: &str) -> bool {
-        self.schema_version == SCHEMA_VERSION
-            && self.operation_id == id
-            && validate_operation_id(id).is_ok()
+        valid_common(
+            self.schema_version,
+            &self.operation_id,
+            id,
+            &self.session_id,
+            &self.run_id,
+            &self.source,
+            &self.created_at,
+            self.allocation_kind,
+        ) && self.lease_recorded_at.parse::<u64>().is_ok()
             && hex_decode(&self.token_hex).is_ok()
     }
 }
+#[allow(clippy::too_many_arguments)]
+fn valid_common(
+    schema_version: u32,
+    operation_id: &str,
+    file_id: &str,
+    session_id: &str,
+    run_id: &str,
+    source: &str,
+    created_at: &str,
+    allocation_kind: AllocationKind,
+) -> bool {
+    let source_valid = match allocation_kind {
+        AllocationKind::RestoreSnapshot => {
+            source.len() == 64
+                && source
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        }
+        AllocationKind::CreateVm => source == "create_vm_config",
+    };
+    schema_version == SCHEMA_VERSION
+        && operation_id == file_id
+        && validate_operation_id(file_id).is_ok()
+        && safe_identifier(session_id)
+        && safe_identifier(run_id)
+        && created_at.parse::<u64>().is_ok()
+        && source_valid
+}
+fn safe_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
 fn record_path(dir: &str, id: &str) -> PathBuf {
     Path::new(dir).join(format!("{id}.json"))
+}
+fn is_atomic_temp_path(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(rest) = name.strip_prefix(".tmp-") else {
+        return false;
+    };
+    let mut parts = rest.rsplitn(3, '-');
+    let (Some(nanos), Some(pid), Some(record_name)) = (parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    if nanos.is_empty()
+        || pid.is_empty()
+        || !nanos.bytes().all(|byte| byte.is_ascii_digit())
+        || !pid.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return false;
+    }
+    let Some(id) = record_name.strip_suffix(".json") else {
+        return false;
+    };
+    validate_operation_id(id).is_ok()
 }
 fn validate_operation_id(id: &str) -> Result<(), LeaseStoreError> {
     let value = Uuid::parse_str(id).map_err(|_| LeaseStoreError::InvalidRecord)?;
@@ -283,7 +344,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 fn hex_decode(value: &str) -> Result<Vec<u8>, LeaseStoreError> {
     if value.is_empty()
-        || value.len() % 2 != 0
+        || !value.len().is_multiple_of(2)
         || !value
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))

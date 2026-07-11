@@ -32,6 +32,7 @@ use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -49,6 +50,10 @@ const SNAPSHOT_REF: &str = "1111111111111111111111111111111111111111111111111111
 const LEASE_TOKEN: &[u8] = b"mock-private-lease-token";
 
 fn seed_record(store: &LeaseStore, token: &[u8]) -> LeaseIntent {
+    seed_record_for_slot(store, 7, token)
+}
+
+fn seed_record_for_slot(store: &LeaseStore, slot_id: u64, token: &[u8]) -> LeaseIntent {
     let intent = LeaseIntent::new(
         "old-session".into(),
         "old-run".into(),
@@ -58,7 +63,7 @@ fn seed_record(store: &LeaseStore, token: &[u8]) -> LeaseIntent {
     store.write_intent(&intent).expect("seed intent");
     store
         .write_lease(&intent.promote(&dh::Lease {
-            slot_id: 7,
+            slot_id,
             token: token.to_vec(),
         }))
         .expect("seed lease");
@@ -125,8 +130,7 @@ async fn stale_token_and_missing_slot_records_are_benignly_cleaned() {
         let worker = MockWorker::new();
         if present {
             let mut state = worker.state.lock().expect("worker");
-            state.active_slot = Some(MockWorker::active_slot(0));
-            state.active_token = Some(LEASE_TOKEN.to_vec());
+            state.set_active_slot(7, LEASE_TOKEN.to_vec(), 0);
         }
         let server = WorkerServer::start(worker.clone()).await;
         let config = real_config_with_start(
@@ -183,6 +187,24 @@ async fn proven_rejection_clears_intent_but_lost_response_retains_it() {
                 .len(),
             expected_intents
         );
+        if lost {
+            assert!(
+                backend
+                    .start_session(StartBackendSession {
+                        requested_capabilities: BackendCapabilities::real_preview_mvp(),
+                    })
+                    .is_err()
+            );
+            assert_eq!(
+                worker
+                    .calls()
+                    .iter()
+                    .filter(|call| **call == "restore_snapshot")
+                    .count(),
+                1,
+                "a dangling intent must block another allocation attempt"
+            );
+        }
     }
 }
 
@@ -194,8 +216,7 @@ async fn worker_unavailable_reconcile_retains_then_later_unblocks() {
     let worker = MockWorker::new();
     {
         let mut state = worker.state.lock().expect("worker");
-        state.active_slot = Some(MockWorker::active_slot(0));
-        state.active_token = Some(LEASE_TOKEN.to_vec());
+        state.set_active_slot(7, LEASE_TOKEN.to_vec(), 0);
         state.list_slots_status = Some(tonic::Code::Unavailable);
     }
     let server = WorkerServer::start(worker.clone()).await;
@@ -234,8 +255,8 @@ async fn repeated_reconcile_converges_after_partial_cleanup_shape() {
     let worker = MockWorker::new();
     {
         let mut state = worker.state.lock().expect("worker");
-        state.active_slot = Some(MockWorker::active_slot(0));
-        state.active_token = Some(LEASE_TOKEN.to_vec());
+        state.set_active_slot(7, LEASE_TOKEN.to_vec(), 0);
+        state.set_active_slot(8, b"second-slot-token".to_vec(), 0);
     }
     let server = WorkerServer::start(worker.clone()).await;
     let config = real_config_with_start(
@@ -245,8 +266,8 @@ async fn repeated_reconcile_converges_after_partial_cleanup_shape() {
         Some((ENV_REAL_SNAPSHOT_REF, SNAPSHOT_REF.into())),
     );
     let store = LeaseStore::new(config.private_config().clone());
-    seed_record(&store, LEASE_TOKEN);
-    seed_record(&store, LEASE_TOKEN);
+    seed_record_for_slot(&store, 7, LEASE_TOKEN);
+    seed_record_for_slot(&store, 8, b"second-slot-token");
     let first = real_backend_from_config(&config);
     drop(first);
     assert!(store.load().expect("first pass").leases.is_empty());
@@ -305,6 +326,51 @@ async fn concurrent_real_starts_are_serialized_across_persistence_and_rpc() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_stop_and_start_serialize_without_orphaning_a_record() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let root = workspace.path().join("private");
+    let checkout = workspace.path().join("checkout");
+    let worker = MockWorker::new();
+    let server = WorkerServer::start(worker.clone()).await;
+    let config = real_config_with_start(
+        &root,
+        &checkout,
+        &format!("unix://{}", server.uds_path.display()),
+        Some((ENV_REAL_SNAPSHOT_REF, SNAPSHOT_REF.into())),
+    );
+    let backend = real_backend_from_config(&config);
+    let session = backend
+        .start_session(StartBackendSession {
+            requested_capabilities: BackendCapabilities::real_preview_mvp(),
+        })
+        .expect("initial start");
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let stopping = backend.clone();
+    let stop_barrier = Arc::clone(&barrier);
+    let stop = tokio::task::spawn_blocking(move || {
+        stop_barrier.wait();
+        stopping.stop_session(
+            session.session_id,
+            rom_operator_bridge_service::backend::StopReason::OperatorStop,
+        )
+    });
+    let starting = backend.clone();
+    let start = tokio::task::spawn_blocking(move || {
+        barrier.wait();
+        starting.start_session(StartBackendSession {
+            requested_capabilities: BackendCapabilities::real_preview_mvp(),
+        })
+    });
+    assert!(stop.await.expect("stop join").is_ok());
+    let start_succeeded = start.await.expect("start join").is_ok();
+    let loaded = LeaseStore::new(config.private_config().clone())
+        .load()
+        .expect("load after race");
+    assert_eq!(loaded.leases.len(), usize::from(start_succeeded));
+    assert!(loaded.intents.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nondiscriminated_failed_preconditions_retain_lease_records() {
     for malformed in [false, true] {
         let workspace = tempfile::tempdir().expect("tempdir");
@@ -313,8 +379,7 @@ async fn nondiscriminated_failed_preconditions_retain_lease_records() {
         let worker = MockWorker::new();
         {
             let mut state = worker.state.lock().expect("worker");
-            state.active_slot = Some(MockWorker::active_slot(0));
-            state.active_token = Some(LEASE_TOKEN.to_vec());
+            state.set_active_slot(7, LEASE_TOKEN.to_vec(), 0);
             state.destroy_detail_override = (!malformed).then(|| "wrong_state".to_string());
             state.destroy_malformed_details = malformed;
         }
@@ -330,6 +395,177 @@ async fn nondiscriminated_failed_preconditions_retain_lease_records() {
         let _backend = real_backend_from_config(&config);
         assert_eq!(store.load().expect("retained").leases.len(), 1);
     }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn intent_persistence_failure_prevents_worker_allocation() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let root = workspace.path().join("private");
+    let checkout = workspace.path().join("checkout");
+    let worker = MockWorker::new();
+    let server = WorkerServer::start(worker.clone()).await;
+    let config = real_config_with_start(
+        &root,
+        &checkout,
+        &format!("unix://{}", server.uds_path.display()),
+        Some((ENV_REAL_SNAPSHOT_REF, SNAPSHOT_REF.into())),
+    );
+    let backend = real_backend_from_config(&config);
+    fs::set_permissions(
+        root.join("leases/intents"),
+        fs::Permissions::from_mode(0o500),
+    )
+    .expect("make intent directory unwritable");
+    assert!(
+        backend
+            .start_session(StartBackendSession {
+                requested_capabilities: BackendCapabilities::real_preview_mvp(),
+            })
+            .is_err()
+    );
+    assert!(!worker.calls().contains(&"restore_snapshot"));
+    fs::set_permissions(
+        root.join("leases/intents"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .expect("restore intent directory");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lease_write_and_destroy_failure_keeps_token_in_ram_until_retry() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let root = workspace.path().join("private");
+    let checkout = workspace.path().join("checkout");
+    let worker = MockWorker::new();
+    let server = WorkerServer::start(worker.clone()).await;
+    let config = real_config_with_start(
+        &root,
+        &checkout,
+        &format!("unix://{}", server.uds_path.display()),
+        Some((ENV_REAL_SNAPSHOT_REF, SNAPSHOT_REF.into())),
+    );
+    let backend = real_backend_from_config(&config);
+    fs::set_permissions(
+        root.join("leases/active"),
+        fs::Permissions::from_mode(0o500),
+    )
+    .expect("make lease directory unwritable");
+    worker.state.lock().expect("worker").destroy_fails = true;
+    assert!(
+        backend
+            .start_session(StartBackendSession {
+                requested_capabilities: BackendCapabilities::real_preview_mvp(),
+            })
+            .is_err()
+    );
+    fs::set_permissions(
+        root.join("leases/active"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .expect("restore lease directory");
+    assert_eq!(
+        LeaseStore::new(config.private_config().clone())
+            .load()
+            .expect("intent remains")
+            .intents
+            .len(),
+        1
+    );
+    worker.state.lock().expect("worker").destroy_fails = false;
+    backend
+        .start_session(StartBackendSession {
+            requested_capabilities: BackendCapabilities::real_preview_mvp(),
+        })
+        .expect("pending token is persisted, reconciled, and allocation resumes");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manifest_failure_rolls_back_durable_lease() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let root = workspace.path().join("private");
+    let checkout = workspace.path().join("checkout");
+    let worker = MockWorker::new();
+    let server = WorkerServer::start(worker.clone()).await;
+    let config = real_config_with_start(
+        &root,
+        &checkout,
+        &format!("unix://{}", server.uds_path.display()),
+        Some((ENV_REAL_SNAPSHOT_REF, SNAPSHOT_REF.into())),
+    );
+    let backend = real_backend_from_config(&config);
+    fs::set_permissions(root.join("runs"), fs::Permissions::from_mode(0o500))
+        .expect("make runs directory unwritable");
+    assert!(
+        backend
+            .start_session(StartBackendSession {
+                requested_capabilities: BackendCapabilities::real_preview_mvp(),
+            })
+            .is_err()
+    );
+    let loaded = LeaseStore::new(config.private_config().clone())
+        .load()
+        .expect("lease store");
+    assert!(loaded.leases.is_empty());
+    assert!(loaded.intents.is_empty());
+    assert!(worker.state.lock().expect("worker").active_slots.is_empty());
+    fs::set_permissions(root.join("runs"), fs::Permissions::from_mode(0o700))
+        .expect("restore runs directory");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn destroy_success_with_record_removal_failure_converges_before_next_start() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let root = workspace.path().join("private");
+    let checkout = workspace.path().join("checkout");
+    let worker = MockWorker::new();
+    let server = WorkerServer::start(worker.clone()).await;
+    let config = real_config_with_start(
+        &root,
+        &checkout,
+        &format!("unix://{}", server.uds_path.display()),
+        Some((ENV_REAL_SNAPSHOT_REF, SNAPSHOT_REF.into())),
+    );
+    let backend = real_backend_from_config(&config);
+    let session = backend
+        .start_session(StartBackendSession {
+            requested_capabilities: BackendCapabilities::real_preview_mvp(),
+        })
+        .expect("start");
+    fs::set_permissions(
+        root.join("leases/active"),
+        fs::Permissions::from_mode(0o500),
+    )
+    .expect("make active directory unwritable");
+    assert!(
+        backend
+            .stop_session(
+                session.session_id,
+                rom_operator_bridge_service::backend::StopReason::OperatorStop,
+            )
+            .is_err()
+    );
+    fs::set_permissions(
+        root.join("leases/active"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .expect("restore active directory");
+    assert_eq!(
+        LeaseStore::new(config.private_config().clone())
+            .load()
+            .expect("record retained")
+            .leases
+            .len(),
+        1
+    );
+    backend
+        .start_session(StartBackendSession {
+            requested_capabilities: BackendCapabilities::real_preview_mvp(),
+        })
+        .expect("missing slot record is cleaned before allocation");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2965,8 +3201,7 @@ struct MockWorker {
 
 struct MockWorkerState {
     calls: Vec<&'static str>,
-    active_slot: Option<dh::SlotInfo>,
-    active_token: Option<Vec<u8>>,
+    active_slots: BTreeMap<u64, (dh::SlotInfo, Vec<u8>)>,
     restore_hash: Option<Vec<u8>>,
     create_vm: Option<dh::CreateVmRequest>,
     take_snapshot_requests: Vec<dh::TakeSnapshotRequest>,
@@ -3003,8 +3238,7 @@ impl Default for MockWorkerState {
     fn default() -> Self {
         Self {
             calls: Vec::new(),
-            active_slot: None,
-            active_token: None,
+            active_slots: BTreeMap::new(),
             restore_hash: None,
             create_vm: None,
             take_snapshot_requests: Vec::new(),
@@ -3053,9 +3287,9 @@ impl MockWorker {
         }
     }
 
-    fn active_slot(icount: u64) -> dh::SlotInfo {
+    fn active_slot(slot_id: u64, icount: u64) -> dh::SlotInfo {
         dh::SlotInfo {
-            slot_id: 7,
+            slot_id,
             state: dh::SlotState::PausedS as i32,
             icount,
             base: None,
@@ -3149,6 +3383,13 @@ impl MockWorker {
     }
 }
 
+impl MockWorkerState {
+    fn set_active_slot(&mut self, slot_id: u64, token: Vec<u8>, icount: u64) {
+        self.active_slots
+            .insert(slot_id, (MockWorker::active_slot(slot_id, icount), token));
+    }
+}
+
 #[tonic::async_trait]
 impl HypervisorWorker for MockWorker {
     async fn create_vm(
@@ -3163,8 +3404,7 @@ impl HypervisorWorker for MockWorker {
         let request = request.into_inner();
         state.create_vm = Some(request);
         state.icount = 0;
-        state.active_slot = Some(Self::active_slot(0));
-        state.active_token = Some(LEASE_TOKEN.to_vec());
+        state.set_active_slot(7, LEASE_TOKEN.to_vec(), 0);
         if state.allocate_then_drop_response {
             return Err(Status::unavailable("response lost"));
         }
@@ -3185,8 +3425,7 @@ impl HypervisorWorker for MockWorker {
         }
         state.restore_hash = request.into_inner().snapshot.map(|snapshot| snapshot.hash);
         state.icount = 0;
-        state.active_slot = Some(Self::active_slot(0));
-        state.active_token = Some(LEASE_TOKEN.to_vec());
+        state.set_active_slot(7, LEASE_TOKEN.to_vec(), 0);
         if state.allocate_then_drop_response {
             return Err(Status::unavailable("response lost"));
         }
@@ -3224,15 +3463,16 @@ impl HypervisorWorker for MockWorker {
         if let Some(code) = &state.destroy_detail_override {
             return Err(worker_detail_status(code));
         }
-        let lease = request.into_inner().lease;
-        if state.active_slot.is_none() {
+        let Some(lease) = request.into_inner().lease else {
             return Err(worker_detail_status("no_such_slot"));
-        }
-        if lease.as_ref().map(|lease| lease.token.as_slice()) != state.active_token.as_deref() {
+        };
+        let Some((_, token)) = state.active_slots.get(&lease.slot_id) else {
+            return Err(worker_detail_status("no_such_slot"));
+        };
+        if lease.token != *token {
             return Err(worker_detail_status("stale_lease"));
         }
-        state.active_slot = None;
-        state.active_token = None;
+        state.active_slots.remove(&lease.slot_id);
         Ok(TonicResponse::new(dh::DestroyVmResponse {}))
     }
 
@@ -3269,7 +3509,7 @@ impl HypervisorWorker for MockWorker {
         }
         state.icount = state.icount.saturating_add(11);
         let icount = state.icount;
-        state.active_slot = Some(Self::active_slot(icount));
+        state.set_active_slot(7, LEASE_TOKEN.to_vec(), icount);
         // Both paths advance one frame. A captured frame-budget Run (the Play
         // fast path) returns the framebuffer inline; a plain Run does not.
         state.frame_counter += 1;
@@ -3322,7 +3562,8 @@ impl HypervisorWorker for MockWorker {
             ));
         }
         state.icount = state.take_snapshot_response.icount;
-        state.active_slot = Some(Self::active_slot(state.icount));
+        let icount = state.icount;
+        state.set_active_slot(7, LEASE_TOKEN.to_vec(), icount);
         Ok(TonicResponse::new(state.take_snapshot_response.clone()))
     }
 
@@ -3471,7 +3712,11 @@ impl HypervisorWorker for MockWorker {
             ));
         }
         Ok(TonicResponse::new(dh::ListSlotsResponse {
-            slots: state.active_slot.clone().into_iter().collect(),
+            slots: state
+                .active_slots
+                .values()
+                .map(|(slot, _)| slot.clone())
+                .collect(),
         }))
     }
 

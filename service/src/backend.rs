@@ -1040,6 +1040,7 @@ impl RealBackend {
             }
         }
         if !pending_retained.is_empty() {
+            let retained = pending_retained.len();
             self.inner
                 .lock()
                 .expect("real backend mutex poisoned")
@@ -1048,6 +1049,18 @@ impl RealBackend {
                 .reconcile_ready
                 .lock()
                 .expect("reconcile mutex poisoned") = false;
+            tracing::info!(
+                found_leases = retained,
+                found_intents = 0,
+                destroyed = 0,
+                stale_cleaned = 0,
+                missing_cleaned = 0,
+                dangling = 0,
+                invalid = 0,
+                retained,
+                ready_for_real_sessions = false,
+                "real lease reconciliation completed"
+            );
             return;
         }
         let loaded = match store.load() {
@@ -1057,6 +1070,18 @@ impl RealBackend {
                     .reconcile_ready
                     .lock()
                     .expect("reconcile mutex poisoned") = false;
+                tracing::info!(
+                    found_leases = 0,
+                    found_intents = 0,
+                    destroyed = 0,
+                    stale_cleaned = 0,
+                    missing_cleaned = 0,
+                    dangling = 0,
+                    invalid = 1,
+                    retained = 1,
+                    ready_for_real_sessions = false,
+                    "real lease reconciliation completed"
+                );
                 return;
             }
         };
@@ -1084,22 +1109,14 @@ impl RealBackend {
                             retained += 1;
                             continue;
                         };
-                        match self.worker.stop(lease) {
-                            Ok(()) => {
-                                if store.remove_lease(&record.operation_id).is_ok() {
-                                    destroyed += 1;
-                                    clean_operations.push(record.operation_id.clone());
-                                } else {
-                                    retained += 1;
-                                }
+                        match self.destroy_recorded(&record.operation_id, lease) {
+                            Ok(RecordedCleanup::Destroyed) => {
+                                destroyed += 1;
+                                clean_operations.push(record.operation_id.clone());
                             }
-                            Err(RealWorkerFailure::StaleLease) => {
-                                if store.remove_lease(&record.operation_id).is_ok() {
-                                    stale_cleaned += 1;
-                                    clean_operations.push(record.operation_id.clone());
-                                } else {
-                                    retained += 1;
-                                }
+                            Ok(RecordedCleanup::Stale) => {
+                                stale_cleaned += 1;
+                                clean_operations.push(record.operation_id.clone());
                             }
                             Err(_) => retained += 1,
                         }
@@ -1111,6 +1128,16 @@ impl RealBackend {
         for operation_id in &clean_operations {
             if store.remove_intent(operation_id).is_err() {
                 retained += 1;
+            } else if let Some(record) = loaded
+                .leases
+                .iter()
+                .find(|record| &record.operation_id == operation_id)
+            {
+                let _ = self.append_real_event(
+                    &record.run_id,
+                    "session_stopped",
+                    "real backend session stopped during lease reconciliation",
+                );
             }
         }
         let dangling = loaded
@@ -1150,22 +1177,35 @@ impl RealBackend {
         }
     }
 
-    fn destroy_recorded(&self, record: &LeaseRecord) -> BackendResult<()> {
-        let lease = record
-            .lease()
-            .map_err(|_| BackendError::BackendUnavailable)?;
-        match self.worker.stop(lease) {
-            Ok(()) | Err(RealWorkerFailure::StaleLease) => {
+    fn destroy_recorded(
+        &self,
+        operation_id: &str,
+        lease: dh::Lease,
+    ) -> BackendResult<RecordedCleanup> {
+        let result = match self.worker.stop(lease) {
+            outcome @ (Ok(()) | Err(RealWorkerFailure::StaleLease)) => {
                 let store = self.lease_store();
                 store
-                    .remove_lease(&record.operation_id)
+                    .remove_lease(operation_id)
                     .map_err(|_| BackendError::BackendUnavailable)?;
                 store
-                    .remove_intent(&record.operation_id)
-                    .map_err(|_| BackendError::BackendUnavailable)
+                    .remove_intent(operation_id)
+                    .map_err(|_| BackendError::BackendUnavailable)?;
+                Ok(match outcome {
+                    Ok(()) => RecordedCleanup::Destroyed,
+                    Err(RealWorkerFailure::StaleLease) => RecordedCleanup::Stale,
+                    Err(_) => unreachable!("matched cleanup outcomes only"),
+                })
             }
             Err(error) => Err(error.into()),
+        };
+        if result.is_err() {
+            *self
+                .reconcile_ready
+                .lock()
+                .expect("reconcile mutex poisoned") = false;
         }
+        result
     }
 
     /// Mark the active session faulted (used by the play loop and run paths on a
@@ -1289,13 +1329,10 @@ impl RealBackend {
             "input_artifact_failed",
             "real backend input artifact persistence failed",
         );
-        let record = LeaseRecord::from_live_session(
-            &session.operation_id,
-            &session.session_id,
-            &session.run_id,
-            &session.lease,
-        );
-        if self.destroy_recorded(&record).is_err() {
+        if self
+            .destroy_recorded(&session.operation_id, session.lease.clone())
+            .is_err()
+        {
             self.append_cleanup_failed(&session.run_id);
         }
     }
@@ -1423,12 +1460,16 @@ impl BridgeBackend for RealBackend {
             .lifecycle
             .lock()
             .expect("real lifecycle mutex poisoned");
-        if self
-            .inner
+        if !*self
+            .reconcile_ready
             .lock()
-            .expect("real backend mutex poisoned")
-            .active
-            .is_none()
+            .expect("reconcile mutex poisoned")
+            && self
+                .inner
+                .lock()
+                .expect("real backend mutex poisoned")
+                .active
+                .is_none()
         {
             self.reconcile_leases();
         }
@@ -1477,9 +1518,14 @@ impl BridgeBackend for RealBackend {
         let outcome = match self.worker.start(start_command) {
             Ok(outcome) => outcome,
             Err(error) => {
-                if matches!(error, RealWorkerFailure::AllocationRejected)
-                    && store.remove_intent(&intent.operation_id).is_err()
-                {
+                if matches!(error, RealWorkerFailure::AllocationRejected) {
+                    if store.remove_intent(&intent.operation_id).is_err() {
+                        *self
+                            .reconcile_ready
+                            .lock()
+                            .expect("reconcile mutex poisoned") = false;
+                    }
+                } else {
                     *self
                         .reconcile_ready
                         .lock()
@@ -1493,7 +1539,12 @@ impl BridgeBackend for RealBackend {
         if store.write_lease(&lease_record).is_err() && store.write_lease(&lease_record).is_err() {
             match self.worker.stop(outcome.lease.clone()) {
                 Ok(()) | Err(RealWorkerFailure::StaleLease) => {
-                    let _ = store.remove_intent(&intent.operation_id);
+                    if store.remove_intent(&intent.operation_id).is_err() {
+                        *self
+                            .reconcile_ready
+                            .lock()
+                            .expect("reconcile mutex poisoned") = false;
+                    }
                 }
                 Err(_) => {
                     self.inner
@@ -1521,7 +1572,7 @@ impl BridgeBackend for RealBackend {
         if let Err(error) = self.write_real_manifest(&run_id).and_then(|_| {
             self.append_real_event(&run_id, "session_started", "real backend session started")
         }) {
-            let _ = self.destroy_recorded(&lease_record);
+            let _ = self.destroy_recorded(&lease_record.operation_id, outcome.lease.clone());
             self.append_cleanup_failed(&run_id);
             self.clear_starting();
             return Err(error);
@@ -1578,14 +1629,8 @@ impl BridgeBackend for RealBackend {
             state: SessionState::Stopped,
             final_frame: session.current_frame,
         };
-        let record = LeaseRecord::from_live_session(
-            &session.operation_id,
-            &session.session_id,
-            &session.run_id,
-            &session.lease,
-        );
-        match self.destroy_recorded(&record) {
-            Ok(()) => {
+        match self.destroy_recorded(&session.operation_id, session.lease) {
+            Ok(_) => {
                 self.append_real_event(
                     &session.run_id,
                     "session_stopped",
@@ -1595,7 +1640,7 @@ impl BridgeBackend for RealBackend {
             }
             Err(error) => {
                 self.append_cleanup_failed(&session.run_id);
-                Err(error.into())
+                Err(error)
             }
         }
     }
@@ -2490,6 +2535,12 @@ struct RealSession {
     active_capture_job_id: Option<CaptureJobId>,
     applied_inputs: Vec<AppliedInputFrame>,
     capabilities: BackendCapabilities,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordedCleanup {
+    Destroyed,
+    Stale,
 }
 
 impl RealSession {
@@ -3574,10 +3625,10 @@ fn worker_failure_from_status(status: tonic::Status) -> RealWorkerFailure {
 
 fn destroy_worker_failure_from_status(status: tonic::Status) -> RealWorkerFailure {
     if status.code() == Code::FailedPrecondition {
-        if let Ok(detail) = dh::ErrorDetail::decode(status.details()) {
-            if detail.code == "stale_lease" || detail.code == "no_such_slot" {
-                return RealWorkerFailure::StaleLease;
-            }
+        if let Ok(detail) = dh::ErrorDetail::decode(status.details())
+            && (detail.code == "stale_lease" || detail.code == "no_such_slot")
+        {
+            return RealWorkerFailure::StaleLease;
         }
         RealWorkerFailure::FailedPrecondition
     } else {

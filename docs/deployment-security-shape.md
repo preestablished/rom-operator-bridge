@@ -172,6 +172,12 @@ Bridge service restart:
 sudo systemctl restart rom-operator-bridge.service
 ```
 
+Real-backend restarts reconcile durable active-lease records before another
+real session is accepted. Inspect only the numeric reconciliation summary and
+confirm `ready_for_real_sessions=true`; never copy lease-record contents into
+deployment evidence. An unmatched intent remains fail-closed and requires the
+stopped-bridge recovery procedure in `docs/operator-runbook.md`.
+
 Emergency bridge service shutdown:
 
 ```sh
@@ -196,6 +202,10 @@ Service artifact rollback:
 sudo ln -sfn /opt/rom-operator-bridge/previous /opt/rom-operator-bridge/current
 sudo systemctl restart rom-operator-bridge.service
 ```
+
+Do not roll back to a bridge version that is unaware of `leases/` while real
+sessions or lease records may exist. Quiesce the bridge and verify worker full
+capacity first; otherwise use a forward fix.
 
 The sanitized ingress and systemd templates now live under `deploy/`. The
 private env file and concrete endpoint manifest remain operator-private. If the

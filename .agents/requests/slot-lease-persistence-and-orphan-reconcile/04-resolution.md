@@ -12,12 +12,13 @@
 
 On 2026-07-11:
 
-- `cd service && cargo test --test lease_store`: 4 passed.
-- `cd service && cargo test --test real-backend`: 38 passed, including the required nine crash/recovery shapes plus malformed/wrong-state details and concurrent starts.
+- `cd service && cargo test --test lease_store`: 8 passed, including strict schema/token validation, atomic replacement/removal, crash-temporary handling, runtime-lock contention, and operator-command refusals/success.
+- `cd service && cargo test --test real-backend`: 43 passed, including the required nine crash/recovery shapes, permission-injected persistence/removal failures, RAM-held token recovery, malformed/wrong-state details, two-slot mock reconciliation, concurrent starts, and concurrent stop/start.
 - `PATH="$HOME/.nvm/versions/node/v22.22.0/bin:$PATH" bash scripts/quality-gate.sh`: passed. This included all service tests, 89 UI tests, the production UI build, and the static redaction scan.
 - `git diff --check`: passed.
+- `cargo clippy --all-targets --all-features` passes for the changed code after allowing the repository's existing unrelated lint classes. The pre-existing all-target `-D warnings` cleanup is tracked by `rom-operator-bridge-w21`.
 
-The matrix covers restart with an active session, empty restart, proven pre-allocation rejection, dangling/lost-response intent, stale token, missing slot, repeated reconciliation, failed-stop retry, and initially unavailable worker recovery. The mock validates slot/token pairs and returns encoded stale/no-slot details.
+The matrix covers restart with an active session, empty restart, proven pre-allocation rejection, dangling/lost-response intent, stale token, missing slot, repeated reconciliation, failed-stop retry, and initially unavailable worker recovery. The mock carries multiple independently tokened slots, validates slot/token pairs, models recycled tokens, and returns encoded stale/no-slot details.
 
 ## Remaining live evidence
 

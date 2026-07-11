@@ -166,6 +166,12 @@ Do not paste service status or journal output into shared handoff text unless it
 has been sanitized for credentials, private paths, host-control details, and
 artifact refs.
 
+For the real backend, also confirm the numeric lease-reconciliation summary
+reports `ready_for_real_sessions=true`. A dangling intent is not repaired by a
+bridge restart or worker restart alone; follow the stopped-bridge, worker
+restart, full-capacity verification, and selected-intent acknowledgement
+procedure in `docs/operator-runbook.md`.
+
 Emergency shutdown:
 
 ```sh
@@ -206,6 +212,10 @@ sudo systemctl restart rom-operator-bridge.service
 If the private env file did not change during the failed deployment, the env
 restore step can be skipped. Do not copy env file contents into shared logs or
 handoff text.
+
+An artifact rollback to a release that predates durable `leases/` awareness can
+leak a newly allocated worker slot. Quiesce real sessions and verify full
+worker capacity before such a rollback; prefer a forward fix.
 
 ## Deployment Checks
 

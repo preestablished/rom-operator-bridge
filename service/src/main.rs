@@ -30,6 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let cleared = store.clear_dangling_intents(&selected)?;
         tracing::info!(
             cleared,
+            operation_ids = %selected.join(","),
             "audited dangling lease intents acknowledged after external recovery"
         );
         return Ok(());
