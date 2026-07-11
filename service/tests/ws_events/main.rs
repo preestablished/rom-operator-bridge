@@ -12,8 +12,8 @@ use rom_operator_bridge_service::{
     backend::{
         BackendCapabilities, BackendMode, BackendResult, BackendSession, BridgeBackend, CaptureJob,
         CaptureJobStatus, CaptureRequest, FramePreview, InputScheduleReceipt, InputScheduleRequest,
-        PlayStepOutcome, RunBoundary, RunStatus, SessionId, SessionState, StartBackendSession,
-        StopReason, StoppedSession,
+        PlayStepOutcome, PlayStreamEvent, PlayStreamSession, RunBoundary, RunStatus, SessionId,
+        SessionState, StartBackendSession, StopReason, StoppedSession,
     },
     config::ServiceConfig,
     private_config::{ENV_PRIVATE_ROOT, ENV_SESSION_SECRET},
@@ -319,6 +319,53 @@ async fn event_stream_publishes_live_run_updates_after_pause() {
     assert_eq!(updates[1]["payload"]["preview_stale"], true);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_play_throttles_run_updates_and_emits_one_terminal_update() {
+    let (_workspace, app, _private_root) =
+        ws_app(EventBackend::new(SESSION_ID, SessionState::Running, None));
+    let cookie = login_cookie(app.clone()).await;
+    let server = WsServer::start(app.clone()).await;
+    let mut ws = server.connect(&cookie).await;
+    let _snapshot = read_events(&mut ws, 4).await;
+
+    let play = app
+        .clone()
+        .oneshot(runtime_json_request(
+            Method::POST,
+            "/api/run/play",
+            &cookie,
+            json!({ "schema_version": 1, "session_id": SESSION_ID }),
+        ))
+        .await
+        .expect("Play request runs");
+    assert_eq!(play.status(), 200);
+    tokio::time::sleep(Duration::from_millis(650)).await;
+    stop_session(app, &cookie).await;
+
+    let updates = drain_events(&mut ws).await;
+    let run_updates = updates
+        .iter()
+        .filter(|message| message["type"] == "run_updated")
+        .collect::<Vec<_>>();
+    let playing_updates = run_updates
+        .iter()
+        .filter(|message| message["payload"]["state"] == "playing")
+        .count();
+    let terminal_updates = run_updates
+        .iter()
+        .filter(|message| message["payload"]["state"] == "stopped")
+        .count();
+
+    // One Play-start update plus at most three ~4Hz intermediate updates in
+    // 650ms. The synthetic stream produces ~39 frames in this window, so this
+    // conservative bound proves event throttling rather than a slow producer.
+    assert!(
+        (2..=4).contains(&playing_updates),
+        "unexpected streaming run_updated count: {playing_updates}"
+    );
+    assert_eq!(terminal_updates, 1);
+}
+
 struct WsServer {
     addr: SocketAddr,
     handle: tokio::task::JoinHandle<()>,
@@ -401,6 +448,18 @@ async fn read_events(ws: &mut TestSocket, count: usize) -> Vec<Value> {
         let json: Value = serde_json::from_str(&text).expect("event json parses");
         assert_matches_runtime_schema(&json);
         messages.push(json);
+    }
+    messages
+}
+
+async fn drain_events(ws: &mut TestSocket) -> Vec<Value> {
+    let mut messages = Vec::new();
+    loop {
+        let next = timeout(Duration::from_millis(150), ws.next()).await;
+        let Ok(Some(Ok(Message::Text(text)))) = next else {
+            break;
+        };
+        messages.push(serde_json::from_str(&text).expect("event JSON parses"));
     }
     messages
 }
@@ -550,7 +609,8 @@ fn config(private_root: &Path) -> ServiceConfig {
 #[derive(Debug)]
 struct EventBackend {
     status_session_id: String,
-    state: Mutex<SessionState>,
+    state: std::sync::Arc<Mutex<SessionState>>,
+    frame: std::sync::Arc<Mutex<u64>>,
     active_capture_job_id: Option<String>,
 }
 
@@ -562,13 +622,18 @@ impl EventBackend {
     ) -> Self {
         Self {
             status_session_id: status_session_id.into(),
-            state: Mutex::new(state),
+            state: std::sync::Arc::new(Mutex::new(state)),
+            frame: std::sync::Arc::new(Mutex::new(18)),
             active_capture_job_id,
         }
     }
 
     fn state(&self) -> SessionState {
         *self.state.lock().expect("state mutex poisoned")
+    }
+
+    fn frame(&self) -> u64 {
+        *self.frame.lock().expect("frame mutex poisoned")
     }
 }
 
@@ -586,7 +651,7 @@ impl BridgeBackend for EventBackend {
             session_id: SESSION_ID.to_string(),
             run_id: RUN_ID.to_string(),
             state: self.state(),
-            current_frame: 18,
+            current_frame: self.frame(),
             capabilities: self.capabilities(),
         })
     }
@@ -599,7 +664,7 @@ impl BridgeBackend for EventBackend {
         Ok(StoppedSession {
             session_id,
             state: SessionState::Stopped,
-            final_frame: 18,
+            final_frame: self.frame(),
         })
     }
 
@@ -609,7 +674,7 @@ impl BridgeBackend for EventBackend {
             run_id: RUN_ID.to_string(),
             state: self.state(),
             backend_mode: self.mode(),
-            current_frame: 18,
+            current_frame: self.frame(),
             capabilities: self.capabilities(),
             last_applied_input_frame: 12,
             last_preview_frame: 17,
@@ -623,7 +688,7 @@ impl BridgeBackend for EventBackend {
         Ok(RunBoundary {
             session_id,
             state: SessionState::Paused,
-            current_frame: 18,
+            current_frame: self.frame(),
             preview_stale: true,
         })
     }
@@ -633,17 +698,34 @@ impl BridgeBackend for EventBackend {
         Ok(RunBoundary {
             session_id,
             state: SessionState::Running,
-            current_frame: 18,
+            current_frame: self.frame(),
             preview_stale: true,
         })
     }
 
-    fn play_start(&self, _session_id: SessionId) -> BackendResult<RunBoundary> {
-        unimplemented!("play mode not exercised by ws_events tests")
+    fn play_start(&self, session_id: SessionId) -> BackendResult<RunBoundary> {
+        *self.state.lock().expect("state mutex poisoned") = SessionState::Playing;
+        Ok(RunBoundary {
+            session_id,
+            state: SessionState::Playing,
+            current_frame: self.frame(),
+            preview_stale: false,
+        })
     }
 
     fn play_step(&self, _session_id: SessionId) -> BackendResult<PlayStepOutcome> {
         unimplemented!("play mode not exercised by ws_events tests")
+    }
+
+    fn play_stream_start(
+        &self,
+        session_id: SessionId,
+    ) -> BackendResult<Box<dyn PlayStreamSession>> {
+        Ok(Box::new(EventPlayStream {
+            session_id,
+            state: self.state.clone(),
+            frame: self.frame.clone(),
+        }))
     }
 
     fn inject_input(&self, request: InputScheduleRequest) -> BackendResult<InputScheduleReceipt> {
@@ -679,6 +761,36 @@ impl BridgeBackend for EventBackend {
             status: CaptureJobStatus::Running,
             capture_id: None,
             public: None,
+        })
+    }
+}
+
+struct EventPlayStream {
+    session_id: String,
+    state: std::sync::Arc<Mutex<SessionState>>,
+    frame: std::sync::Arc<Mutex<u64>>,
+}
+
+impl PlayStreamSession for EventPlayStream {
+    fn next_frame(&mut self, _timeout: Duration) -> BackendResult<PlayStreamEvent> {
+        let mut frame = self.frame.lock().expect("frame mutex poisoned");
+        *frame += 1;
+        Ok(PlayStreamEvent::Frame(PlayStepOutcome {
+            session_id: self.session_id.clone(),
+            frame: *frame,
+            width: 1,
+            height: 1,
+            png_bytes: vec![1],
+        }))
+    }
+
+    fn stop(&mut self) -> BackendResult<RunBoundary> {
+        *self.state.lock().expect("state mutex poisoned") = SessionState::Paused;
+        Ok(RunBoundary {
+            session_id: self.session_id.clone(),
+            state: SessionState::Paused,
+            current_frame: *self.frame.lock().expect("frame mutex poisoned"),
+            preview_stale: false,
         })
     }
 }

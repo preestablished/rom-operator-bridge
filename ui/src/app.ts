@@ -47,6 +47,7 @@ import {
   type NeutralizedDirection
 } from "./inputUx";
 import type { RuntimeConfig } from "./runtimeConfig";
+import { LiveFrameController } from "./liveFrame";
 
 type OperatorViewModel = {
   backendMode: BackendMode;
@@ -436,17 +437,12 @@ export function mountOperatorApp(
   let inputSessionId: string | null = null;
   let framesSocket: ReturnType<NonNullable<RuntimeEventClient["framesSocket"]>> | null = null;
   let framesSessionId: string | null = null;
-  // Live-play frame delivery. Frames stream over the frames socket as
-  // [u64 LE frame_counter][PNG]; the newest bitmap is drawn onto a <canvas> via
-  // createImageBitmap (no object/data URLs — those are blocked by the privacy
-  // boundary since they could persist framebuffer pixels). `lastDisplayedFrame`
-  // is the ordering key (deterministic pv-pad frame_counter): a frame renders
-  // only if strictly newer. frame_counter restarts at 0 each run, so it resets
-  // on run_id change. `liveBitmap` is retained so the canvas can be repainted
-  // after a re-render without waiting for the next frame.
-  let liveBitmap: ImageBitmap | null = null;
-  let lastDisplayedFrame = -1;
-  let liveFrameRunId: string | null = null;
+  // Live-play frame delivery. The controller owns exact-u64 ordering, async
+  // decode races, and bitmap lifetime; app.ts owns only canvas painting.
+  const liveFrames = new LiveFrameController<ImageBitmap>(
+    (pngBytes) => createImageBitmap(new Blob([pngBytes], { type: "image/png" })),
+    () => paintLiveFrame()
+  );
   let gamepadPollCancel: (() => void) | null = null;
   root.innerHTML = '<div data-operator-app></div><p class="session-live" aria-live="polite"></p>';
   const appRegion = root.querySelector<HTMLElement>("[data-operator-app]");
@@ -461,6 +457,8 @@ export function mountOperatorApp(
     const focusedPadButton = shouldRestoreInputFocus
       ? padButtonFromElement(globalThis.document?.activeElement)
       : null;
+    const currentRunId = auth.status === "active" ? (auth.session.run_id ?? null) : null;
+    liveFrames.setRun(currentRunId);
     appRegion.innerHTML = renderOperatorApp(config, auth, {
       validationState: validationStateToViewState(validationStatus.status),
       validationStatus,
@@ -623,15 +621,13 @@ export function mountOperatorApp(
     framesSocket?.close();
     framesSocket = null;
     framesSessionId = null;
-    liveBitmap?.close();
-    liveBitmap = null;
-    lastDisplayedFrame = -1;
-    liveFrameRunId = null;
+    liveFrames.clear();
   }
 
   // Paint the retained live frame onto the current preview canvas. Called both
   // when a new frame decodes and after a re-render (which replaces the canvas).
   function paintLiveFrame() {
+    const liveBitmap = liveFrames.bitmap;
     if (!liveBitmap) {
       return;
     }
@@ -652,40 +648,8 @@ export function mountOperatorApp(
   }
 
   async function handleLiveFrame(buffer: ArrayBuffer) {
-    if (buffer.byteLength < 8) {
-      return;
-    }
-    const view = new DataView(buffer);
-    const frameCounter = Number(view.getBigUint64(0, true));
     const runId = auth.status === "active" ? (auth.session.run_id ?? null) : null;
-    if (runId !== liveFrameRunId) {
-      liveFrameRunId = runId;
-      lastDisplayedFrame = -1;
-    }
-    // Newest-by-frame_counter: drop any older/reordered frame.
-    if (frameCounter <= lastDisplayedFrame) {
-      return;
-    }
-    // Mark received-newest up front (so a concurrent older decode is dropped
-    // post-await) and remember which run this frame belongs to.
-    lastDisplayedFrame = frameCounter;
-    const decodeRunId = liveFrameRunId;
-    let bitmap: ImageBitmap;
-    try {
-      bitmap = await createImageBitmap(new Blob([buffer.slice(8)], { type: "image/png" }));
-    } catch {
-      return;
-    }
-    // Discard if a newer frame won the race (don't paint backwards) OR the run
-    // changed while decoding — a Stop->Start could otherwise paint a previous
-    // run's frame onto the new run's canvas.
-    if (frameCounter < lastDisplayedFrame || decodeRunId !== liveFrameRunId) {
-      bitmap.close();
-      return;
-    }
-    liveBitmap?.close();
-    liveBitmap = bitmap;
-    paintLiveFrame();
+    await liveFrames.receive(buffer, runId);
   }
 
   function syncFramesStream() {

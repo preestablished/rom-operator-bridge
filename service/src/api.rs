@@ -50,6 +50,10 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+static NEXT_PLAY_METRICS_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static NEXT_FRAME_SOCKET_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static ACTIVE_FRAME_SOCKETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub const RUNTIME_API_SCHEMA_VERSION: u16 = 1;
 const JSON_SAFE_U64_MAX: u64 = 9_007_199_254_740_991;
 const MAX_CACHED_FRAME_PREVIEWS: usize = 16;
@@ -147,6 +151,21 @@ impl AppState {
             ws_input: WsInputState::new(),
             play: crate::play::PlayController::new(),
         }
+    }
+
+    /// Test-only lifecycle observation without exposing frame bytes.
+    pub fn play_active_for_tests(&self, session_id: &str) -> bool {
+        self.play.is_playing(session_id)
+    }
+
+    /// Test-only retained-slot state; never returns framebuffer contents.
+    pub fn play_frame_retained_for_tests(&self) -> bool {
+        self.play.subscribe().borrow().is_some()
+    }
+
+    /// Test-only receiver used to keep the watch slot observed across a loop.
+    pub fn play_frames_for_tests(&self) -> tokio::sync::watch::Receiver<crate::play::FrameSlot> {
+        self.play.subscribe()
     }
 
     pub fn validation_status_snapshot(&self) -> PublicValidationStatus {
@@ -1964,11 +1983,11 @@ async fn serve_frames_socket(
     mut socket: WebSocket,
     mut frames: tokio::sync::watch::Receiver<crate::play::FrameSlot>,
 ) {
+    let mut metrics = FrameSocketMetrics::new();
     // Send the latest frame immediately (if a run is already producing).
     let current = frames.borrow_and_update().clone();
     if let Some(frame) = current
-        && socket
-            .send(Message::Binary(frame.as_ref().clone().into()))
+        && send_frame_with_metrics(&mut socket, &frame, &mut metrics)
             .await
             .is_err()
     {
@@ -1982,8 +2001,7 @@ async fn serve_frames_socket(
                 }
                 let current = frames.borrow_and_update().clone();
                 if let Some(frame) = current
-                    && socket
-                        .send(Message::Binary(frame.as_ref().clone().into()))
+                    && send_frame_with_metrics(&mut socket, &frame, &mut metrics)
                         .await
                         .is_err()
                 {
@@ -1997,6 +2015,89 @@ async fn serve_frames_socket(
                 }
             }
         }
+    }
+}
+
+async fn send_frame_with_metrics(
+    socket: &mut WebSocket,
+    frame: &std::sync::Arc<Vec<u8>>,
+    metrics: &mut FrameSocketMetrics,
+) -> Result<(), axum::Error> {
+    socket
+        .send(Message::Binary(frame.as_ref().clone().into()))
+        .await?;
+    metrics.sent(frame);
+    Ok(())
+}
+
+#[derive(Debug)]
+struct FrameSocketMetrics {
+    socket_ordinal: u64,
+    started: std::time::Instant,
+    sent_frames: u64,
+    payload_bytes: u64,
+    png_bytes: u64,
+    inferred_counter_gaps: u64,
+    last_counter: Option<u64>,
+}
+
+impl FrameSocketMetrics {
+    fn new() -> Self {
+        use std::sync::atomic::Ordering;
+        let socket_ordinal = NEXT_FRAME_SOCKET_ID.fetch_add(1, Ordering::Relaxed);
+        ACTIVE_FRAME_SOCKETS.fetch_add(1, Ordering::Relaxed);
+        Self {
+            socket_ordinal,
+            started: std::time::Instant::now(),
+            sent_frames: 0,
+            payload_bytes: 0,
+            png_bytes: 0,
+            inferred_counter_gaps: 0,
+            last_counter: None,
+        }
+    }
+
+    fn sent(&mut self, frame: &[u8]) {
+        self.sent_frames += 1;
+        self.payload_bytes = self.payload_bytes.saturating_add(frame.len() as u64);
+        self.png_bytes = self
+            .png_bytes
+            .saturating_add(frame.len().saturating_sub(8) as u64);
+        if let Some(counter) = frame
+            .get(..8)
+            .and_then(|prefix| prefix.try_into().ok())
+            .map(u64::from_le_bytes)
+        {
+            if let Some(last) = self.last_counter
+                && counter > last.saturating_add(1)
+            {
+                self.inferred_counter_gaps = self
+                    .inferred_counter_gaps
+                    .saturating_add(counter - last - 1);
+            }
+            self.last_counter = Some(counter);
+        }
+    }
+}
+
+impl Drop for FrameSocketMetrics {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        let active_subscribers = ACTIVE_FRAME_SOCKETS
+            .fetch_sub(1, Ordering::Relaxed)
+            .saturating_sub(1);
+        tracing::info!(
+            metric = "play_frame_socket_summary",
+            socket_ordinal = self.socket_ordinal,
+            elapsed_ms = self.started.elapsed().as_millis() as u64,
+            sent_frames = self.sent_frames,
+            websocket_payload_bytes = self.payload_bytes,
+            png_bytes = self.png_bytes,
+            inferred_counter_gaps = self.inferred_counter_gaps,
+            retained_depth_max = 1_u64,
+            active_subscribers,
+            "play frame socket summary"
+        );
     }
 }
 
@@ -2094,11 +2195,21 @@ async fn play_run(
     let loop_state = state.clone();
     let loop_session = request.session_id.clone();
     let loop_stop = stop.clone();
+    // The loop can self-deregister immediately (expired auth or stream-open
+    // failure). Hold it behind a one-shot barrier until its handle is installed
+    // so that deregister cannot race ahead of register and leave a stale,
+    // already-finished handle behind.
+    let (start_tx, start_rx) = std::sync::mpsc::sync_channel(0);
     let join = std::thread::Builder::new()
         .name("play-loop".to_string())
-        .spawn(move || play_loop(loop_state, loop_session, loop_stop))
+        .spawn(move || {
+            if start_rx.recv().is_ok() {
+                play_loop(loop_state, loop_session, loop_stop);
+            }
+        })
         .expect("spawn play loop thread");
     state.play.register(request.session_id.clone(), stop, join);
+    let _ = start_tx.send(());
 
     let mut response = Json(RunStateResponse {
         schema_version: RUNTIME_API_SCHEMA_VERSION,
@@ -2128,11 +2239,65 @@ const PLAY_PACER_RESYNC: std::time::Duration = std::time::Duration::from_millis(
 const PLAY_STREAM_REOPEN_ATTEMPTS: u32 = 5;
 const PLAY_STREAM_REOPEN_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
 
+fn should_publish_play_event(
+    last_published: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    last_published.is_none_or(|last| now.duration_since(last) >= PLAY_EVENT_THROTTLE)
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 struct PlayReopenTelemetry {
     clean_budget_ends: u64,
     successful_reopens: u64,
     failed_reopen_attempts: u64,
+}
+
+#[derive(Debug)]
+struct PlayLoopMetrics {
+    play_ordinal: u64,
+    path: &'static str,
+    started: std::time::Instant,
+    produced_frames: u64,
+    png_bytes: u64,
+    pacer_deadline_misses: u64,
+    pacer_resyncs: u64,
+}
+
+impl PlayLoopMetrics {
+    fn new(path: &'static str) -> Self {
+        use std::sync::atomic::Ordering;
+        Self {
+            play_ordinal: NEXT_PLAY_METRICS_ID.fetch_add(1, Ordering::Relaxed),
+            path,
+            started: std::time::Instant::now(),
+            produced_frames: 0,
+            png_bytes: 0,
+            pacer_deadline_misses: 0,
+            pacer_resyncs: 0,
+        }
+    }
+
+    fn produced(&mut self, png_bytes: usize) {
+        self.produced_frames += 1;
+        self.png_bytes = self.png_bytes.saturating_add(png_bytes as u64);
+    }
+}
+
+impl Drop for PlayLoopMetrics {
+    fn drop(&mut self) {
+        tracing::info!(
+            metric = "play_loop_summary",
+            play_ordinal = self.play_ordinal,
+            path = self.path,
+            elapsed_ms = self.started.elapsed().as_millis() as u64,
+            produced_frames = self.produced_frames,
+            png_bytes = self.png_bytes,
+            pacer_deadline_misses = self.pacer_deadline_misses,
+            pacer_resyncs = self.pacer_resyncs,
+            "play loop summary"
+        );
+    }
 }
 
 impl PlayReopenTelemetry {
@@ -2197,6 +2362,7 @@ fn play_stream_loop(
     use std::time::Instant;
 
     let frames = state.play.frames_sender();
+    let mut metrics = PlayLoopMetrics::new("streaming");
     let mut next_tick = Instant::now();
     let mut last_event: Option<Instant> = None;
     let mut reopen_telemetry = PlayReopenTelemetry::default();
@@ -2227,21 +2393,25 @@ fn play_stream_loop(
         let now = Instant::now();
         if let Some(wait) = next_tick.checked_duration_since(now) {
             std::thread::sleep(wait);
-        } else if now.duration_since(next_tick) > PLAY_PACER_RESYNC {
-            next_tick = now;
+        } else {
+            metrics.pacer_deadline_misses += 1;
+            if now.duration_since(next_tick) > PLAY_PACER_RESYNC {
+                metrics.pacer_resyncs += 1;
+                next_tick = now;
+            }
         }
         next_tick += PLAY_FRAME_PERIOD;
 
         match handle.next_frame(PLAY_STREAM_READ_TIMEOUT) {
             Ok(PlayStreamEvent::Frame(step)) => {
+                metrics.produced(step.png_bytes.len());
                 let _ = frames.send(Some(crate::play::frame_message(
                     step.frame,
                     &step.png_bytes,
                 )));
-                let throttled =
-                    last_event.is_some_and(|published| published.elapsed() < PLAY_EVENT_THROTTLE);
-                if !throttled {
-                    last_event = Some(Instant::now());
+                let now = Instant::now();
+                if should_publish_play_event(last_event, now) {
+                    last_event = Some(now);
                     publish_run_boundary_event(
                         &state,
                         &crate::backend::RunBoundary {
@@ -2362,6 +2532,7 @@ fn play_step_loop(
 ) {
     use std::sync::atomic::Ordering;
     let frames = state.play.frames_sender();
+    let mut metrics = PlayLoopMetrics::new("fallback");
     loop {
         if stop.load(Ordering::SeqCst) {
             break;
@@ -2382,6 +2553,7 @@ fn play_step_loop(
 
         match state.backend.play_step(session_id.clone()) {
             Ok(step) => {
+                metrics.produced(step.png_bytes.len());
                 let _ = frames.send(Some(crate::play::frame_message(
                     step.frame,
                     &step.png_bytes,
@@ -3591,6 +3763,47 @@ mod tests {
                 failed_reopen_attempts: 1,
             }
         );
+    }
+
+    #[test]
+    fn play_event_throttle_publishes_at_exact_interval_boundary() {
+        let start = std::time::Instant::now();
+        assert!(should_publish_play_event(None, start));
+        assert!(!should_publish_play_event(
+            Some(start),
+            start + PLAY_EVENT_THROTTLE - std::time::Duration::from_nanos(1)
+        ));
+        assert!(should_publish_play_event(
+            Some(start),
+            start + PLAY_EVENT_THROTTLE
+        ));
+        assert!(should_publish_play_event(
+            Some(start),
+            start + PLAY_EVENT_THROTTLE + std::time::Duration::from_nanos(1)
+        ));
+    }
+
+    #[test]
+    fn frame_socket_metrics_separate_prefix_png_and_counter_gaps() {
+        let mut metrics = FrameSocketMetrics::new();
+        metrics.sent(&crate::play::frame_message(4, b"abc"));
+        metrics.sent(&crate::play::frame_message(7, b"de"));
+        assert_eq!(metrics.sent_frames, 2);
+        assert_eq!(metrics.payload_bytes, 8 + 3 + 8 + 2);
+        assert_eq!(metrics.png_bytes, 5);
+        assert_eq!(metrics.inferred_counter_gaps, 2);
+        assert_eq!(metrics.last_counter, Some(7));
+    }
+
+    #[test]
+    fn play_loop_metrics_count_production_once_per_frame() {
+        let mut metrics = PlayLoopMetrics::new("test");
+        metrics.produced(11);
+        metrics.produced(13);
+        assert_eq!(metrics.produced_frames, 2);
+        assert_eq!(metrics.png_bytes, 24);
+        assert_eq!(metrics.pacer_deadline_misses, 0);
+        assert_eq!(metrics.pacer_resyncs, 0);
     }
 
     #[test]

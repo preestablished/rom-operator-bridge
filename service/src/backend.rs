@@ -1467,7 +1467,7 @@ impl BridgeBackend for RealBackend {
             active.clone()
         };
 
-        let outcome = match self.worker.resume(session.lease.clone()) {
+        let mut outcome = match self.worker.resume(session.lease.clone()) {
             Ok(outcome) => outcome,
             Err(error) => {
                 {
@@ -1510,6 +1510,22 @@ impl BridgeBackend for RealBackend {
             return Err(BackendError::BackendUnavailable);
         }
 
+        // A plain frame-budget Run commonly omits fb_info. Resolve the
+        // authoritative post-run frame from GetFramebuffer rather than
+        // returning the pre-run cached counter or inferring from frames_elapsed.
+        if outcome.current_frame.is_none() {
+            match self.worker.frame_counter(session.lease.clone()) {
+                Ok(counter) => {
+                    outcome.current_frame = Some(counter.frame);
+                    outcome.current_icount = counter.icount;
+                }
+                Err(error) => {
+                    self.mark_faulted(&session);
+                    return Err(error.into());
+                }
+            }
+        }
+
         {
             let mut inner = self.inner.lock().expect("real backend mutex poisoned");
             let active = inner
@@ -1520,14 +1536,11 @@ impl BridgeBackend for RealBackend {
             active.state = SessionState::Paused;
             active.current_icount = outcome.current_icount;
             active.input_in_flight = false;
-            if let Some(frame) = outcome.current_frame {
-                active.current_frame = frame;
-                active.frame_base_known = true;
-                active.preview_stale = active.last_preview_frame < active.current_frame;
-            } else {
-                active.frame_base_known = false;
-                active.preview_stale = true;
-            }
+            active.current_frame = outcome
+                .current_frame
+                .expect("resume resolves an authoritative frame above");
+            active.frame_base_known = true;
+            active.preview_stale = active.last_preview_frame < active.current_frame;
         }
         self.append_real_event(
             &session.run_id,

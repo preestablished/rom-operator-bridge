@@ -162,7 +162,7 @@ async fn real_restore_snapshot_lifecycle_calls_worker_and_stays_sanitized() {
     assert_eq!(resume.status(), StatusCode::OK);
     let resume_body = body_json(resume).await;
     assert_eq!(resume_body["state"], "paused");
-    assert_eq!(resume_body["current_frame"], 12);
+    assert_eq!(resume_body["current_frame"], 13);
 
     let status = send_request(
         &mut app,
@@ -173,7 +173,7 @@ async fn real_restore_snapshot_lifecycle_calls_worker_and_stays_sanitized() {
     let status_body = body_json(status).await;
     assert_eq!(status_body["backend_mode"], "real");
     assert_eq!(status_body["state"], "paused");
-    assert_eq!(status_body["current_frame"], 12);
+    assert_eq!(status_body["current_frame"], 13);
     assert_eq!(status_body["preview_stale"], true);
 
     let stop = send_request(
@@ -2090,7 +2090,9 @@ async fn api_play_loop_does_not_reopen_faulted_stream() {
         &format!("unix://{}", server.uds_path.display()),
         Some((ENV_REAL_SNAPSHOT_REF, SNAPSHOT_REF.to_string())),
     );
-    let mut app = router(AppState::from_config(config));
+    let app_state = AppState::from_config(config);
+    let frames = app_state.play_frames_for_tests();
+    let mut app = router(app_state.clone());
     {
         let mut state = worker.state.lock().expect("mock worker mutex poisoned");
         state.frame_stream_frame_limit = Some(2);
@@ -2124,7 +2126,22 @@ async fn api_play_loop_does_not_reopen_faulted_stream() {
     )
     .await;
     assert_eq!(play.status(), StatusCode::OK);
-    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while app_state.play_active_for_tests(session_id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("faulted stream deregisters its Play handle");
+
+    assert!(
+        !app_state.play_active_for_tests(session_id),
+        "faulted stream must deregister its Play handle"
+    );
+    assert!(
+        frames.borrow().is_none(),
+        "faulted stream must clear the retained frame slot"
+    );
 
     assert_eq!(
         worker
@@ -2809,10 +2826,13 @@ impl HypervisorWorker for MockWorker {
         state.icount = state.icount.saturating_add(11);
         let icount = state.icount;
         state.active_slot = Some(Self::active_slot(icount));
-        // A captured frame-budget Run (the Play fast path) returns the
-        // framebuffer inline; a plain Run does not.
+        // Both paths advance one frame. A captured frame-budget Run (the Play
+        // fast path) returns the framebuffer inline; a plain Run does not.
+        state.frame_counter += 1;
+        let frame_counter = state.frame_counter;
+        state.framebuffer_response.frame_counter = frame_counter;
+        state.framebuffer_response.icount = icount;
         let (fb_lz4, fb_info) = if request.capture.is_some_and(|capture| capture.framebuffer) {
-            state.frame_counter += 1;
             let (fb_lz4, fb_info) = Self::captured_framebuffer(state.frame_counter);
             (fb_lz4, Some(fb_info))
         } else {

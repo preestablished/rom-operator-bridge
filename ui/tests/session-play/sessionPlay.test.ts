@@ -29,6 +29,24 @@ const capabilities = {
 };
 
 describe("session and play surface", () => {
+  it("keeps pad input enabled while the active run is playing", async () => {
+    const client = mockClient({
+      sessionStatus: vi.fn().mockResolvedValue({ ...activeSessionResponse(), state: "playing" }),
+      runStatus: vi.fn().mockResolvedValue(
+        runStatusResponse({ state: "playing", preview_stale: false })
+      ),
+      currentFrame: vi.fn().mockResolvedValue(frameCurrentResponse(12, false))
+    });
+    const root = document.createElement("div");
+
+    mountOperatorApp(root, config, client, null);
+    await flushPromises();
+
+    const buttons = Array.from(root.querySelectorAll<HTMLButtonElement>("[data-pad-button]"));
+    expect(buttons.length).toBeGreaterThan(0);
+    expect(buttons.every((button) => !button.disabled)).toBe(true);
+  });
+
   it("pauses and resumes active synthetic sessions from the play surface", async () => {
     const client = mockClient({
       sessionStatus: vi.fn().mockResolvedValue(activeSessionResponse()),

@@ -642,3 +642,90 @@ async fn synthetic_streaming_play_via_api_paces_frames_and_pauses_at_a_boundary(
     assert_eq!(status["state"], "paused");
     assert_eq!(status["current_frame"].as_u64(), Some(frame_at_pause));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auth_ttl_during_play_deregisters_loop_and_clears_retained_frame() {
+    let workspace = tempfile::tempdir().expect("tempdir creates");
+    let private_root = workspace.path().join("bridge-private");
+    let auth = AuthState::fixed_for_tests(1_000);
+    let state = AppState::synthetic_for_tests_with_auth(config(&private_root), auth.clone());
+    let frames = state.play_frames_for_tests();
+    let app = router(state.clone());
+    let (start, cookie) = start_session(app.clone()).await;
+    let session_id = start["session_id"].as_str().expect("session id is string");
+
+    let play = request_json(
+        app,
+        runtime_request(
+            Method::POST,
+            "/api/run/play",
+            Body::from(session_only_body(session_id)),
+        )
+        .with_header(COOKIE, &cookie),
+    )
+    .await;
+    assert_eq!(play["state"], "playing");
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while frames.borrow().is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Play publishes a retained frame");
+    assert!(state.play_active_for_tests(session_id));
+
+    auth.advance_for_tests(SESSION_TTL_SECONDS + 1);
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while state.play_active_for_tests(session_id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("TTL self-exit deregisters and clears the retained frame");
+    assert!(frames.borrow().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_joins_play_before_teardown_and_clears_retained_frame() {
+    let workspace = tempfile::tempdir().expect("tempdir creates");
+    let private_root = workspace.path().join("bridge-private");
+    let state = AppState::synthetic_for_tests(config(&private_root));
+    let frames = state.play_frames_for_tests();
+    let app = router(state.clone());
+    let (start, cookie) = start_session(app.clone()).await;
+    let session_id = start["session_id"].as_str().expect("session id is string");
+
+    let play = request_json(
+        app.clone(),
+        runtime_request(
+            Method::POST,
+            "/api/run/play",
+            Body::from(session_only_body(session_id)),
+        )
+        .with_header(COOKIE, &cookie),
+    )
+    .await;
+    assert_eq!(play["state"], "playing");
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while frames.borrow().is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Play publishes before Stop");
+
+    let stopped = request_json(
+        app,
+        runtime_request(
+            Method::POST,
+            "/api/session/stop",
+            Body::from(stop_session_body(session_id)),
+        )
+        .with_header(COOKIE, &cookie),
+    )
+    .await;
+    assert_eq!(stopped["state"], "stopped");
+    assert!(!state.play_active_for_tests(session_id));
+    assert!(frames.borrow().is_none());
+}
