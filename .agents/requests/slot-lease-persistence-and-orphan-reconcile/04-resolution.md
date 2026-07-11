@@ -27,6 +27,37 @@ Two independent post-implementation reviews were applied. The crash/lifecycle re
 
 The operator tool continues to permit any explicitly enumerated unique subset of operation IDs. It has no wildcard or implicit all-record mode; `--all` is explicitly tested as a refusal. This preserves selected recovery of a single remaining intent without introducing broad deletion.
 
-## Remaining live evidence
+## Live acceptance evidence
 
-The required live SIGKILL exercise remains restricted to an explicitly owned operator window and must not use a user session. It has not been performed in this session. Bead `rom-operator-bridge-72o` therefore remains in progress until sanitized before/after `ListSlots` capacity and no-worker-restart evidence are captured. The historical restart-orphan caveats in the sibling request choreography are not yet retired.
+The owned-window exercise completed on 2026-07-11 against bridge release
+`20260711T210540Z` built from `6a01480e0711`. Only an operator-created
+synthetic session was used.
+
+- Before the exercise, `ListSlots` reported four `EMPTY` slots.
+- The synthetic session occupied exactly one slot (`PAUSED_S`), leaving three
+  `EMPTY` slots.
+- The operator sent `SIGKILL` to only the bridge service's main process. Systemd
+  restarted the bridge under a new PID and recorded one service restart.
+- Startup reconciliation reported `found_leases=1`, `destroyed=1`,
+  `retained=0`, and `ready_for_real_sessions=true`.
+- After reconciliation, `ListSlots` again reported four `EMPTY` slots and no
+  paused or active slots.
+- The worker retained PID `2925839` and its original 2026-07-07 start time
+  throughout the exercise; it was not restarted.
+
+This closes the live acceptance gap without recording session identifiers,
+lease tokens, private paths, or endpoint details.
+
+## Caveat retirement
+
+The historical “bridge restarts orphan slots” scheduling caveat is retired for
+the following sibling choreography references:
+
+- `phase3-eqb-amendment-and-capture-smoke/03-verification-offer.md`
+- `phase3-play-validation-and-residuals/01-current-state.md`
+- `phase3-play-validation-and-residuals/02-requested-work.md`
+- `phase3-play-validation-and-residuals/03-verification-offer.md`
+
+Those files remain unchanged as historical request records. Their references to
+`72o` no longer describe an open residual; this resolution and the closed beads
+are the authoritative disposition.
