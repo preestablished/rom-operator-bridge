@@ -397,7 +397,7 @@ ws_probe() {
 check_websockets() {
   local failed=0
   local ws_path code
-  for ws_path in /ws/events /ws/input; do
+  for ws_path in /ws/events /ws/input /ws/frames; do
     code=$(ws_probe "$ws_path" allowed "$ORIGIN" cookie)
     [[ "$code" == "101" ]] || failed=1
     code=$(ws_probe "$ws_path" unauth "$ORIGIN" no-cookie)

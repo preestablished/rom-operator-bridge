@@ -53,3 +53,30 @@ projected_mbps = mean_png_bytes * target_fps * 8 / 1_000_000
 ```
 
 State separately whether websocket and TLS framing overhead was measured.
+
+## EQB Client
+
+`service/examples/eqb_frames_client.rs` is the generic authenticated
+measurement client. It contains no endpoint, cookie, workload, or operator
+defaults. First run `scripts/deployment-network-check.sh`; its websocket
+preflight covers allowed, unauthenticated, wrong-origin, null-origin, and
+absent-origin handshakes for `/ws/frames` as well as the event/input sockets.
+
+From an approved private workspace, invoke the client with runtime values:
+
+```sh
+cargo run --manifest-path /path/to/checkout/service/Cargo.toml \
+  --example eqb_frames_client -- \
+  --url "$PRIVATE_FRAMES_URL" \
+  --origin "$APPROVED_ORIGIN" \
+  --cookie-file "$PRIVATE_COOKIE_JAR" \
+  --seconds 60 \
+  --raw-output "$PRIVATE_EVIDENCE_ROOT/frames.csv"
+```
+
+The cookie jar must be a regular `0600` Netscape-format file. Raw output is
+created once at `0600` and is rejected if its parent is inside the checkout.
+Standard output is aggregate JSON only: observation time, frame count/fps,
+counter gaps/non-monotonic frames, disconnects, payload/PNG bytes and Mbps,
+and p50/p95/max inter-arrival time. Boundary-aligned stall and icount analysis
+still comes from the private aggregate service logs required by the EQB rider.

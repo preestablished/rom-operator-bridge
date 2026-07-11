@@ -21,6 +21,10 @@ Bridge commit `a4f9f98` provides:
   producer frames/bytes, pacer misses/resyncs, per-socket sink sends/bytes,
   inferred counter gaps, retained depth, and subscriber count, documented in
   `docs/play-metrics.md`; and
+- a generic authenticated EQB frames client with aggregate fps, inter-arrival,
+  disconnect, gap, and byte accounting; optional raw CSV is forced outside the
+  checkout at `0600`, and the deployment preflight now checks `/ws/frames`
+  origin/auth rejection live; and
 - the real resume-response cosmetic: when a plain frame-budget Run omits
   `fb_info`, the adapter resolves the authoritative post-run counter from
   `GetFramebuffer` rather than returning cached pre-run progress.
@@ -40,6 +44,7 @@ The following checks passed on 2026-07-11:
 - `bash scripts/redaction-gate.sh` (`redaction-scan: PASS`, 334708 bytes / 6837
   lines scanned);
 - deployment helper shell syntax checks; and
+- focused EQB client framing/math tests; and
 - determinism-hypervisor focused
   `service::tests::run_capture_spec_reads_manifest_ranges_and_lz4_framebuffer`.
 
