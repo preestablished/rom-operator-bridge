@@ -47,7 +47,7 @@ const SESSION_SECRET: &str = "session-secret-from-test-source-32-bytes";
 const WORKLOAD_IMAGE_REF: &str = "private-workload-image-ref-from-test";
 const CAPTURE_SPEC_REF: &str = "private-capture-spec-ref-from-test";
 const SNAPSHOT_REF: &str = "1111111111111111111111111111111111111111111111111111111111111111";
-const LEASE_TOKEN: &[u8] = b"mock-private-lease-token";
+const LEASE_TOKEN: &[u8] = b"mock-lease-token";
 
 fn seed_record(store: &LeaseStore, token: &[u8]) -> LeaseIntent {
     seed_record_for_slot(store, 7, token)
@@ -140,7 +140,7 @@ async fn stale_token_and_missing_slot_records_are_benignly_cleaned() {
             Some((ENV_REAL_SNAPSHOT_REF, SNAPSHOT_REF.into())),
         );
         let store = LeaseStore::new(config.private_config().clone());
-        seed_record(&store, b"recycled-old-token");
+        seed_record(&store, b"recycled-token!!");
         let _backend = real_backend_from_config(&config);
         let loaded = store.load().expect("load");
         assert!(loaded.leases.is_empty());
@@ -150,10 +150,34 @@ async fn stale_token_and_missing_slot_records_are_benignly_cleaned() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn proven_rejection_clears_intent_but_lost_response_retains_it() {
-    for (status, lost, expected_intents) in [
-        (Some(tonic::Code::InvalidArgument), false, 0),
-        (None, true, 1),
+async fn exact_proven_rejection_clears_intent_but_ambiguous_failures_retain_it() {
+    for (status, detail, lost, expected_intents) in [
+        (
+            Some(tonic::Code::ResourceExhausted),
+            Some("no_free_slot"),
+            false,
+            0,
+        ),
+        (
+            Some(tonic::Code::ResourceExhausted),
+            Some("not_enough_cores"),
+            false,
+            0,
+        ),
+        (
+            Some(tonic::Code::InvalidArgument),
+            Some("no_free_slot"),
+            false,
+            1,
+        ),
+        (
+            Some(tonic::Code::ResourceExhausted),
+            Some("different_code"),
+            false,
+            1,
+        ),
+        (Some(tonic::Code::InvalidArgument), None, false, 1),
+        (None, None, true, 1),
     ] {
         let workspace = tempfile::tempdir().expect("tempdir");
         let root = workspace.path().join("private");
@@ -162,6 +186,7 @@ async fn proven_rejection_clears_intent_but_lost_response_retains_it() {
         {
             let mut state = worker.state.lock().expect("worker");
             state.allocation_status = status;
+            state.allocation_detail = detail.map(str::to_string);
             state.allocate_then_drop_response = lost;
         }
         let server = WorkerServer::start(worker.clone()).await;
@@ -187,7 +212,7 @@ async fn proven_rejection_clears_intent_but_lost_response_retains_it() {
                 .len(),
             expected_intents
         );
-        if lost {
+        if expected_intents == 1 {
             assert!(
                 backend
                     .start_session(StartBackendSession {
@@ -256,7 +281,7 @@ async fn repeated_reconcile_converges_after_partial_cleanup_shape() {
     {
         let mut state = worker.state.lock().expect("worker");
         state.set_active_slot(7, LEASE_TOKEN.to_vec(), 0);
-        state.set_active_slot(8, b"second-slot-token".to_vec(), 0);
+        state.set_active_slot(8, b"secondslot-token".to_vec(), 0);
     }
     let server = WorkerServer::start(worker.clone()).await;
     let config = real_config_with_start(
@@ -267,7 +292,7 @@ async fn repeated_reconcile_converges_after_partial_cleanup_shape() {
     );
     let store = LeaseStore::new(config.private_config().clone());
     seed_record_for_slot(&store, 7, LEASE_TOKEN);
-    seed_record_for_slot(&store, 8, b"second-slot-token");
+    seed_record_for_slot(&store, 8, b"secondslot-token");
     let first = real_backend_from_config(&config);
     drop(first);
     assert!(store.load().expect("first pass").leases.is_empty());
@@ -481,6 +506,57 @@ async fn lease_write_and_destroy_failure_keeps_token_in_ram_until_retry() {
         .expect("pending token is persisted, reconciled, and allocation resumes");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_worker_lease_token_is_retained_verbatim_until_destroyed() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let root = workspace.path().join("private");
+    let checkout = workspace.path().join("checkout");
+    let worker = MockWorker::new();
+    {
+        let mut state = worker.state.lock().expect("worker");
+        state.allocation_token = Some(vec![0x55; 15]);
+        state.destroy_fails = true;
+    }
+    let server = WorkerServer::start(worker.clone()).await;
+    let config = real_config_with_start(
+        &root,
+        &checkout,
+        &format!("unix://{}", server.uds_path.display()),
+        Some((ENV_REAL_SNAPSHOT_REF, SNAPSHOT_REF.into())),
+    );
+    let backend = real_backend_from_config(&config);
+    assert!(
+        backend
+            .start_session(StartBackendSession {
+                requested_capabilities: BackendCapabilities::real_preview_mvp(),
+            })
+            .is_err()
+    );
+    assert!(worker.calls().contains(&"destroy_vm"));
+    assert_eq!(worker.state.lock().expect("worker").active_slots.len(), 1);
+    let loaded = LeaseStore::new(config.private_config().clone())
+        .load()
+        .expect("store remains valid");
+    assert!(loaded.leases.is_empty());
+    assert_eq!(loaded.intents.len(), 1);
+
+    {
+        let mut state = worker.state.lock().expect("worker");
+        state.destroy_fails = false;
+        state.allocation_token = None;
+    }
+    backend
+        .start_session(StartBackendSession {
+            requested_capabilities: BackendCapabilities::real_preview_mvp(),
+        })
+        .expect("raw malformed token is retried, destroyed, and allocation resumes");
+    let loaded = LeaseStore::new(config.private_config().clone())
+        .load()
+        .expect("valid replacement lease is durable");
+    assert_eq!(loaded.leases.len(), 1);
+    assert!(loaded.intents.is_empty());
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manifest_failure_rolls_back_durable_lease() {
@@ -665,6 +741,43 @@ async fn failed_stop_record_is_reconciled_before_later_start() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wrong_session_stop_leaves_the_active_real_session_untouched() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let root = workspace.path().join("private");
+    let checkout = workspace.path().join("checkout");
+    let worker = MockWorker::new();
+    let server = WorkerServer::start(worker.clone()).await;
+    let config = real_config_with_start(
+        &root,
+        &checkout,
+        &format!("unix://{}", server.uds_path.display()),
+        Some((ENV_REAL_SNAPSHOT_REF, SNAPSHOT_REF.into())),
+    );
+    let backend = real_backend_from_config(&config);
+    let session = backend
+        .start_session(StartBackendSession {
+            requested_capabilities: BackendCapabilities::real_preview_mvp(),
+        })
+        .expect("start");
+    assert!(
+        backend
+            .stop_session(
+                "stale-real-session-id".to_string(),
+                rom_operator_bridge_service::backend::StopReason::OperatorStop,
+            )
+            .is_err()
+    );
+    assert!(!worker.calls().contains(&"destroy_vm"));
+    assert!(backend.status(session.session_id.clone()).is_ok());
+    backend
+        .stop_session(
+            session.session_id,
+            rom_operator_bridge_service::backend::StopReason::OperatorStop,
+        )
+        .expect("matching stop still succeeds");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_start_without_attached_worker_returns_sanitized_backend_unavailable() {
     let workspace = tempfile::tempdir().expect("tempdir creates");
     let private_root = workspace.path().join("bridge-private");
@@ -730,6 +843,7 @@ async fn real_restore_snapshot_lifecycle_calls_worker_and_stays_sanitized() {
         &format!("unix://{}", server.uds_path.display()),
         Some((ENV_REAL_SNAPSHOT_REF, SNAPSHOT_REF.to_string())),
     );
+    let lease_store = LeaseStore::new(config.private_config().clone());
     let mut app = router(AppState::from_config(config));
 
     let start = send_request(
@@ -809,7 +923,7 @@ async fn real_restore_snapshot_lifecycle_calls_worker_and_stays_sanitized() {
     let stop_body = body_json(stop).await;
     assert_eq!(stop_body["state"], "stopped");
     assert_public_json_sanitized(&stop_body, &private_root, &reference_checkout, &server);
-    assert_private_artifacts_do_not_contain_lease(&private_root);
+    assert_private_artifacts_do_not_contain_lease(&private_root, &lease_store);
 
     let snapshot_hash = worker
         .state
@@ -1520,6 +1634,7 @@ async fn real_input_injection_schedules_pad_set_and_writes_private_padlog() {
         &format!("unix://{}", server.uds_path.display()),
         Some((ENV_REAL_SNAPSHOT_REF, SNAPSHOT_REF.to_string())),
     );
+    let lease_store = LeaseStore::new(config.private_config().clone());
     let backend = real_backend_from_config(&config);
     let session = backend
         .start_session(StartBackendSession {
@@ -1583,7 +1698,7 @@ async fn real_input_injection_schedules_pad_set_and_writes_private_padlog() {
     assert_eq!(event["client_seq"], 42);
     assert_eq!(event["source_id"], "keyboard");
     assert_eq!(event["status"], "applied");
-    assert_private_artifacts_do_not_contain_lease(&private_root);
+    assert_private_artifacts_do_not_contain_lease(&private_root, &lease_store);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3083,36 +3198,58 @@ fn sha256_ref(bytes: &[u8]) -> String {
     format!("sha256:{hex}")
 }
 
-fn assert_private_artifacts_do_not_contain_lease(private_root: &Path) {
+fn assert_private_artifacts_do_not_contain_lease(private_root: &Path, store: &LeaseStore) {
     let token_hex: String = LEASE_TOKEN
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect();
-    let run_dir = private_root.join("runs").join("real-run-0000");
-    for file_name in [
-        "run-manifest.json",
-        "bridge-events.jsonl",
-        "input.padlog",
-        "padlog-events.jsonl",
-    ] {
-        let path = run_dir.join(file_name);
-        if !path.exists() || !path.is_file() {
+    let raw_token = String::from_utf8(LEASE_TOKEN.to_vec()).expect("lease token utf8");
+    let active = private_root.join("leases/active");
+    let loaded = store.load().expect("the complete lease store validates");
+    assert_eq!(loaded.invalid, 0);
+    let active_ids: std::collections::BTreeSet<_> = loaded
+        .leases
+        .iter()
+        .map(|record| record.operation_id.as_str())
+        .collect();
+
+    let mut files = Vec::new();
+    collect_private_files(private_root, &mut files);
+    for path in files {
+        let bytes =
+            fs::read(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        let contains_token = bytes
+            .windows(LEASE_TOKEN.len())
+            .any(|window| window == LEASE_TOKEN)
+            || bytes
+                .windows(token_hex.len())
+                .any(|window| window == token_hex.as_bytes())
+            || String::from_utf8_lossy(&bytes).contains(&raw_token);
+        if !contains_token {
             continue;
         }
-        let contents = fs::read_to_string(&path)
-            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
-        assert!(
-            !contents.contains(&String::from_utf8(LEASE_TOKEN.to_vec()).expect("lease token utf8"))
-                && !contents.contains(&token_hex),
-            "private artifact persisted lease token: {}",
+        assert_eq!(
+            path.parent(),
+            Some(active.as_path()),
+            "token appeared outside the sole active-lease allowlist: {}",
             path.display()
         );
+        let operation_id = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .expect("active lease filename is utf8");
+        assert!(
+            active_ids.contains(operation_id),
+            "token-bearing active file was not accepted by strict LeaseStore validation"
+        );
     }
-    // The decoded, validated active lease record is the sole durable token
-    // allowlist. It remains private mode 0600 and is removed only after cleanup.
-    let active = private_root.join("leases/active");
+
+    // Every active file, not merely token matches, must be a strictly decoded
+    // record. This is the sole durable token allowlist.
+    let mut active_file_count = 0;
     for entry in fs::read_dir(active).expect("active lease directory") {
         let path = entry.expect("lease entry").path();
+        active_file_count += 1;
         let metadata = fs::symlink_metadata(&path).expect("lease metadata");
         assert!(metadata.file_type().is_file());
         #[cfg(unix)]
@@ -3121,6 +3258,28 @@ fn assert_private_artifacts_do_not_contain_lease(private_root: &Path) {
             .expect("validated lease json");
         assert_eq!(value["schema_version"], 1);
         assert_eq!(value["token_hex"], token_hex);
+        let operation_id = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .expect("active filename");
+        assert!(active_ids.contains(operation_id));
+    }
+    assert_eq!(active_file_count, loaded.leases.len());
+}
+
+fn collect_private_files(directory: &Path, files: &mut Vec<PathBuf>) {
+    for entry in fs::read_dir(directory).expect("private directory reads") {
+        let path = entry.expect("private entry").path();
+        let metadata = fs::symlink_metadata(&path).expect("private metadata");
+        assert!(
+            !metadata.file_type().is_symlink(),
+            "private tree has symlink"
+        );
+        if metadata.is_dir() {
+            collect_private_files(&path, files);
+        } else if metadata.is_file() {
+            files.push(path);
+        }
     }
 }
 
@@ -3211,6 +3370,8 @@ struct MockWorkerState {
     destroy_detail_override: Option<String>,
     destroy_malformed_details: bool,
     allocation_status: Option<tonic::Code>,
+    allocation_detail: Option<String>,
+    allocation_token: Option<Vec<u8>>,
     allocate_then_drop_response: bool,
     inject_status: Option<tonic::Code>,
     inject_scheduled: u32,
@@ -3248,6 +3409,8 @@ impl Default for MockWorkerState {
             destroy_detail_override: None,
             destroy_malformed_details: false,
             allocation_status: None,
+            allocation_detail: None,
+            allocation_token: None,
             allocate_then_drop_response: false,
             inject_status: None,
             inject_scheduled: 1,
@@ -3278,13 +3441,6 @@ impl MockWorker {
             .expect("mock worker mutex poisoned")
             .calls
             .clone()
-    }
-
-    fn lease() -> dh::Lease {
-        dh::Lease {
-            slot_id: 7,
-            token: LEASE_TOKEN.to_vec(),
-        }
     }
 
     fn active_slot(slot_id: u64, icount: u64) -> dh::SlotInfo {
@@ -3399,17 +3555,24 @@ impl HypervisorWorker for MockWorker {
         let mut state = self.state.lock().expect("mock worker mutex poisoned");
         state.calls.push("create_vm");
         if let Some(code) = state.allocation_status {
-            return Err(Status::new(code, "allocation rejected"));
+            return Err(worker_status_with_detail(
+                code,
+                state.allocation_detail.as_deref(),
+            ));
         }
         let request = request.into_inner();
         state.create_vm = Some(request);
         state.icount = 0;
-        state.set_active_slot(7, LEASE_TOKEN.to_vec(), 0);
+        let token = state
+            .allocation_token
+            .clone()
+            .unwrap_or_else(|| LEASE_TOKEN.to_vec());
+        state.set_active_slot(7, token.clone(), 0);
         if state.allocate_then_drop_response {
             return Err(Status::unavailable("response lost"));
         }
         Ok(TonicResponse::new(dh::CreateVmResponse {
-            lease: Some(Self::lease()),
+            lease: Some(dh::Lease { slot_id: 7, token }),
             icount: 0,
         }))
     }
@@ -3421,16 +3584,23 @@ impl HypervisorWorker for MockWorker {
         let mut state = self.state.lock().expect("mock worker mutex poisoned");
         state.calls.push("restore_snapshot");
         if let Some(code) = state.allocation_status {
-            return Err(Status::new(code, "allocation rejected"));
+            return Err(worker_status_with_detail(
+                code,
+                state.allocation_detail.as_deref(),
+            ));
         }
         state.restore_hash = request.into_inner().snapshot.map(|snapshot| snapshot.hash);
         state.icount = 0;
-        state.set_active_slot(7, LEASE_TOKEN.to_vec(), 0);
+        let token = state
+            .allocation_token
+            .clone()
+            .unwrap_or_else(|| LEASE_TOKEN.to_vec());
+        state.set_active_slot(7, token.clone(), 0);
         if state.allocate_then_drop_response {
             return Err(Status::unavailable("response lost"));
         }
         Ok(TonicResponse::new(dh::RestoreSnapshotResponse {
-            lease: Some(Self::lease()),
+            lease: Some(dh::Lease { slot_id: 7, token }),
             config: None,
             state_hash: None,
             frame_counter: 12,
@@ -3734,12 +3904,19 @@ impl HypervisorWorker for MockWorker {
 }
 
 fn worker_detail_status(code: &str) -> Status {
+    worker_status_with_detail(tonic::Code::FailedPrecondition, Some(code))
+}
+
+fn worker_status_with_detail(code: tonic::Code, detail: Option<&str>) -> Status {
     use prost::Message;
+    let Some(detail) = detail else {
+        return Status::new(code, "worker request failed");
+    };
     Status::with_details(
-        tonic::Code::FailedPrecondition,
-        "worker precondition failed",
+        code,
+        "worker request failed",
         dh::ErrorDetail {
-            code: code.to_string(),
+            code: detail.to_string(),
             slot_id: 7,
             icount: 0,
         }

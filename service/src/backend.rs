@@ -1026,16 +1026,13 @@ impl RealBackend {
             std::mem::take(&mut inner.pending_cleanup)
         };
         let mut pending_retained = Vec::new();
-        for record in pending {
-            if store.write_lease(&record).is_err() {
-                match self.worker.stop(record.lease().unwrap_or(dh::Lease {
-                    slot_id: 0,
-                    token: Vec::new(),
-                })) {
+        for pending in pending {
+            if store.write_lease(&pending.record).is_err() {
+                match self.worker.stop(pending.lease.clone()) {
                     Ok(()) | Err(RealWorkerFailure::StaleLease) => {
-                        let _ = store.remove_intent(&record.operation_id);
+                        let _ = store.remove_intent(&pending.record.operation_id);
                     }
-                    Err(_) => pending_retained.push(record),
+                    Err(_) => pending_retained.push(pending),
                 }
             }
         }
@@ -1551,7 +1548,10 @@ impl BridgeBackend for RealBackend {
                         .lock()
                         .expect("real backend mutex poisoned")
                         .pending_cleanup
-                        .push(lease_record);
+                        .push(PendingCleanup {
+                            record: lease_record,
+                            lease: outcome.lease,
+                        });
                     *self
                         .reconcile_ready
                         .lock()
@@ -1614,14 +1614,14 @@ impl BridgeBackend for RealBackend {
             .expect("real lifecycle mutex poisoned");
         let session = {
             let mut inner = self.inner.lock().expect("real backend mutex poisoned");
-            let Some(session) = inner
+            if !inner
                 .active
-                .take()
-                .filter(|session| session.session_id == session_id)
-            else {
+                .as_ref()
+                .is_some_and(|session| session.session_id == session_id)
+            {
                 return Err(BackendError::BackendUnavailable);
-            };
-            session
+            }
+            inner.active.take().expect("matched active session exists")
         };
 
         let stopped = StoppedSession {
@@ -2493,7 +2493,23 @@ struct RealBackendInner {
     capture_jobs: BTreeMap<CaptureJobId, RealCaptureJobState>,
     capture_idempotency: BTreeMap<(SessionId, String), CaptureJobId>,
     starting: bool,
-    pending_cleanup: Vec<LeaseRecord>,
+    pending_cleanup: Vec<PendingCleanup>,
+}
+
+#[derive(Clone)]
+struct PendingCleanup {
+    record: LeaseRecord,
+    lease: dh::Lease,
+}
+
+impl std::fmt::Debug for PendingCleanup {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PendingCleanup")
+            .field("operation_id", &self.record.operation_id)
+            .field("slot_id", &self.lease.slot_id)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3637,9 +3653,13 @@ fn destroy_worker_failure_from_status(status: tonic::Status) -> RealWorkerFailur
 }
 
 fn allocation_worker_failure_from_status(status: tonic::Status) -> RealWorkerFailure {
-    match status.code() {
-        Code::InvalidArgument | Code::ResourceExhausted => RealWorkerFailure::AllocationRejected,
-        _ => RealWorkerFailure::BackendUnavailable,
+    if status.code() == Code::ResourceExhausted
+        && let Ok(detail) = dh::ErrorDetail::decode(status.details())
+        && matches!(detail.code.as_str(), "no_free_slot" | "not_enough_cores")
+    {
+        RealWorkerFailure::AllocationRejected
+    } else {
+        RealWorkerFailure::BackendUnavailable
     }
 }
 

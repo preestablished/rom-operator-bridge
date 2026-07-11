@@ -44,7 +44,7 @@ fn intent_promotes_to_private_lease_and_round_trips() {
         .expect("atomic intent replacement");
     let record = intent.promote(&dh_proto::v1::Lease {
         slot_id: 7,
-        token: vec![0xab, 0xcd],
+        token: vec![0xab; 16],
     });
     store.write_lease(&record).expect("lease durable");
     let loaded = store.load().expect("load");
@@ -53,7 +53,7 @@ fn intent_promotes_to_private_lease_and_round_trips() {
     assert_eq!(loaded.leases.len(), 1);
     assert_eq!(
         loaded.leases[0].lease().expect("decode").token,
-        vec![0xab, 0xcd]
+        vec![0xab; 16]
     );
     let root = workspace.path().join("private");
     let mode = std::fs::metadata(
@@ -117,7 +117,7 @@ fn selected_dangling_intent_acknowledgement_refuses_active_records() {
     store
         .write_lease(&intent.promote(&dh_proto::v1::Lease {
             slot_id: 7,
-            token: vec![1],
+            token: vec![1; 16],
         }))
         .expect("lease");
     assert!(
@@ -202,6 +202,52 @@ fn validated_atomic_temporary_files_are_safely_ignored_after_crash() {
     assert!(temp.exists(), "evidence is left for safe later cleanup");
 }
 
+#[test]
+fn strict_record_validation_rejects_each_malformed_field_class() {
+    let (workspace, _config, store) = store();
+    let active = workspace.path().join("private/leases/active");
+    let ids = [
+        "00000000-0000-4000-8000-000000000010",
+        "00000000-0000-4000-8000-000000000011",
+        "00000000-0000-4000-8000-000000000012",
+        "00000000-0000-4000-8000-000000000013",
+        "00000000-0000-4000-8000-000000000014",
+        "00000000-0000-4000-8000-000000000015",
+        "00000000-0000-4000-8000-000000000016",
+        "00000000-0000-4000-8000-000000000017",
+    ];
+    let valid = |id: &str| {
+        serde_json::json!({
+            "schema_version": 1,
+            "operation_id": id,
+            "session_id": "real-session-0000",
+            "run_id": "real-run-0000",
+            "source": "create_vm_config",
+            "created_at": "1",
+            "allocation_kind": "create_vm",
+            "slot_id": 0,
+            "token_hex": "00".repeat(16),
+            "lease_recorded_at": "2"
+        })
+    };
+    let mut records: Vec<_> = ids.iter().map(|id| valid(id)).collect();
+    records[0]["unexpected"] = serde_json::json!(true);
+    records[1]["operation_id"] = serde_json::json!(ids[0]);
+    records[2]["session_id"] = serde_json::json!("../escape");
+    records[3]["source"] = serde_json::json!("unvalidated-source");
+    records[4]["created_at"] = serde_json::json!("not-a-time");
+    records[5]["lease_recorded_at"] = serde_json::json!("not-a-time");
+    records[6]["token_hex"] = serde_json::json!("AA".repeat(16));
+    records[7]["token_hex"] = serde_json::json!("00".repeat(15));
+    for (id, record) in ids.iter().zip(records) {
+        let path = active.join(format!("{id}.json"));
+        std::fs::write(&path, serde_json::to_vec(&record).expect("json")).expect("record");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(PRIVATE_FILE_MODE))
+            .expect("private mode");
+    }
+    assert_eq!(store.load().expect("strict load").invalid, ids.len());
+}
+
 fn run_clear_command(root: &std::path::Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_rom-operator-bridge-service"))
         .env_clear()
@@ -228,6 +274,19 @@ fn operator_command_requires_confirmations_and_a_stopped_bridge() {
     let missing = run_clear_command(&root, &["clear-dangling-intents", &intent.operation_id]);
     assert!(!missing.status.success());
     assert_eq!(store.load().expect("still retained").intents.len(), 1);
+
+    let broad = run_clear_command(
+        &root,
+        &[
+            "clear-dangling-intents",
+            "--bridge-stopped",
+            "--worker-restarted",
+            "--full-capacity",
+            "--all",
+        ],
+    );
+    assert!(!broad.status.success());
+    assert_eq!(store.load().expect("broad refusal").intents.len(), 1);
 
     let service_lock = config.acquire_bridge_runtime_lock().expect("service lock");
     let running = run_clear_command(

@@ -9,6 +9,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 const SCHEMA_VERSION: u32 = 1;
+const LEASE_TOKEN_BYTES: usize = 16;
 const INTENTS_DIR: &str = "leases/intents";
 const ACTIVE_DIR: &str = "leases/active";
 
@@ -181,8 +182,16 @@ impl LeaseStore {
             .map(|intent| intent.operation_id)
             .collect())
     }
-    fn write<T: Serialize>(&self, dir: &str, id: &str, value: &T) -> Result<(), LeaseStoreError> {
+    fn write<T: Serialize + RecordValidation>(
+        &self,
+        dir: &str,
+        id: &str,
+        value: &T,
+    ) -> Result<(), LeaseStoreError> {
         validate_operation_id(id)?;
+        if !value.valid_for(id) {
+            return Err(LeaseStoreError::InvalidRecord);
+        }
         let bytes = serde_json::to_vec(value).map_err(|_| LeaseStoreError::InvalidRecord)?;
         self.config
             .write_private_file_atomic(record_path(dir, id), &bytes)?;
@@ -343,8 +352,7 @@ fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 fn hex_decode(value: &str) -> Result<Vec<u8>, LeaseStoreError> {
-    if value.is_empty()
-        || !value.len().is_multiple_of(2)
+    if value.len() != LEASE_TOKEN_BYTES * 2
         || !value
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
